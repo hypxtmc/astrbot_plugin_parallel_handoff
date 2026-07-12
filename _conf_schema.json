@@ -1,0 +1,50 @@
+{
+  "fragment_interval": {
+    "description": "分段发送间隔（秒）",
+    "type": "float",
+    "default": 0.3,
+    "hint": "分段转发模式下，每条片段之间的发送间隔。建议 0.2-0.5 秒，避免触发平台风控。"
+  },
+  "min_fragment_length": {
+    "description": "最小分段长度（字符）",
+    "type": "int",
+    "default": 5,
+    "hint": "括号内动作描写短于此长度时，会合并到下一段对话，避免零碎输出。"
+  },
+  "enable_subagent_name_prefix": {
+    "description": "子代理消息启用姓名前缀",
+    "type": "bool",
+    "default": true,
+    "hint": "并行回复时每个子代理结果前加【名字】前缀，方便区分发言人。替代旧配置项 enable_name_prefix。"
+  },
+  "enable_mainagent_name_prefix": {
+    "description": "主代理消息启用姓名前缀",
+    "type": "bool",
+    "default": false,
+    "hint": "主代理（调用本工具的一方）回复消息时是否加【名字】前缀。默认关闭，因为主代理通常只有一个人。可在 format_mainagent_message() 方法中使用。"
+  },
+  "enable_scene_inject": {
+    "description": "启用场景注入",
+    "type": "bool",
+    "default": true,
+    "hint": "调用子代理时自动在 input 中注入当前场景信息（群聊/私聊、对话对象等）。"
+  },
+  "enable_segmented_forward": {
+    "description": "启用分段转发",
+    "type": "bool",
+    "default": true,
+    "hint": "子代理回复按括号/换行拆分后逐条发送，提升阅读体验。关闭则合并为一条 JSON 返回。"
+  },
+  "name_prefix_overrides": {
+    "description": "子代理前缀覆盖表（JSON格式）",
+    "type": "string",
+    "default": "{}",
+    "hint": "按子代理名单独控制前缀开关。JSON格式：{\"助手A\": true, \"助手B\": false}。未列出的走全局开关"
+  },
+  "name_display_map": {
+    "description": "子代理显示名映射",
+    "type": "string",
+    "default": "{}",
+    "hint": "JSON格式，自定义子代理显示名。如 {\"助手A\": \"张先生\", \"助手B\": \"李女士\"}"
+  }
+}
