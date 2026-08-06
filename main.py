@@ -110,6 +110,76 @@ class ParallelHandoffPlugin(Star):
             return raw
         return {}
 
+    async def _forward_segmented(self, text, event):
+        """单条子代理回复的分段直接发送（流式转发/统一转发共用）。"""
+        try:
+            prefix = ""
+            content = text
+            prefix_match = re.match(r"^(【[^】]+】)\n", text)
+            if prefix_match:
+                prefix = prefix_match.group(1)
+                content = text[prefix_match.end():]
+            if "（" in content:
+                raw_segments = re.split(r"(（[^）]*）)", content)
+                raw_segments = [s.strip() for s in raw_segments if s.strip()]
+                min_len = self.config.get("min_fragment_length", 5)
+                segments = []
+                i = 0
+                while i < len(raw_segments):
+                    seg = raw_segments[i]
+                    if (
+                        seg.startswith("（")
+                        and seg.endswith("）")
+                        and len(seg) - 2 < min_len
+                        and i + 1 < len(raw_segments)
+                    ):
+                        segments.append(seg + raw_segments[i + 1])
+                        i += 2
+                    else:
+                        segments.append(seg)
+                        i += 1
+                final_segments = []
+                for seg in segments:
+                    sub_segs = seg.split("\n\n")
+                    final_segments.extend([s.strip() for s in sub_segs if s.strip()])
+                segments = final_segments
+            else:
+                segments = content.split("\n\n")
+                if len(segments) == 1:
+                    segments = content.split("\n")
+                segments = [s.strip() for s in segments if s.strip()]
+            for idx, seg_text in enumerate(segments):
+                if idx == 0 and prefix:
+                    msg = f"{prefix}\n{seg_text}"
+                else:
+                    msg = seg_text
+                await self.context.send_message(
+                    event.unified_msg_origin,
+                    MessageChain([Plain(msg)]),
+                )
+                await asyncio.sleep(self.config.get("fragment_interval", 0.3))
+        except Exception as e:
+            logger.error(f"[parallel_handoff] 分段发送失败: {e}")
+
+    async def _send_failure_notify(self, r, event):
+        """子代理失败（超时/报错）时通知用户。"""
+        try:
+            agent_name = r.get("agent_name", "未知")
+            err_text = r.get("response", "未知错误")
+            if "Timeout" in err_text:
+                notify = f"【{self._display_name(agent_name)}】超时了，没有回复"
+            else:
+                notify = f"【{self._display_name(agent_name)}】出错了: {err_text}"
+            await self.context.send_message(
+                event.unified_msg_origin,
+                MessageChain([Plain(notify)]),
+            )
+            await asyncio.sleep(self.config.get("fragment_interval", 0.3))
+        except Exception as e:
+            logger.error(
+                f"[parallel_handoff] 失败通知发送失败 [{r.get('agent_name')}]: {e}"
+            )
+
     def _display_name(self, agent_name: str) -> str:
         """返回 agent_name 对应的中文显示名,找不到则返回原名
 
@@ -774,27 +844,54 @@ Args:
 
         call_mode = self._cfg("call_mode", "parallel")
 
+        # ── 读取直接发送名单（提前定义，供接龙流式转发使用） ────
+        direct_agents_str = self._cfg("direct_delivery_agents", "amiya,closure,theresia")
+        direct_agents = {
+            name.strip().lower()
+            for name in direct_agents_str.split(",")
+            if name.strip()
+        }
+        # 非直接发送代理的完整回复收集
+        return_agent_results = []
+
         logger.info(
             f"[parallel_handoff] Dispatching {len(calls)} subagent calls (mode={call_mode})"
         )
         t_total = time.perf_counter()
         if call_mode == "chained":
             # ── 接龙模式：串行调用，前一个子代理的回复注入下一个的输入 ──
-            # 注：direct/relay 均为发送方式，在调用完成后统一分发（见下方分段转发），
-            #     与接龙的调用方式正交，互不冲突。
+            # 注：direct/relay 均为发送方式，与接龙的调用方式正交，互不冲突。
+            # 流式转发：每条完成后立刻发送（direct 直接发/失败立刻通知），
+            # 无需等整条链跑完；失败的子代理在链上标注，下一个能看到谁掉队。
             results = []
             for i, c in enumerate(calls):
-                if i > 0 and results and results[-1].get("success"):
+                if i > 0 and results:
                     prev = results[-1]
                     c = dict(c)
                     prev_display = self._display_name(prev.get("agent_name", ""))
-                    chain_note = (
-                        f"（接龙·上一位）【{prev_display}】的回复：\n"
-                        f"{prev.get('response', '')}\n\n"
-                        f"请接续上文，现在轮到你回应："
-                    )
+                    if prev.get("success"):
+                        chain_note = (
+                            f"（接龙·上一位）【{prev_display}】的回复：\n"
+                            f"{prev.get('response', '')}\n\n"
+                            f"请接续上文，现在轮到你回应："
+                        )
+                    else:
+                        # 失败留痕：链上标注谁掉队了，下一个子代理能看到
+                        chain_note = (
+                            f"（接龙·上一位）【{prev_display}】超时未接：\n"
+                            f"（无回复）\n\n"
+                            f"请接续上文，现在轮到你回应："
+                        )
                     c["input"] = chain_note + (c.get("input") or "")
-                results.append(await _call_one(c))
+                r = await _call_one(c)
+                results.append(r)
+                # ── 流式转发：本条立刻发出，不等整条链 ──
+                if enable_segmented_forward:
+                    r["_sent"] = True  # 标记已处理，统一转发阶段跳过
+                    if r.get("success") and r.get("agent_name", "").lower() in direct_agents:
+                        await self._forward_segmented(r.get("response", ""), event)
+                    elif not r.get("success"):
+                        await self._send_failure_notify(r, event)
             # 接龙模式保持调用顺序发送，不按 order 重排（order 仅对并行模式生效）
         else:
             # ── 并行模式（默认）──
@@ -824,15 +921,7 @@ Args:
             f"{fail_count} failed, total {total_latency_ms}ms"
         )
 
-        # ── 读取直接发送名单 ─────────────────────────────────
-        direct_agents_str = self._cfg("direct_delivery_agents", "amiya,closure,theresia")
-        direct_agents = {
-            name.strip().lower()
-            for name in direct_agents_str.split(",")
-            if name.strip()
-        }
-        # 非直接发送代理的完整回复收集
-        return_agent_results = []
+        # （direct_agents / return_agent_results 已在调度前定义，此处复用）
 
         # ── 分段转发：按中文括号拆分逐条发送 ─────────────────
         if enable_segmented_forward:
@@ -842,90 +931,18 @@ Args:
                 agent_name = r.get("agent_name", "")
                 is_direct = agent_name.lower() in direct_agents
 
+                # 接龙模式下该条已流式发送/通知，跳过避免重复
+                if r.get("_sent"):
+                    continue
+
                 if r.get("success") and is_direct:
-                    text = r.get("response", "")
-                    # 先提取姓名前缀（如 "【阿米娅】\n"），避免被分段逻辑拆散
-                    prefix = ""
-                    content = text
-                    prefix_match = re.match(r"^(【[^】]+】)\n", text)
-                    if prefix_match:
-                        prefix = prefix_match.group(1)
-                        content = text[prefix_match.end():]
-                    # 1. 如果文本中含有中文括号,按括号拆分
-                    if "（" in content:
-                        raw_segments = re.split(r"(（[^）]*）)", content)
-                        raw_segments = [s.strip() for s in raw_segments if s.strip()]
-                        min_len = self.config.get("min_fragment_length", 5)
-                        segments = []
-                        i = 0
-                        while i < len(raw_segments):
-                            seg = raw_segments[i]
-                            # 括号内动作描写太短则合并到下一段对话
-                            if (
-                                seg.startswith("（")
-                                and seg.endswith("）")
-                                and len(seg) - 2 < min_len
-                                and i + 1 < len(raw_segments)
-                            ):
-                                segments.append(seg + raw_segments[i + 1])
-                                i += 2
-                            else:
-                                segments.append(seg)
-                                i += 1
-                        # 按双换行进一步拆分段内段落，防止 \n\n 被吞
-                        final_segments = []
-                        for seg in segments:
-                            sub_segs = seg.split("\n\n")
-                            final_segments.extend([s.strip() for s in sub_segs if s.strip()])
-                        segments = final_segments
-                    else:
-                        # 2. 回退到换行拆分：先双换行,再单换行
-                        segments = content.split("\n\n")
-                        if len(segments) == 1:
-                            segments = content.split("\n")
-                        segments = [s.strip() for s in segments if s.strip()]
-                    # 返回文本给主代理，让框架正常发送，不自己发
-                    try:
-                        full_content = "\n\n".join(segments)
-                        if prefix:
-                            full_content = f"{prefix}\n{full_content}"
-                        # 分段转发：各段落单独发
-                        try:
-                            for idx, seg_text in enumerate(segments):
-                                if idx == 0 and prefix:
-                                    msg = f"{prefix}\n{seg_text}"
-                                else:
-                                    msg = seg_text
-                                await self.context.send_message(
-                                    event.unified_msg_origin,
-                                    MessageChain([Plain(msg)]),
-                                )
-                                await asyncio.sleep(self.config.get("fragment_interval", 0.3))
-                        except Exception as e:
-                            logger.error(
-                                f"[parallel_handoff] 发送失败 [{r.get('agent_name')}]: {e}"
-                            )
-                    except Exception as e:
-                        logger.error(
-                            f"[parallel_handoff] 处理失败 [{r.get('agent_name')}]: {e}"
-                        )
+                    await self._forward_segmented(r.get("response", ""), event)
                 elif r.get("success"):
                     # 非直接发送代理（如tech）— 收集完整回复返回给主代理
                     if agent_name not in [ra.get("agent_name") for ra in return_agent_results]:
                         return_agent_results.append(r)
                 else:
-                    # 失败的子代理（超时/报错），通知用户
-                    agent_name = r.get("agent_name", "未知")
-                    err_text = r.get("response", "未知错误")
-                    if "Timeout" in err_text:
-                        notify = f"【{self._display_name(agent_name)}】超时了，没有回复"
-                    else:
-                        notify = f"【{self._display_name(agent_name)}】出错了: {err_text}"
-                    try:
-                        await self.context.send_message(event.unified_msg_origin, MessageChain([Plain(notify)]))
-                        await asyncio.sleep(self.config.get("fragment_interval", 0.3))
-                    except Exception as e:
-                        logger.error(f"[parallel_handoff] 失败通知发送失败 [{agent_name}]: {e}")
+                    await self._send_failure_notify(r, event)
 
             # ── 构建返回摘要 ─────────────────────────────────
             summary = {
