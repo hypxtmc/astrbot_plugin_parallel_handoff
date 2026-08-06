@@ -71,7 +71,12 @@ class ParallelHandoffPlugin(Star):
         "tech": "技术Agent",
         "memory": "记忆管家",
         "search": "搜索Agent",
+        "agent_b": "助手B",
+        "agent_d": "助手D",
         "xi": "夕",
+        "shu": "黍",
+        "nian": "年",
+        "ling": "令",
     }
     # 中文显示名 -> agent_name 反向映射
     AGENT_NAME_REVERSE = {v: k for k, v in AGENT_DISPLAY_NAME.items()}

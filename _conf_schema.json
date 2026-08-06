@@ -51,13 +51,13 @@
     "description": "子代理前缀覆盖表（JSON格式）",
     "type": "string",
     "default": "{}",
-    "hint": "按子代理名单独控制前缀开关。JSON格式：{\"助手A\": true, \"助手B\": false}。未列出的走全局开关"
+    "hint": "留空即可：所有子代理统一走全局开关（enable_subagent_name_prefix），自动显示【内置中文名】前缀。只有当个别子代理需要特殊开关时才填，JSON格式：{\"agent_a\": false, \"tech\": false}。添加新子代理后无需在此配置"
   },
   "name_display_map": {
     "description": "子代理显示名映射",
     "type": "string",
-    "default": "{\"xi\": \"夕\"}",
-    "hint": "JSON格式，自定义子代理显示名。如 {\"助手A\": \"张先生\", \"助手B\": \"李女士\"}"
+    "default": "{}",
+    "hint": "留空即可：自动使用内置中文显示名（助手A/助手C/助手B/助手D/夕/黍/年/令/技术Agent 等）。仅当需要自定义显示名时才填，JSON格式：{\"agent_a\": \"助手A酱\"}"
   },
   "direct_delivery_agents": {
     "description": "直接发送到用户的子代理列表",
