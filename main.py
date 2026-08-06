@@ -585,6 +585,15 @@ Args:
         scene_prefix = ""
         if enable_scene_inject:
             scene_prefix = self._build_scene_context(event)
+        # ── 共用剧情基线注入（所有子代理共享的世界设定锚点） ──
+        if self._cfg("enable_baseline_inject", True):
+            baseline = (self._cfg("shared_scene_baseline", "") or "").strip()
+            if baseline:
+                scene_prefix = (
+                    f"{scene_prefix}\n【共用剧情场景基线】\n{baseline}\n"
+                    if scene_prefix
+                    else f"【共用剧情场景基线】\n{baseline}\n"
+                )
 
         # ── 长期记忆插件查找 ─────────────────────────────────
         livingmemory_plugin = None
