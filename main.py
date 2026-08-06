@@ -664,10 +664,15 @@ Args:
             # ── 构建子代理工具集 ──
             subagent_tools = None
             try:
+                # 子代理记忆配置：扁平字段优先，兼容旧的 subagent_memory 嵌套对象
                 memory_cfg = self._cfg("subagent_memory", {})
-                memory_enabled = memory_cfg.get("enabled", True) if isinstance(memory_cfg, dict) else True
+                if isinstance(memory_cfg, dict) and memory_cfg:
+                    memory_enabled = self._cfg("recall_enabled", memory_cfg.get("enabled", True))
+                    exclude_raw = self._cfg("exclude_agents", memory_cfg.get("exclude_agents", "tech,技术Agent"))
+                else:
+                    memory_enabled = self._cfg("recall_enabled", True)
+                    exclude_raw = self._cfg("exclude_agents", "tech,技术Agent")
                 if memory_enabled:
-                    exclude_raw = memory_cfg.get("exclude_agents", "tech,技术Agent") if isinstance(memory_cfg, dict) else "tech,技术Agent"
                     exclude_agents = {name.strip() for name in exclude_raw.split(",") if name.strip()}
                     if agent_name not in exclude_agents:
                         global_tools = getattr(
