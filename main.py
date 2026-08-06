@@ -18,6 +18,7 @@
 - enable_mainagent_name_prefix: 主代理姓名前缀,通过 format_mainagent_message() 给主代理消息加前缀
 - enable_disambiguation: 消息消歧,无指名消息自动按最近对话对象路由
 - enable_segmented_forward: 分段转发,子代理回应用分条发不合并
+- enable_mainagent_segmented: 主代理分段转发,主代理自身回复按段落分条发送
 """
 
 import asyncio
@@ -30,8 +31,28 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.event.filter import llm_tool
+from astrbot.api.provider import ProviderRequest
+from astrbot.core.agent.tool import ToolSet
 from astrbot.core.message.components import Plain
 from astrbot.core.message.message_event_result import MessageChain
+
+
+def _strip_chain_injection(text: str) -> str:
+    """剥离接龙注入的前文块（临时上下文），避免污染子代理长期记忆。
+
+    接龙模式（call_mode=chained）会把上一个子代理的输出注入下一个的
+    input，这部分是临时上下文，不应进入本子代理的记忆召回/存储链路。
+    """
+    marker = "（接龙·上一位）"
+    if marker not in text:
+        return text
+    idx = text.find(marker)
+    end_marker = "请接续上文，现在轮到你回应："
+    end = text.find(end_marker, idx)
+    if end == -1:
+        return text[:idx]
+    tail = text[end + len(end_marker):]
+    return text[:idx] + tail.lstrip("\n")
 
 
 @register(
@@ -50,6 +71,7 @@ class ParallelHandoffPlugin(Star):
         "tech": "技术Agent",
         "memory": "记忆管家",
         "search": "搜索Agent",
+        "xi": "夕",
     }
     # 中文显示名 -> agent_name 反向映射
     AGENT_NAME_REVERSE = {v: k for k, v in AGENT_DISPLAY_NAME.items()}
@@ -59,6 +81,12 @@ class ParallelHandoffPlugin(Star):
         self.config = config if config else {}
         # 跟踪每个 session 最近成功调用的子代理,用于消息消歧
         self._last_agent: dict[str, str] = {}
+        # 跨轮对话上下文：{agent_name:session_id -> [{"role": ..., "content": ...}, ...]}
+        self._subagent_contexts: dict[str, list[dict]] = {}
+        self._ctx_enabled = bool(self._cfg("subagent_context_enabled", True))
+        self._ctx_max_turns = int(self._cfg("subagent_context_max_turns", 100))
+        self._ctx_keep_recent = int(self._cfg("subagent_context_keep_recent", 5))
+        self._ctx_compress_ratio = int(self._cfg("subagent_context_compress_ratio", 15))
         # 迁移旧配置键（必须在 _migrate_config 之后再读一次 config）
         self._migrate_config()
 
@@ -107,6 +135,90 @@ class ParallelHandoffPlugin(Star):
             display_name = self._display_name(agent_name)
             return f"【{display_name}】\n{message}"
         return message
+
+    # ── 主代理前缀自动注入（on_decorating_result 钩子）───────
+    @filter.on_decorating_result()
+    async def _inject_mainagent_prefix(self, event: AstrMessageEvent):
+        """在主代理消息发出前自动加【名字】前缀
+
+        通过 on_decorating_result 钩子拦截所有即将发送的消息，
+        当 enable_mainagent_name_prefix=true 且消息不以任何子代理前缀开头时，
+        自动在消息正文前加 "【主代理名】\n" 前缀。
+        子代理分段转发期间此钩子被抑制，避免误加。
+        """
+        if getattr(self, "_suppress_mainagent_prefix", False):
+            # 分段转发已发送子代理回复，清空主代理后续输出避免重复
+            logger.info("[inject_mainagent_prefix] suppress=True, clearing chain to avoid duplicate")
+            result = event.get_result()
+            has_chain = hasattr(result, "chain")
+            if has_chain:
+                chain_len = len(result.chain)
+                logger.info(f"[inject_mainagent_prefix] chain length before clear: {chain_len}")
+                # Log text components
+                for i, comp in enumerate(result.chain):
+                    text = getattr(comp, "text", None)
+                    if text:
+                        logger.info(f"[inject_mainagent_prefix] chain[{i}]: text={text[:80]!r}")
+                result.chain.clear()
+            self._suppress_mainagent_prefix = False
+            logger.info("[inject_mainagent_prefix] suppress flag reset to False, returning")
+            return
+
+        # ── 主代理分段转发：按空行拆分，逐条发送 ──
+        if self._cfg("enable_mainagent_segmented", False):
+            result = event.get_result()
+            if hasattr(result, "chain") and result.chain:
+                full_text = ""
+                for comp in result.chain:
+                    text = getattr(comp, "text", None)
+                    if isinstance(text, str):
+                        full_text += text
+                full_text = full_text.strip()
+                if full_text:
+                    segments = [s.strip() for s in full_text.split("\n\n") if s.strip()]
+                    if len(segments) > 1:
+                        try:
+                            add_prefix = self._cfg("enable_mainagent_name_prefix", False)
+                            prefix_str = ""
+                            if add_prefix:
+                                prefix_str = f"【{self._cfg('main_agent_name', '普瑞赛斯')}】\n"
+                            for idx, seg_text in enumerate(segments):
+                                msg = seg_text
+                                if idx == 0 and prefix_str:
+                                    msg = f"{prefix_str}{seg_text}"
+                                await self.context.send_message(
+                                    event.unified_msg_origin,
+                                    MessageChain([Plain(msg)]),
+                                )
+                                await asyncio.sleep(self.config.get("fragment_interval", 0.3))
+                        except Exception as e:
+                            logger.error(f"[inject_mainagent_prefix] 分段发送失败: {e}")
+                        # 清空原始链，不让框架重复发送
+                        result.chain.clear()
+                        return
+        if not self._cfg("enable_mainagent_name_prefix", False):
+            return
+
+        result = event.get_result()
+        if not (hasattr(result, "chain") and result.chain):
+            return
+
+        main_agent_name = self._cfg("main_agent_name", "普瑞赛斯")
+        prefix_str = f"【{main_agent_name}】\n"
+
+        for comp in result.chain:
+            text = getattr(comp, "text", None)
+            if not isinstance(text, str) or text.startswith("【"):
+                continue
+            # 跳过纯空白文本——避免 tool call 前的空行被加上前缀
+            if not text.strip():
+                continue
+            comp.text = prefix_str + text
+            logger.info(
+                f"[parallel_handoff] 已为主代理消息添加前缀: "
+                f"【{main_agent_name}】"
+            )
+            break  # 只给第一个 text 组件加前缀
 
     # ── 配置读取 helper ──────────────────────────────────────
     def _cfg(self, key: str, default=None):
@@ -228,7 +340,10 @@ class ParallelHandoffPlugin(Star):
         parts = []
 
         sender = event.get_sender_name()
-        if sender:
+        sender_id = event.get_sender_id()
+        if sender and sender_id:
+            parts.append(f"当前对话对象：{sender}（ID: {sender_id}）")
+        elif sender:
             parts.append(f"当前对话对象：{sender}")
 
         msg_type = event.get_message_type()
@@ -331,7 +446,7 @@ class ParallelHandoffPlugin(Star):
         self,
         event: AstrMessageEvent,
         calls: list[dict] = None,
-        timeout: int = 15,
+        timeout: int = 30,
         message: str = None,
     ) -> str:
         """并行调用多个子代理（如阿米娅、特蕾西娅、tech、memory、search）,
@@ -396,6 +511,18 @@ Args:
         if enable_scene_inject:
             scene_prefix = self._build_scene_context(event)
 
+        # ── 长期记忆插件查找 ─────────────────────────────────
+        livingmemory_plugin = None
+        try:
+            all_stars = self.context.get_all_stars()
+            for star in all_stars:
+                name = getattr(star, "name", "")
+                if "livingmemory" in name.lower():
+                    livingmemory_plugin = star.star_cls
+                    break
+        except Exception:
+            pass
+
         # ── 单子代理调用 ─────────────────────────────────────
         async def _call_one(call: dict) -> dict:
             """调用单个子代理,带超时和错误隔离"""
@@ -435,6 +562,58 @@ Args:
             if enable_scene_inject and scene_prefix:
                 final_input = f"{scene_prefix}\n\n{input_text}"
 
+            # ── 记忆召回：注入长期记忆 ──
+            # 接龙注入的前文是临时上下文：记忆链路（召回/存储）统一剥离，
+            # 避免上一个子代理的输出污染本子代理的长期记忆。
+            clean_input = _strip_chain_injection(final_input)
+            if livingmemory_plugin:
+                try:
+                    event.persona_id = agent_name
+                    req = ProviderRequest(
+                        prompt=clean_input,
+                        extra_user_content_parts=[],
+                    )
+                    await livingmemory_plugin.handle_memory_recall(event, req)
+
+                    # 保留记忆注入内容，透传给子代理的 provider
+                    memory_extra_parts = list(req.extra_user_content_parts or [])
+                except Exception as e:
+                    logger.warning(
+                        f"[parallel_handoff] Memory recall failed for "
+                        f"{agent_name}: {e}"
+                    )
+                    memory_extra_parts = []
+            else:
+                memory_extra_parts = []
+
+            # ── 构建子代理工具集 ──
+            subagent_tools = None
+            try:
+                memory_cfg = self._cfg("subagent_memory", {})
+                memory_enabled = memory_cfg.get("enabled", True) if isinstance(memory_cfg, dict) else True
+                if memory_enabled:
+                    exclude_raw = memory_cfg.get("exclude_agents", "tech,技术Agent") if isinstance(memory_cfg, dict) else "tech,技术Agent"
+                    exclude_agents = {name.strip() for name in exclude_raw.split(",") if name.strip()}
+                    if agent_name not in exclude_agents:
+                        global_tools = getattr(
+                            self.context.provider_manager, "llm_tools", None
+                        )
+                        if global_tools and not global_tools.empty():
+                            memory_tools = []
+                            for tool in global_tools.func_list:
+                                if tool.name in (
+                                    "recall_long_term_memory",
+                                    "memorize_long_term_memory",
+                                ):
+                                    memory_tools.append(tool)
+                            if memory_tools:
+                                subagent_tools = ToolSet(tools=memory_tools)
+            except Exception as e:
+                logger.warning(
+                    f"[parallel_handoff] Failed to build agent tools for "
+                    f"{agent_name}: {e}"
+                )
+
             t0 = time.perf_counter()
             try:
                 umo = event.unified_msg_origin
@@ -443,17 +622,73 @@ Args:
                     or await self.context.get_current_chat_provider_id(umo)
                 )
 
+                # ── 上下文注入：跨轮对话历史 ──
+                if self._ctx_enabled and agent_name not in ("tech", "技术Agent"):
+                    ctx_session_id = event.unified_msg_origin
+                    ctx_key = f"{agent_name}:{ctx_session_id}"
+                    ctx_history = self._subagent_contexts.get(ctx_key, [])
+                    if ctx_history:
+                        ctx_turns = len(ctx_history) // 2
+                        if ctx_turns <= self._ctx_max_turns:
+                            ctx_text = self._format_context_history(ctx_history)
+                            final_input = f"--- 对话历史 ---\n{ctx_text}\n--- 新的输入 ---\n{final_input}"
+                        else:
+                            try:
+                                ctx_text = await self._compress_context_history(
+                                    agent_name, ctx_session_id, ctx_history, prov_id, handoff, timeout
+                                )
+                            except Exception:
+                                max_msgs = self._ctx_max_turns * 2
+                                ctx_text = self._format_context_history(ctx_history[-max_msgs:])
+                            final_input = f"--- 对话历史 ---\n{ctx_text}\n--- 新的输入 ---\n{final_input}"
+
                 llm_resp = await asyncio.wait_for(
                     self.context.llm_generate(
                         chat_provider_id=prov_id,
                         prompt=final_input,
                         system_prompt=handoff.agent.instructions or "",
+                        tools=subagent_tools,
+                        extra_user_content_parts=memory_extra_parts,
                     ),
                     timeout=timeout,
                 )
                 latency_ms = int((time.perf_counter() - t0) * 1000)
                 raw_response = llm_resp.completion_text
 
+                # ── 记忆存储：存入长期记忆 ──
+                if livingmemory_plugin:
+                    try:
+                        conv_mgr = (
+                            livingmemory_plugin
+                            .event_handler._memory_recall.conversation_manager
+                        )
+                        await conv_mgr.add_message_from_event(
+                            event, role="user", content=_strip_chain_injection(final_input)
+                        )
+                        await conv_mgr.add_message_from_event(
+                            event, role="assistant", content=raw_response
+                        )
+                        session_id = event.unified_msg_origin
+                        await (
+                            livingmemory_plugin
+                            .event_handler._memory_recall.message_utils
+                            .enforce_message_limit(session_id)
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"[parallel_handoff] Memory storage failed for "
+                            f"{agent_name}: {e}"
+                        )
+
+                # 清理 persona_id（由上方的记忆召回阶段设置），确保下轮调用不残留
+                if hasattr(event, "persona_id"):
+                    delattr(event, "persona_id")
+
+                # ── 上下文存储：追加到跨轮对话历史 ──
+                if self._ctx_enabled and agent_name not in ("tech", "技术Agent"):
+                    self._append_context(agent_name, event.unified_msg_origin, input_text, raw_response)
+
+                # 自动转发已由 parallel_handoff 的分段转发负责,此处不再重复推送
                 # 姓名前缀（先查覆盖表,再走全局开关）
                 overrides = self._get_name_prefix_overrides()
                 if isinstance(overrides, dict) and agent_name in overrides:
@@ -463,7 +698,9 @@ Args:
 
                 if should_prefix:
                     display_name = self._display_name(agent_name)
-                    raw_response = f"【{display_name}】\n{raw_response}"
+                    prefix_str = f"【{display_name}】\n"
+                    if not raw_response.startswith(prefix_str):
+                        raw_response = prefix_str + raw_response
 
                 return {
                     "agent_name": agent_name,
@@ -477,6 +714,8 @@ Args:
                 logger.warning(
                     f"[parallel_handoff] Subagent '{agent_name}' timed out after {timeout}s"
                 )
+                if hasattr(event, "persona_id"):
+                    delattr(event, "persona_id")
                 err_text = f"Timeout after {timeout}s"
                 overrides = self._get_name_prefix_overrides()
                 if isinstance(overrides, dict) and agent_name in overrides:
@@ -485,7 +724,9 @@ Args:
                     should_prefix = enable_name_prefix
                 if should_prefix:
                     display_name = self._display_name(agent_name)
-                    err_text = f"【{display_name}】\n{err_text}"
+                    prefix_str = f"【{display_name}】\n"
+                    if not err_text.startswith(prefix_str):
+                        err_text = prefix_str + err_text
                 return {
                     "agent_name": agent_name,
                     "success": False,
@@ -494,6 +735,8 @@ Args:
                     "order": order,
                 }
             except Exception as e:
+                if hasattr(event, "persona_id"):
+                    delattr(event, "persona_id")
                 latency_ms = int((time.perf_counter() - t0) * 1000)
                 logger.error(
                     f"[parallel_handoff] Subagent '{agent_name}' failed: {e}"
@@ -506,7 +749,9 @@ Args:
                     should_prefix = enable_name_prefix
                 if should_prefix:
                     display_name = self._display_name(agent_name)
-                    err_text = f"【{display_name}】\n{err_text}"
+                    prefix_str = f"【{display_name}】\n"
+                    if not err_text.startswith(prefix_str):
+                        err_text = prefix_str + err_text
                 return {
                     "agent_name": agent_name,
                     "success": False,
@@ -522,22 +767,43 @@ Args:
                 ensure_ascii=False,
             )
 
+        call_mode = self._cfg("call_mode", "parallel")
+
         logger.info(
-            f"[parallel_handoff] Dispatching {len(calls)} parallel subagent calls"
+            f"[parallel_handoff] Dispatching {len(calls)} subagent calls (mode={call_mode})"
         )
         t_total = time.perf_counter()
-        tasks = [_call_one(c) for c in calls]
-        results = await asyncio.gather(*tasks)
-        total_latency_ms = int((time.perf_counter() - t_total) * 1000)
-
-        # 按 order 排序（如果有的话）
-        has_order = any(r.get("order") is not None for r in results)
-        if has_order:
-            results.sort(
-                key=lambda r: (
-                    r.get("order") if r.get("order") is not None else 999999
+        if call_mode == "chained":
+            # ── 接龙模式：串行调用，前一个子代理的回复注入下一个的输入 ──
+            # 注：direct/relay 均为发送方式，在调用完成后统一分发（见下方分段转发），
+            #     与接龙的调用方式正交，互不冲突。
+            results = []
+            for i, c in enumerate(calls):
+                if i > 0 and results and results[-1].get("success"):
+                    prev = results[-1]
+                    c = dict(c)
+                    prev_display = self._display_name(prev.get("agent_name", ""))
+                    chain_note = (
+                        f"（接龙·上一位）【{prev_display}】的回复：\n"
+                        f"{prev.get('response', '')}\n\n"
+                        f"请接续上文，现在轮到你回应："
+                    )
+                    c["input"] = chain_note + (c.get("input") or "")
+                results.append(await _call_one(c))
+            # 接龙模式保持调用顺序发送，不按 order 重排（order 仅对并行模式生效）
+        else:
+            # ── 并行模式（默认）──
+            tasks = [_call_one(c) for c in calls]
+            results = await asyncio.gather(*tasks)
+            # 按 order 排序（如果有的话）
+            has_order = any(r.get("order") is not None for r in results)
+            if has_order:
+                results.sort(
+                    key=lambda r: (
+                        r.get("order") if r.get("order") is not None else 999999
+                    )
                 )
-            )
+        total_latency_ms = int((time.perf_counter() - t_total) * 1000)
 
         # ── 跟踪最近调用的子代理（用于消歧） ─────────────────
         if enable_disambiguation:
@@ -553,14 +819,36 @@ Args:
             f"{fail_count} failed, total {total_latency_ms}ms"
         )
 
+        # ── 读取直接发送名单 ─────────────────────────────────
+        direct_agents_str = self._cfg("direct_delivery_agents", "amiya,closure,theresia")
+        direct_agents = {
+            name.strip().lower()
+            for name in direct_agents_str.split(",")
+            if name.strip()
+        }
+        # 非直接发送代理的完整回复收集
+        return_agent_results = []
+
         # ── 分段转发：按中文括号拆分逐条发送 ─────────────────
         if enable_segmented_forward:
+            self._suppress_mainagent_prefix = True
+            pending_text = ""
             for r in results:
-                if r.get("success"):
+                agent_name = r.get("agent_name", "")
+                is_direct = agent_name.lower() in direct_agents
+
+                if r.get("success") and is_direct:
                     text = r.get("response", "")
+                    # 先提取姓名前缀（如 "【阿米娅】\n"），避免被分段逻辑拆散
+                    prefix = ""
+                    content = text
+                    prefix_match = re.match(r"^(【[^】]+】)\n", text)
+                    if prefix_match:
+                        prefix = prefix_match.group(1)
+                        content = text[prefix_match.end():]
                     # 1. 如果文本中含有中文括号,按括号拆分
-                    if "（" in text:
-                        raw_segments = re.split(r"(（[^）]*）)", text)
+                    if "（" in content:
+                        raw_segments = re.split(r"(（[^）]*）)", content)
                         raw_segments = [s.strip() for s in raw_segments if s.strip()]
                         min_len = self.config.get("min_fragment_length", 5)
                         segments = []
@@ -579,46 +867,100 @@ Args:
                             else:
                                 segments.append(seg)
                                 i += 1
+                        # 按双换行进一步拆分段内段落，防止 \n\n 被吞
+                        final_segments = []
+                        for seg in segments:
+                            sub_segs = seg.split("\n\n")
+                            final_segments.extend([s.strip() for s in sub_segs if s.strip()])
+                        segments = final_segments
                     else:
                         # 2. 回退到换行拆分：先双换行,再单换行
-                        segments = text.split("\n\n")
+                        segments = content.split("\n\n")
                         if len(segments) == 1:
-                            segments = text.split("\n")
+                            segments = content.split("\n")
                         segments = [s.strip() for s in segments if s.strip()]
-                    for seg in segments:
-                        if not seg:
-                            continue
+                    # 返回文本给主代理，让框架正常发送，不自己发
+                    try:
+                        full_content = "\n\n".join(segments)
+                        if prefix:
+                            full_content = f"{prefix}\n{full_content}"
+                        # 分段转发：各段落单独发
                         try:
-                            await event.send(MessageChain([Plain(seg)]))
-                            await asyncio.sleep(self.config.get("fragment_interval", 0.3))
+                            for idx, seg_text in enumerate(segments):
+                                if idx == 0 and prefix:
+                                    msg = f"{prefix}\n{seg_text}"
+                                else:
+                                    msg = seg_text
+                                await self.context.send_message(
+                                    event.unified_msg_origin,
+                                    MessageChain([Plain(msg)]),
+                                )
+                                await asyncio.sleep(self.config.get("fragment_interval", 0.3))
                         except Exception as e:
                             logger.error(
-                                f"[parallel_handoff] 分段发送失败 [{r.get('agent_name')}]: {e}"
+                                f"[parallel_handoff] 发送失败 [{r.get('agent_name')}]: {e}"
                             )
-            # 返回摘要给 LLM,避免重复输出完整内容
-            return json.dumps(
-                {
-                    "segmented_forward": True,
-                    "note": "各子代理回复已分条直接发送给用户,以下为摘要",
-                    "results": [
-                        {
-                            "agent_name": r.get("agent_name"),
-                            "success": r.get("success"),
-                            "latency_ms": r.get("latency_ms"),
-                            "response_preview": (r.get("response", "") or "")[:120],
-                        }
-                        for r in results
-                    ],
-                    "summary": {
-                        "total": len(results),
-                        "success": success_count,
-                        "failed": fail_count,
-                        "total_latency_ms": total_latency_ms,
-                    },
+                    except Exception as e:
+                        logger.error(
+                            f"[parallel_handoff] 处理失败 [{r.get('agent_name')}]: {e}"
+                        )
+                elif r.get("success"):
+                    # 非直接发送代理（如tech）— 收集完整回复返回给主代理
+                    if agent_name not in [ra.get("agent_name") for ra in return_agent_results]:
+                        return_agent_results.append(r)
+                else:
+                    # 失败的子代理（超时/报错），通知用户
+                    agent_name = r.get("agent_name", "未知")
+                    err_text = r.get("response", "未知错误")
+                    if "Timeout" in err_text:
+                        notify = f"【{self._display_name(agent_name)}】超时了，没有回复"
+                    else:
+                        notify = f"【{self._display_name(agent_name)}】出错了: {err_text}"
+                    try:
+                        await self.context.send_message(event.unified_msg_origin, MessageChain([Plain(notify)]))
+                        await asyncio.sleep(self.config.get("fragment_interval", 0.3))
+                    except Exception as e:
+                        logger.error(f"[parallel_handoff] 失败通知发送失败 [{agent_name}]: {e}")
+
+            # ── 构建返回摘要 ─────────────────────────────────
+            summary = {
+                "segmented_forward": True,
+                "note": "各子代理回复已分条直接发送给用户,以下为摘要",
+                "results": [
+                    {
+                        "agent_name": r.get("agent_name"),
+                        "success": r.get("success"),
+                        "latency_ms": r.get("latency_ms"),
+                        "response_preview": (r.get("response", "") or "")[:120],
+                    }
+                    for r in results
+                ],
+                "summary": {
+                    "total": len(results),
+                    "success": success_count,
+                    "failed": fail_count,
+                    "total_latency_ms": total_latency_ms,
                 },
-                ensure_ascii=False,
-                indent=2,
-            )
+            }
+            # 如有非直接发送代理的完整回复，附加到摘要中
+            if return_agent_results:
+                summary["note"] = (
+                    "以下子代理的回复已直接发送给用户。"
+                    "以下子代理的完整回复返回给主代理处理。"
+                )
+                summary["returned_agents"] = [
+                    {
+                        "agent_name": ra.get("agent_name"),
+                        "success": True,
+                        "latency_ms": ra.get("latency_ms"),
+                        "full_response": ra.get("response", ""),
+                    }
+                    for ra in return_agent_results
+                ]
+            # 注释掉: 此flag由钩子清空chain后自行复位, 不在工具内复位以拦截后续回显
+            # self._suppress_mainagent_prefix = False
+            # 返回子代理回复文本供主代理转发
+            return pending_text if pending_text else "✓"
 
         # ── 默认：合并返回 ───────────────────────────────────
         return json.dumps(
@@ -634,3 +976,80 @@ Args:
             ensure_ascii=False,
             indent=2,
         )
+
+    # ── 跨轮上下文辅助方法 ─────────────────────────────────
+
+    def _format_context_history(self, history: list[dict]) -> str:
+        """格式化对话历史列表为文本"""
+        lines = []
+        for msg in history:
+            role_label = "user" if msg["role"] == "user" else "assistant"
+            lines.append(f"{role_label}: {msg['content']}")
+        return "\n".join(lines)
+
+    async def _compress_context_history(
+        self, agent_name: str, session_id: str, history: list[dict],
+        prov_id: str, handoff, timeout: int
+    ) -> str:
+        """压缩对话历史：保留最近 N 轮完整对话 + LLM 摘要旧对话"""
+        keep_count = self._ctx_keep_recent * 2
+        if len(history) <= keep_count:
+            return self._format_context_history(history)
+
+        recent = history[-keep_count:]
+        old = history[:-keep_count]
+
+        old_text = self._format_context_history(old)
+        compress_prompt = (
+            f"请将以下对话历史压缩为一段简洁的摘要，保留关键信息、上下文和决策。"
+            f"压缩后长度约为原文的{self._ctx_compress_ratio}%。"
+            f"只输出摘要文本，不要加任何前缀或解释。\n\n{old_text}"
+        )
+
+        llm_resp = await asyncio.wait_for(
+            self.context.llm_generate(
+                chat_provider_id=prov_id,
+                prompt=compress_prompt,
+                system_prompt="你是一个对话摘要助手。请简洁地总结对话内容。",
+            ),
+            timeout=min(timeout, 30),
+        )
+        summary = llm_resp.completion_text.strip()
+
+        recent_text = self._format_context_history(recent)
+        return f"[历史摘要]\n{summary}\n\n[最近对话]\n{recent_text}"
+
+    def _append_context(self, agent_name: str, session_id: str, user_input: str, assistant_response: str):
+        """追加一轮对话到上下文历史，上限 200 条消息"""
+        ctx_key = f"{agent_name}:{session_id}"
+        if ctx_key not in self._subagent_contexts:
+            self._subagent_contexts[ctx_key] = []
+
+        history = self._subagent_contexts[ctx_key]
+        history.append({"role": "user", "content": user_input})
+        history.append({"role": "assistant", "content": assistant_response})
+
+        if len(history) > 200:
+            self._subagent_contexts[ctx_key] = history[-200:]
+
+    # ── 统一单代理路由 ─────────────────────────────────────
+    @llm_tool(name="call_subagent")
+    async def call_subagent(
+        self,
+        event: AstrMessageEvent,
+        agent_name: str,
+        input: str,
+    ) -> str:
+        """替代 transfer_to_* 工具的统一入口。调用单个子代理并将回复直接分段转发到用户。
+
+使用场景：
+- 用户明确要求与某子代理对话（如「可露希尔，改掌机的事交给你了」）
+- 用户提到子代理名字后说正事
+- 相比 transfer_to_* 工具，本工具确保回复直接发到用户而不用主代理转述
+
+Args:
+    agent_name (string): 子代理名称。可选值: amiya(阿米娅), closure(可露希尔), theresia(特蕾西娅), tech(技术Agent), xi(夕)
+    input (string): 传给子代理的完整问题或指令
+"""
+        calls = [{"agent_name": agent_name, "input": input}]
+        return await self.parallel_handoff(event, calls=calls)

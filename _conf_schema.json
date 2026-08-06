@@ -21,7 +21,19 @@
     "description": "主代理消息启用姓名前缀",
     "type": "bool",
     "default": false,
-    "hint": "主代理（调用本工具的一方）回复消息时是否加【名字】前缀。默认关闭，因为主代理通常只有一个人。可在 format_mainagent_message() 方法中使用。"
+    "hint": "主代理（调用本工具的一方）回复消息时是否通过 on_decorating_result 钩子自动加【名字】前缀。"
+  },
+  "enable_mainagent_segmented": {
+    "description": "主代理启用分段转发",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后主代理自身回复按空行拆分，逐条单独发送。关闭则整个回复作为一条消息发送。子代理分段转发由 enable_segmented_forward 独立控制。"
+  },
+  "main_agent_name": {
+    "description": "主代理显示名",
+    "type": "string",
+    "default": "普瑞赛斯",
+    "hint": "启用主代理姓名前缀时使用的中文显示名。默认为「普瑞赛斯」。"
   },
   "enable_scene_inject": {
     "description": "启用场景注入",
@@ -44,7 +56,79 @@
   "name_display_map": {
     "description": "子代理显示名映射",
     "type": "string",
-    "default": "{}",
+    "default": "{\"xi\": \"夕\"}",
     "hint": "JSON格式，自定义子代理显示名。如 {\"张三\": \"张先生\", \"李四\": \"李女士\"}"
+  },
+  "direct_delivery_agents": {
+    "description": "直接发送到用户的子代理列表",
+    "type": "string",
+    "default": "amiya,closure,theresia,xi",
+    "hint": "逗号分隔的子代理名。列表中的子代理回复会直接分段发送到用户。不在列表中的（如tech）回复会返回给主代理处理。"
+  },
+  "subagent_memory": {
+    "description": "子代理长期记忆设置",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用子代理记忆工具",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后所有子代理都不会获得 recall_long_term_memory 和 memorize_long_term_memory 工具"
+      },
+      "exclude_agents": {
+        "description": "排除记忆工具的代理列表",
+        "type": "string",
+        "default": "tech,技术Agent",
+        "hint": "逗号分隔的子代理名，这些代理即使全局启用也不会得到记忆工具"
+      },
+      "recall_default_k": {
+        "description": "单次回忆默认结果数",
+        "type": "int",
+        "default": 5,
+        "hint": "Agent 未指定 k 时的默认召回条数"
+      },
+      "recall_max_k": {
+        "description": "单次回忆最大结果数",
+        "type": "int",
+        "default": 10,
+        "hint": "限制每次回忆返回的最大记忆条数，防止超长上下文"
+      }
+    }
+  },
+  "subagent_context_enabled": {
+    "description": "启用跨轮对话上下文",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后子代理会记住本轮 session 内的对话历史（tech/技术Agent 始终不启用）。关闭则每次调用都是独立的新对话。"
+  },
+  "subagent_context_max_turns": {
+    "description": "最大历史轮数",
+    "type": "int",
+    "default": 100,
+    "hint": "对话历史超过此轮数后会触发压缩（LLM 摘要 + 保留最近 N 轮完整对话）。每轮 = 一对 user+assistant 消息。"
+  },
+  "subagent_context_keep_recent": {
+    "description": "压缩时保留的最近完整轮数",
+    "type": "int",
+    "default": 5,
+    "hint": "历史超限时，保留最近 N 轮完整对话原文，其余部分用 LLM 压缩为摘要。"
+  },
+  "subagent_context_compress_ratio": {
+    "description": "压缩后保留比例（%）",
+    "type": "int",
+    "default": 15,
+    "hint": "LLM 压缩历史时，摘要长度约为原文的百分比。值越小摘要越短。"
+  },
+  "route_mode": {
+    "description": "子代理路由模式",
+    "type": "string",
+    "default": "direct",
+    "hint": "direct=用call_subagent路由，子代理回复直接发用户端不中转；relay=用transfer_to_*路由，子代理回复返回主代理转发。WebUI切换后直接生效，无需重启。"
+  },
+  "call_mode": {
+    "description": "子代理调用模式",
+    "type": "string",
+    "default": "parallel",
+    "hint": "parallel=并行调用所有子代理（快，各说各话）；chained=接龙式串行调用（慢，前一个子代理的回复自动传给下一个作为上下文，剧情连贯）。direct/relay 路由模式不受影响，接龙时两者均正常工作。"
   }
 }

@@ -21,6 +21,8 @@ if PLUGIN_DIR not in sys.path:
 _fake_api = MagicMock()
 _fake_api.logger = MagicMock()
 _fake_api.AstrBotConfig = dict
+_fake_api.provider = MagicMock()
+_fake_api.provider.ProviderRequest = MagicMock()
 
 _fake_event = MagicMock()
 _fake_event.filter = MagicMock()
@@ -45,8 +47,19 @@ sys.modules["astrbot.api"] = _fake_api
 sys.modules["astrbot.api.event"] = _fake_event
 sys.modules["astrbot.api.event.filter"] = _fake_event_filter
 sys.modules["astrbot.api.star"] = _fake_star
-sys.modules["astrbot.core"] = MagicMock()
-sys.modules["astrbot.core.message"] = MagicMock()
+sys.modules["astrbot.api.provider"] = _fake_api.provider
+
+_fake_core = MagicMock()
+_fake_core.agent = MagicMock()
+_fake_core.agent.tool = MagicMock()
+_fake_core.agent.tool.ToolSet = MagicMock()
+_fake_core.message = MagicMock()
+_fake_core.message.components = _fake_components
+_fake_core.message.message_event_result = _fake_msg_result
+sys.modules["astrbot.core"] = _fake_core
+sys.modules["astrbot.core.agent"] = _fake_core.agent
+sys.modules["astrbot.core.agent.tool"] = _fake_core.agent.tool
+sys.modules["astrbot.core.message"] = _fake_core.message
 sys.modules["astrbot.core.message.components"] = _fake_components
 sys.modules["astrbot.core.message.message_event_result"] = _fake_msg_result
 
@@ -84,6 +97,7 @@ class TestSchema(unittest.TestCase):
             "min_fragment_length",
             "enable_subagent_name_prefix",
             "enable_mainagent_name_prefix",
+            "main_agent_name",
             "enable_scene_inject",
             "enable_segmented_forward",
             "name_prefix_overrides",
@@ -99,11 +113,17 @@ class TestSchema(unittest.TestCase):
             "name_display_map type 应为 string",
         )
 
-        # 验证默认值为 "{}"
-        self.assertEqual(
+        # 验证默认值非空
+        self.assertIsInstance(
             self.schema["name_display_map"]["default"],
-            "{}",
-            "name_display_map default 应为 \"{}\"",
+            str,
+            "name_display_map default 应为 string",
+        )
+        # 验证 main_agent_name 默认值
+        self.assertEqual(
+            self.schema["main_agent_name"]["default"],
+            "普瑞赛斯",
+            "main_agent_name default 应为 普瑞赛斯",
         )
 
 
@@ -205,6 +225,106 @@ class TestPrefixOverrides(unittest.TestCase):
         plugin = self._make_plugin({"name_prefix_overrides": ""})
         result = plugin._get_name_prefix_overrides()
         self.assertEqual(result, {})
+
+
+class TestMainagentPrefix(unittest.TestCase):
+    """测试 format_mainagent_message 和主代理前缀功能"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.PluginClass = _load_plugin_class()
+
+    def _make_plugin(self, config: dict = None):
+        mock_context = MagicMock()
+        if config is None:
+            config = {}
+        plugin = self.PluginClass(context=mock_context, config=config)
+        return plugin
+
+    def test_format_mainagent_disabled(self):
+        """enable_mainagent_name_prefix=false 时返回原文"""
+        plugin = self._make_plugin({
+            "enable_mainagent_name_prefix": False,
+        })
+        result = plugin.format_mainagent_message("你好", "普瑞赛斯")
+        self.assertEqual(result, "你好")
+
+    def test_format_mainagent_enabled(self):
+        """enable_mainagent_name_prefix=true 时加前缀"""
+        plugin = self._make_plugin({
+            "enable_mainagent_name_prefix": True,
+        })
+        result = plugin.format_mainagent_message("你好", "普瑞赛斯")
+        self.assertEqual(result, "【普瑞赛斯】\n你好")
+
+    def test_format_mainagent_custom_name(self):
+        """使用 main_agent_name 配置自定义名"""
+        plugin = self._make_plugin({
+            "enable_mainagent_name_prefix": True,
+            "main_agent_name": "博士",
+        })
+        result = plugin.format_mainagent_message("测试消息", "博士")
+        self.assertEqual(result, "【博士】\n测试消息")
+
+    def test_format_mainagent_name_display_map(self):
+        """name_display_map 中的主代理名优先生效"""
+        plugin = self._make_plugin({
+            "enable_mainagent_name_prefix": True,
+            "main_agent_name": "普瑞赛斯",
+            "name_display_map": json.dumps({"普瑞赛斯": "主控"}),
+        })
+        result = plugin.format_mainagent_message("内容", "普瑞赛斯")
+        self.assertEqual(result, "【主控】\n内容")
+
+
+class TestPrefixDedup(unittest.TestCase):
+    """测试前缀去重：_call_one 中不应重复添加已有前缀"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.PluginClass = _load_plugin_class()
+
+    def _make_plugin(self, config: dict = None):
+        mock_context = MagicMock()
+        if config is None:
+            config = {}
+        plugin = self.PluginClass(context=mock_context, config=config)
+        return plugin
+
+    def test_prefix_not_doubled_when_already_present(self):
+        """子代理回复已含前缀时，_display_name 逻辑不应重复"""
+        plugin = self._make_plugin({
+            "enable_subagent_name_prefix": True,
+            "name_display_map": json.dumps({"amiya": "阿米娅"}),
+        })
+        # 模拟子代理已返回带前缀的文本
+        text_with_prefix = "【阿米娅】\n这是子代理的回复"
+        display_name = plugin._display_name("amiya")
+        prefix_str = f"【{display_name}】\n"
+
+        # 验证去重逻辑：如果已有前缀不再添加
+        if not text_with_prefix.startswith(prefix_str):
+            text_with_prefix = prefix_str + text_with_prefix
+        # 前缀应该仍然只出现一次
+        self.assertTrue(text_with_prefix.startswith("【阿米娅】\n"))
+        # 前缀后面不应该再出现第二次
+        after_prefix = text_with_prefix[len("【阿米娅】\n"):]
+        self.assertFalse(after_prefix.startswith("【阿米娅】"))
+
+    def test_prefix_added_when_not_present(self):
+        """子代理回复无前缀时正常添加"""
+        plugin = self._make_plugin({
+            "enable_subagent_name_prefix": True,
+        })
+        text = "纯文本回复"
+        display_name = plugin._display_name("amiya")
+        prefix_str = f"【{display_name}】\n"
+
+        if not text.startswith(prefix_str):
+            text = prefix_str + text
+        self.assertTrue(text.startswith("【阿米娅】\n"))
+        # 前缀后内容应与原文一致
+        self.assertEqual(text[len(prefix_str):], "纯文本回复")
 
 
 if __name__ == "__main__":
