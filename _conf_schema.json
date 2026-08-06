@@ -5,6 +5,30 @@
     "default": 0.3,
     "hint": "分段转发模式下，每条片段之间的发送间隔。建议 0.2-0.5 秒，避免触发平台风控。"
   },
+  "recall_enabled": {
+    "description": "子代理长期记忆开关",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后子代理可召回/存储长期记忆（主代理记忆参数不受影响，独立设置）"
+  },
+  "exclude_agents": {
+    "description": "子代理记忆排除名单（逗号分隔）",
+    "type": "string",
+    "default": "tech,技术Agent",
+    "hint": "列出的子代理不启用长期记忆，逗号分隔"
+  },
+  "recall_default_k": {
+    "description": "子代理默认记忆召回条数",
+    "type": "int",
+    "default": 5,
+    "hint": "子代理调用记忆召回时的默认条数，可低于主代理（如设3）"
+  },
+  "recall_max_k": {
+    "description": "子代理记忆召回条数上限",
+    "type": "int",
+    "default": 10,
+    "hint": "召回条数的硬上限，防止一次注入过多记忆"
+  },
   "min_fragment_length": {
     "description": "最小分段长度（字符）",
     "type": "int",
@@ -64,36 +88,6 @@
     "type": "string",
     "default": "amiya,closure,theresia,xi",
     "hint": "逗号分隔的子代理名。列表中的子代理回复会直接分段发送到用户。不在列表中的（如tech）回复会返回给主代理处理。"
-  },
-  "subagent_memory": {
-    "description": "子代理长期记忆设置",
-    "type": "object",
-    "items": {
-      "enabled": {
-        "description": "启用子代理记忆工具",
-        "type": "bool",
-        "default": true,
-        "hint": "关闭后所有子代理都不会获得 recall_long_term_memory 和 memorize_long_term_memory 工具"
-      },
-      "exclude_agents": {
-        "description": "排除记忆工具的代理列表",
-        "type": "string",
-        "default": "tech,技术Agent",
-        "hint": "逗号分隔的子代理名，这些代理即使全局启用也不会得到记忆工具"
-      },
-      "recall_default_k": {
-        "description": "单次回忆默认结果数",
-        "type": "int",
-        "default": 5,
-        "hint": "Agent 未指定 k 时的默认召回条数"
-      },
-      "recall_max_k": {
-        "description": "单次回忆最大结果数",
-        "type": "int",
-        "default": 10,
-        "hint": "限制每次回忆返回的最大记忆条数，防止超长上下文"
-      }
-    }
   },
   "subagent_context_enabled": {
     "description": "启用跨轮对话上下文",
