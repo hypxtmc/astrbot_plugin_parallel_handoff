@@ -86,6 +86,8 @@ class ParallelHandoffPlugin(Star):
         self.config = config if config else {}
         # 跟踪每个 session 最近成功调用的子代理,用于消息消歧
         self._last_agent: dict[str, str] = {}
+        # LLM 工具调用防重标记：{message_key -> (ts, None)}，同一消息重复路由直接短路
+        self._tool_call_seen: dict[str, tuple[float, None]] = {}
         # 跨轮对话上下文：{agent_name:session_id -> [{"role": ..., "content": ...}, ...]}
         self._subagent_contexts: dict[str, list[dict]] = {}
         self._ctx_enabled = bool(self._cfg("subagent_context_enabled", True))
@@ -161,6 +163,54 @@ class ParallelHandoffPlugin(Star):
         except Exception as e:
             logger.error(f"[parallel_handoff] 分段发送失败: {e}")
 
+    def _extract_chain_text(self, result) -> str:
+        """拼接 result.chain 中所有文本组件的文本并去除首尾空白。"""
+        full_text = ""
+        if hasattr(result, "chain") and result.chain:
+            for comp in result.chain:
+                text = getattr(comp, "text", None)
+                if isinstance(text, str):
+                    full_text += text
+        return full_text.strip()
+
+    async def _send_mainagent_segmented(self, result, event) -> bool:
+        """主代理回复分段发送：按空行拆分，段落数>1时逐条直发。
+
+        与 enable_mainagent_segmented 配置联动；首段可选加【主代理名】前缀。
+        返回 True=已分段发送并清空链；False=未分段（未开启/段落数<=1/发送异常），
+        链保持原样由调用方走原样发送路径兜底。
+        """
+        if not self._cfg("enable_mainagent_segmented", False):
+            return False
+        full_text = self._extract_chain_text(result)
+        if not full_text:
+            return False
+        # [主代理亲修 03:08] 剥离首部【名字】前缀，防止与下方 add_prefix 叠加成双前缀
+        full_text = re.sub(r"^\s*【[^】]*】\s*\n?", "", full_text, count=1)
+        segments = [s.strip() for s in full_text.split("\n\n") if s.strip()]
+        if len(segments) <= 1:
+            return False
+        try:
+            add_prefix = self._cfg("enable_mainagent_name_prefix", False)
+            prefix_str = ""
+            if add_prefix:
+                prefix_str = f"【{self._cfg('main_agent_name', '主代理')}】\n"
+            for idx, seg_text in enumerate(segments):
+                msg = seg_text
+                if idx == 0 and prefix_str and not msg.startswith("【"):
+                    msg = f"{prefix_str}{seg_text}"
+                await self.context.send_message(
+                    event.unified_msg_origin,
+                    MessageChain([Plain(msg)]),
+                )
+                await asyncio.sleep(self.config.get("fragment_interval", 0.3))
+        except Exception as e:
+            logger.error(f"[inject_mainagent_prefix] 分段发送失败: {e}")
+            return False
+        # 清空原始链，不让框架重复发送
+        result.chain.clear()
+        return True
+
     async def _send_failure_notify(self, r, event):
         """子代理失败（超时/报错）时通知用户。"""
         try:
@@ -192,6 +242,20 @@ class ParallelHandoffPlugin(Star):
         # 回退到硬编码映射
         return self.AGENT_DISPLAY_NAME.get(agent_name, agent_name)
 
+    def _resolve_agent_name(self, agent_name: str) -> str:
+        """规范化子代理名称：兼容中文名（助手A->agent_a）和大小写（助手->agent_a）。
+
+        优先级：中文显示名反查（硬编码 AGENT_NAME_REVERSE + name_display_map 配置）
+        > 小写归一。找不到则返回小写后的原名（由调用方报错兜底）。
+        """
+        if not agent_name:
+            return agent_name
+        # 中文显示名反查：硬编码表 + 配置表（display_map 为 {英文id: 中文名}）
+        reverse = dict(self.AGENT_NAME_REVERSE)
+        for eng, cn in self._get_name_display_map().items():
+            reverse.setdefault(cn, eng)
+        return reverse.get(agent_name) or agent_name.lower()
+
     # ── 主代理前缀（公共方法，供外部调用） ─────────────────
     def format_mainagent_message(self, message: str, agent_name: str) -> str:
         """给主代理消息加【名字】前缀（由 enable_mainagent_name_prefix 配置控制）。
@@ -222,55 +286,53 @@ class ParallelHandoffPlugin(Star):
         子代理分段转发期间此钩子被抑制，避免误加。
         """
         if getattr(self, "_suppress_mainagent_prefix", False):
-            # 分段转发已发送子代理回复，清空主代理后续输出避免重复
-            logger.info("[inject_mainagent_prefix] suppress=True, clearing chain to avoid duplicate")
+            # 分段转发已直发子代理回复。主代理若有实质台词则加前缀放行，否则静默。
+            # allow_mainagent_after_direct=false 时恢复旧行为：无条件清空。
             result = event.get_result()
             has_chain = hasattr(result, "chain")
+            if not self._cfg("allow_mainagent_after_direct", True):
+                if has_chain:
+                    result.chain.clear()
+                self._suppress_mainagent_prefix = False
+                return
+            has_real_content = False
             if has_chain:
-                chain_len = len(result.chain)
-                logger.info(f"[inject_mainagent_prefix] chain length before clear: {chain_len}")
-                # Log text components
-                for i, comp in enumerate(result.chain):
+                for comp in result.chain:
                     text = getattr(comp, "text", None)
-                    if text:
-                        logger.info(f"[inject_mainagent_prefix] chain[{i}]: text={text[:80]!r}")
-                result.chain.clear()
+                    if isinstance(text, str) and text.strip():
+                        has_real_content = True
+                        break
+            if not has_real_content:
+                # 主代理无实质台词：清空链，静默（不发空壳）
+                if has_chain:
+                    result.chain.clear()
+                self._suppress_mainagent_prefix = False
+                return
+            # 主代理有实质台词：优先走分段转发（enable_mainagent_segmented 联动），
+            # 未分段（段落数<=1 或未开启）时复刻姓名前缀逻辑后原样放行。
+            if await self._send_mainagent_segmented(result, event):
+                # 已分段逐条发送并清空链，静默
+                self._suppress_mainagent_prefix = False
+                return
+            if self._cfg("enable_mainagent_name_prefix", False):
+                main_agent_name = self._cfg("main_agent_name", "主代理")
+                prefix_str = f"【{main_agent_name}】\n"
+                for comp in result.chain:
+                    text = getattr(comp, "text", None)
+                    if not isinstance(text, str) or text.startswith("【"):
+                        continue
+                    if not text.strip():
+                        continue
+                    comp.text = prefix_str + text
+                    break
             self._suppress_mainagent_prefix = False
-            logger.info("[inject_mainagent_prefix] suppress flag reset to False, returning")
             return
 
         # ── 主代理分段转发：按空行拆分，逐条发送 ──
-        if self._cfg("enable_mainagent_segmented", False):
-            result = event.get_result()
-            if hasattr(result, "chain") and result.chain:
-                full_text = ""
-                for comp in result.chain:
-                    text = getattr(comp, "text", None)
-                    if isinstance(text, str):
-                        full_text += text
-                full_text = full_text.strip()
-                if full_text:
-                    segments = [s.strip() for s in full_text.split("\n\n") if s.strip()]
-                    if len(segments) > 1:
-                        try:
-                            add_prefix = self._cfg("enable_mainagent_name_prefix", False)
-                            prefix_str = ""
-                            if add_prefix:
-                                prefix_str = f"【{self._cfg('main_agent_name', '主代理')}】\n"
-                            for idx, seg_text in enumerate(segments):
-                                msg = seg_text
-                                if idx == 0 and prefix_str:
-                                    msg = f"{prefix_str}{seg_text}"
-                                await self.context.send_message(
-                                    event.unified_msg_origin,
-                                    MessageChain([Plain(msg)]),
-                                )
-                                await asyncio.sleep(self.config.get("fragment_interval", 0.3))
-                        except Exception as e:
-                            logger.error(f"[inject_mainagent_prefix] 分段发送失败: {e}")
-                        # 清空原始链，不让框架重复发送
-                        result.chain.clear()
-                        return
+        result = event.get_result()
+        if await self._send_mainagent_segmented(result, event):
+            # 已分段逐条发送并清空链，不再走下方前缀注入
+            return
         if not self._cfg("enable_mainagent_name_prefix", False):
             return
 
@@ -294,6 +356,71 @@ class ParallelHandoffPlugin(Star):
                 f"【{main_agent_name}】"
             )
             break  # 只给第一个 text 组件加前缀
+
+    # ── 路由强制指令注入（OnLLMRequestEvent 钩子）───────────
+    @filter.on_llm_request()
+    async def _route_directive_inject(self, event: AstrMessageEvent, req: ProviderRequest):
+        """按配置向主代理 LLM 请求注入路由强制指令（软注入，不拦截）。
+
+        触发点：仅主代理请求经过 OnLLMRequestEvent（子代理走 llm_generate 不触发）。
+        作用：把 route_mode / call_mode / direct_delivery_agents 算出的路由路径规范
+        注入 req.system_prompt，主代理必须照走；不修改 req.func_tool（工具全保留）。
+        system_prompt 已含标记则跳过，避免 agent 循环多轮重复注入。
+        """
+        try:
+            if not bool(self._cfg("enable_route_directive", True)):
+                return False
+            directive = self._build_route_directive()
+            if not directive:
+                return False
+            marker = "【路由强制指令·parallel_handoff】"
+            system_prompt = req.system_prompt or ""
+            if marker in system_prompt:
+                return False
+            req.system_prompt = f"{system_prompt}\n\n{directive}".strip()
+            logger.info(
+                f"[parallel_handoff] 路由强制指令已注入 "
+                f"(route_mode={self._cfg('route_mode', 'direct')}, "
+                f"call_mode={self._cfg('call_mode', 'parallel')})"
+            )
+        except Exception as e:
+            logger.warning(f"[parallel_handoff] 路由指令注入失败: {e}")
+        return False
+
+    def _build_route_directive(self) -> str:
+        """按配置生成路由路径规范文本；配置缺失时不注入"""
+        route_mode = str(self._cfg("route_mode", "direct")).strip().lower()
+        call_mode = str(self._cfg("call_mode", "parallel")).strip().lower()
+        raw_agents = str(self._cfg("direct_delivery_agents", "")).strip()
+        agent_ids = [a.strip() for a in raw_agents.split(",") if a.strip()]
+        if not agent_ids:
+            return ""
+        display_map = self._get_name_display_map()
+        names = []
+        for aid in agent_ids:
+            if aid in display_map:
+                names.append(str(display_map[aid]))
+            elif aid in self.AGENT_DISPLAY_NAME:
+                names.append(self.AGENT_DISPLAY_NAME[aid])
+            else:
+                names.append(aid)
+        name_str = "、".join(names)
+
+        lines = [
+            "【路由强制指令·parallel_handoff】（由插件注入，主代理必须遵守；不涉及路由的日常对话不受影响）",
+            "当判定需要将消息路由给子代理时，一律使用 parallel_handoff 工具，并按以下路径规范执行：",
+        ]
+        if route_mode == "relay":
+            lines.append("- 路由模式 relay：所有子代理回复返回主代理，由主代理把关后转述，不直接发用户端")
+        else:
+            lines.append(f"- 路由模式 direct：以下子代理回复直接分段转发用户端，不经主代理转述：{name_str}")
+            lines.append("- 其余子代理（如技术Agent）走 relay：回复返回主代理，由主代理把关后转述")
+        if call_mode == "chained":
+            lines.append("- 调用模式 chained：多子代理按接龙顺序串行调用，前一个的回复作为后一个的上下文，禁止并行双发")
+        else:
+            lines.append("- 调用模式 parallel：多子代理并行调用，各说各话，回复统一汇总返回")
+        lines.append("- 工具列表保持完整，禁止摘除或绕过任何工具")
+        return "\n".join(lines)
 
     # ── 配置读取 helper ──────────────────────────────────────
     def _cfg(self, key: str, default=None):
@@ -516,6 +643,46 @@ class ParallelHandoffPlugin(Star):
         yield event.plain_result(f"✅ {verb}「{chinese_name}」的名字前缀")
 
     # ── 核心 tool ────────────────────────────────────────────
+    def _tool_call_dedup_key(self, event: AstrMessageEvent, agents: list = None) -> str:
+        """生成工具调用防重 key：消息 ID + 路由目标子代理签名。
+
+        agents 参与 key 计算：同一条消息内串行调用不同子代理各自放行，
+        只有完全重复的路由（同一批子代理）才短路。agents 为空时回退纯消息 key。
+        """
+        mid = getattr(getattr(event, "message_obj", None), "message_id", None)
+        base = f"mid:{mid}" if mid else f"evt:{id(event)}"
+        if agents:
+            sig = ",".join(sorted({str(a).strip() for a in agents if str(a).strip()}))
+            if sig:
+                return f"{base}|agents:{sig}"
+        return base
+
+    def _dedup_guard(self, event: AstrMessageEvent, agents: list = None):
+        """LLM 同回合重复调用防重：同一消息对同一批子代理的重复路由短路，不同子代理放行。
+
+        返回 None 表示放行；返回 str 表示命中重复，直接作为工具结果返回。
+        窗口 60s，覆盖一次完整 LLM 生成回合；过期自动清理防内存膨胀。
+        """
+        dedup_key = self._tool_call_dedup_key(event, agents)
+        seen = self._tool_call_seen.get(dedup_key)
+        if seen and time.time() - seen[0] < 60:
+            logger.info(f"[parallel_handoff] 同消息重复调用已短路: key={dedup_key}")
+            return json.dumps(
+                {
+                    "results": [],
+                    "note": "该消息已由 parallel_handoff 处理过，本次为 LLM 同回合重复触发，已短路",
+                    "dedup": True,
+                },
+                ensure_ascii=False,
+            )
+        # 标记本消息已进入路由（60s 窗口内不再重复执行）
+        now_ts = time.time()
+        stale = [k for k, v in self._tool_call_seen.items() if now_ts - v[0] >= 60]
+        for k in stale:
+            self._tool_call_seen.pop(k, None)
+        self._tool_call_seen[dedup_key] = (now_ts, None)
+        return None
+
     @llm_tool(name="parallel_handoff")
     async def parallel_handoff(
         self,
@@ -538,6 +705,13 @@ Args:
     timeout(number): 单个子代理的超时秒数,默认15秒。超过此时间未返回则跳过该子代理。
     message(string): 当开启消息消歧且不传calls时,传入原始消息文本,工具会自动路由到最近对话的子代理。
 """
+        # ── LLM 同回合重复调用防重：同一消息对同一批子代理的重复路由短路 ──
+        # 防重 key 含本次路由目标子代理名单，串行调不同子代理可各自放行
+        target_agents = [c.get("agent_name") for c in (calls or []) if isinstance(c, dict)]
+        dedup_result = self._dedup_guard(event, agents=target_agents)
+        if dedup_result is not None:
+            return dedup_result
+
         orchestrator = self.context.subagent_orchestrator
         if not orchestrator or not orchestrator.handoffs:
             return json.dumps(
@@ -611,6 +785,9 @@ Args:
         async def _call_one(call: dict) -> dict:
             """调用单个子代理,带超时和错误隔离"""
             agent_name = (call.get("agent_name") or "").strip()
+            # 中文名/大小写兼容：助手A -> agent_a，助手 -> agent_a（写回 call，后续统一用英文 id）
+            agent_name = self._resolve_agent_name(agent_name)
+            call["agent_name"] = agent_name
             input_text = (call.get("input") or "").strip()
             order = call.get("order")
 
@@ -884,11 +1061,31 @@ Args:
                     c = dict(c)
                     prev_display = self._display_name(prev.get("agent_name", ""))
                     if prev.get("success"):
+                        prev_text = prev.get('response', '')
                         chain_note = (
                             f"（接龙·上一位）【{prev_display}】的回复：\n"
-                            f"{prev.get('response', '')}\n\n"
+                            f"{prev_text}\n\n"
                             f"请接续上文，现在轮到你回应："
                         )
+                        # ── 接龙长回复精简：开关开启且超阈值 → 摘要+首尾 ──
+                        summary_enabled = bool(self._cfg("chain_summary_enabled", True))
+                        threshold = int(self._cfg("chain_summary_threshold", 600))
+                        if summary_enabled and len(prev_text) > threshold:
+                            try:
+                                summary_prov = str(self._cfg("chain_summary_model", "") or "").strip()
+                                if not summary_prov:
+                                    summary_prov = await self.context.get_current_chat_provider_id(
+                                        event.unified_msg_origin
+                                    )
+                                summarized = await self._summarize_chain_reply(
+                                    prev_display, prev_text, summary_prov, timeout
+                                )
+                                if summarized:
+                                    chain_note = summarized
+                            except Exception as e:
+                                logger.warning(
+                                    f"[parallel_handoff] 接龙精简准备失败，降级原样注入: {e}"
+                                )
                     else:
                         # 失败留痕：链上标注谁掉队了，下一个子代理能看到
                         chain_note = (
@@ -901,11 +1098,16 @@ Args:
                 results.append(r)
                 # ── 流式转发：本条立刻发出，不等整条链 ──
                 if enable_segmented_forward:
-                    r["_sent"] = True  # 标记已处理，统一转发阶段跳过
                     if r.get("success") and r.get("agent_name", "").lower() in direct_agents:
+                        # direct 代理：已流式转发，统一转发阶段跳过
+                        r["_sent"] = True
                         await self._forward_segmented(r.get("response", ""), event)
                     elif not r.get("success"):
+                        # 失败：已通知，统一转发阶段跳过
+                        r["_sent"] = True
                         await self._send_failure_notify(r, event)
+                    # 非 direct 且成功（如 tech）：不打 _sent，
+                    # 交由统一转发阶段收集进 return_agent_results 返回完整回复
             # 接龙模式保持调用顺序发送，不按 order 重排（order 仅对并行模式生效）
         else:
             # ── 并行模式（默认）──
@@ -995,8 +1197,14 @@ Args:
                 ]
             # 注释掉: 此flag由钩子清空chain后自行复位, 不在工具内复位以拦截后续回显
             # self._suppress_mainagent_prefix = False
-            # 返回子代理回复文本供主代理转发
-            return pending_text if pending_text else "✓"
+            # 返回子代理回复文本供主代理转发。
+            # 修复：非 direct 代理（如 tech）的完整回复收集在 return_agent_results 中，
+            # 只返回 pending_text 会把回复吞成 "✓"——有完整回复时必须返回摘要 JSON。
+            if pending_text:
+                return pending_text
+            if return_agent_results:
+                return json.dumps(summary, ensure_ascii=False)
+            return "✓"
 
         # ── 默认：合并返回 ───────────────────────────────────
         return json.dumps(
@@ -1055,6 +1263,46 @@ Args:
         recent_text = self._format_context_history(recent)
         return f"[历史摘要]\n{summary}\n\n[最近对话]\n{recent_text}"
 
+    async def _summarize_chain_reply(
+        self, prev_display: str, text: str, prov_id, timeout: int
+    ) -> str | None:
+        """接龙长回复精简：压缩为 摘要+原文首尾 格式。
+
+        - 超阈值才触发，保留首尾各 N 字符，中间用摘要衔接
+        - 保留「（接龙·上一位）」与「请接续上文，现在轮到你回应：」标记，
+          使 _strip_chain_injection 的记忆剥离链路不受影响
+        - 精简失败返回 None，由调用方降级为原样注入
+        """
+        keep = max(20, int(self._cfg("chain_summary_keep_head_tail", 120)))
+        head = text[:keep]
+        tail = text[-keep:] if len(text) > keep * 2 else ""
+        prompt = (
+            f"请将下面这段角色回复压缩为一段简洁的摘要，保留关键剧情、情绪、伏笔和重要原话。"
+            f"摘要控制在 {max(keep, 150)} 字以内，只输出摘要内容，不要加任何前缀或解释。\n\n{text}"
+        )
+        try:
+            llm_resp = await asyncio.wait_for(
+                self.context.llm_generate(
+                    chat_provider_id=prov_id,
+                    prompt=prompt,
+                    system_prompt="你是一个剧情摘要助手，负责把接龙中上一位角色的长回复压缩为简练摘要，保留剧情关键信息。",
+                ),
+                timeout=min(timeout, 30),
+            )
+            summary = (llm_resp.completion_text or "").strip()
+            if not summary:
+                return None
+            return (
+                f"（接龙·上一位）【{prev_display}】的回复（已精简·原文{len(text)}字）：\n"
+                f"【摘要】{summary}\n"
+                f"【原文开头】{head}\n"
+                f"【原文结尾】{tail}\n\n"
+                f"请接续上文，现在轮到你回应："
+            )
+        except Exception as e:
+            logger.warning(f"[parallel_handoff] 接龙精简失败，降级原样注入: {e}")
+            return None
+
     def _append_context(self, agent_name: str, session_id: str, user_input: str, assistant_response: str):
         """追加一轮对话到上下文历史，上限 200 条消息"""
         ctx_key = f"{agent_name}:{session_id}"
@@ -1084,8 +1332,52 @@ Args:
 - 相比 transfer_to_* 工具，本工具确保回复直接发到用户而不用主代理转述
 
 Args:
-    agent_name (string): 子代理名称。可选值: agent_a(助手A), agent_b(助手B), agent_c(助手C), tech(技术Agent), xi(夕)
+    agent_name (string): 子代理名称。支持英文 id（agent_a, agent_b, agent_c, tech, xi 等）和中文名（助手A, 助手B, 助手C, 技术Agent, 夕 等），大小写不敏感
     input (string): 传给子代理的完整问题或指令
 """
         calls = [{"agent_name": agent_name, "input": input}]
         return await self.parallel_handoff(event, calls=calls)
+
+@llm_tool(name="call_tech_relay")
+async def call_tech_relay(self, event: AstrMessageEvent, input: str) -> str:
+    """技术Agent专用 relay 路由接口。调用 tech/技术Agent 并将完整回复返回主代理，由主代理把关后转述。
+
+relay 语义：回复不直接发送到用户端，完整返回主代理。技术Agent执行结果需主代理确认后再转述，
+直接透传容易出问题，故单开此接口强制走 relay，不受 route_mode / direct_delivery_agents 配置影响。
+
+Args:
+    input (string): 传给技术Agent的完整问题或指令
+"""
+    calls = [{"agent_name": "tech", "input": input}]
+    raw = await self.parallel_handoff(event, calls=calls)
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return raw
+    # segmented 分支：非 direct 代理的完整回复在 returned_agents
+    for ra in data.get("returned_agents") or []:
+        if ra.get("full_response"):
+            return json.dumps(
+                {
+                    "agent_name": ra.get("agent_name"),
+                    "success": True,
+                    "relay": True,
+                    "latency_ms": ra.get("latency_ms"),
+                    "full_response": ra.get("full_response"),
+                },
+                ensure_ascii=False,
+            )
+    # 合并返回分支：完整回复在 results[0].response
+    for r in data.get("results") or []:
+        if r.get("response"):
+            return json.dumps(
+                {
+                    "agent_name": r.get("agent_name"),
+                    "success": True,
+                    "relay": True,
+                    "latency_ms": r.get("latency_ms"),
+                    "full_response": r.get("response"),
+                },
+                ensure_ascii=False,
+            )
+    return raw
