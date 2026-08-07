@@ -33,6 +33,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.event.filter import llm_tool
 from astrbot.api.provider import ProviderRequest
+from astrbot.core.agent.message import TextPart
 from astrbot.core.agent.tool import ToolSet
 from astrbot.core.message.components import Plain
 from astrbot.core.message.message_event_result import MessageChain
@@ -365,8 +366,10 @@ class ParallelHandoffPlugin(Star):
 
         触发点：仅主代理请求经过 OnLLMRequestEvent（子代理走 llm_generate 不触发）。
         作用：把 route_mode / call_mode / direct_delivery_agents 算出的路由路径规范
-        注入 req.system_prompt，主代理必须照走；不修改 req.func_tool（工具全保留）。
-        system_prompt 已含标记则跳过，避免 agent 循环多轮重复注入。
+        追加到 req.extra_user_content_parts（请求尾部，livingmemory 同款），主代理必须照走；
+        不修改 req.func_tool（工具全保留）。系统提示与历史消息为请求前缀，完全不动，
+        故不破坏 DeepSeek 前缀缓存命中率；mark_as_temp 置 _no_save，不写入对话历史。
+        已含标记则跳过，避免 agent 循环多轮重复注入。
         """
         try:
             if not bool(self._cfg("enable_route_directive", True)):
@@ -375,12 +378,14 @@ class ParallelHandoffPlugin(Star):
             if not directive:
                 return False
             marker = "【路由强制指令·parallel_handoff】"
-            system_prompt = req.system_prompt or ""
-            if marker in system_prompt:
-                return False
-            req.system_prompt = f"{system_prompt}\n\n{directive}".strip()
+            parts = getattr(req, "extra_user_content_parts", None) or []
+            for part in parts:
+                text = getattr(part, "text", "")
+                if text and marker in text:
+                    return False
+            req.extra_user_content_parts.append(TextPart(text=directive).mark_as_temp())
             logger.info(
-                f"[parallel_handoff] 路由强制指令已注入 "
+                f"[parallel_handoff] 路由强制指令已注入 extra_user_content_parts "
                 f"(route_mode={self._cfg('route_mode', 'direct')}, "
                 f"call_mode={self._cfg('call_mode', 'parallel')})"
             )
