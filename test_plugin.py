@@ -58,12 +58,21 @@ _fake_core = MagicMock()
 _fake_core.agent = MagicMock()
 _fake_core.agent.tool = MagicMock()
 _fake_core.agent.tool.ToolSet = MagicMock()
+_fake_core.agent.message = MagicMock()
+class _FakeTextPart:
+    """TextPart 桩：支持 text 属性与 mark_as_temp() 链式调用"""
+    def __init__(self, text=""):
+        self.text = text
+    def mark_as_temp(self):
+        return self
+_fake_core.agent.message.TextPart = _FakeTextPart
 _fake_core.message = MagicMock()
 _fake_core.message.components = _fake_components
 _fake_core.message.message_event_result = _fake_msg_result
 sys.modules["astrbot.core"] = _fake_core
 sys.modules["astrbot.core.agent"] = _fake_core.agent
 sys.modules["astrbot.core.agent.tool"] = _fake_core.agent.tool
+sys.modules["astrbot.core.agent.message"] = _fake_core.agent.message
 sys.modules["astrbot.core.message"] = _fake_core.message
 sys.modules["astrbot.core.message.components"] = _fake_components
 sys.modules["astrbot.core.message.message_event_result"] = _fake_msg_result
@@ -407,11 +416,13 @@ class TestRouteDirectiveInject(unittest.TestCase):
         })
         req = MagicMock()
         req.system_prompt = "【人格】原 prompt"
+        req.extra_user_content_parts = []
         req.func_tool = {"tools": ["parallel_handoff", "transfer_to_tech"]}
         ret = asyncio.run(plugin._route_directive_inject(MagicMock(), req))
         self.assertIs(ret, False)                      # 不拦截
-        self.assertIn("【人格】原 prompt", req.system_prompt)
-        self.assertIn("【路由强制指令·parallel_handoff】", req.system_prompt)
+        self.assertEqual(req.system_prompt, "【人格】原 prompt")  # 系统提示前缀零改动
+        self.assertEqual(len(req.extra_user_content_parts), 1)   # 注入到请求尾部
+        self.assertIn("【路由强制指令·parallel_handoff】", req.extra_user_content_parts[0].text)
         self.assertEqual(req.func_tool["tools"], ["parallel_handoff", "transfer_to_tech"])  # 工具保留
 
     def test_marker_dedup(self):
@@ -424,10 +435,12 @@ class TestRouteDirectiveInject(unittest.TestCase):
             "enable_route_directive": True,
         })
         req = MagicMock()
-        req.system_prompt = "【路由强制指令·parallel_handoff】已有"
+        req.system_prompt = "【人格】原 prompt"
+        req.extra_user_content_parts = [_FakeTextPart(text="【路由强制指令·parallel_handoff】已有")]
         req.func_tool = {"tools": []}
         asyncio.run(plugin._route_directive_inject(MagicMock(), req))
-        self.assertEqual(req.system_prompt, "【路由强制指令·parallel_handoff】已有")
+        self.assertEqual(req.system_prompt, "【人格】原 prompt")
+        self.assertEqual(len(req.extra_user_content_parts), 1)  # 已含标记，不再追加
 
     def test_disabled_no_inject(self):
         """开关关闭时不注入"""
@@ -440,9 +453,11 @@ class TestRouteDirectiveInject(unittest.TestCase):
         })
         req = MagicMock()
         req.system_prompt = "原 prompt"
+        req.extra_user_content_parts = []
         req.func_tool = {"tools": []}
         asyncio.run(plugin._route_directive_inject(MagicMock(), req))
         self.assertEqual(req.system_prompt, "原 prompt")
+        self.assertEqual(len(req.extra_user_content_parts), 0)
 
     def test_no_agents_no_inject(self):
         """direct_delivery_agents 为空时不注入"""
@@ -455,9 +470,11 @@ class TestRouteDirectiveInject(unittest.TestCase):
         })
         req = MagicMock()
         req.system_prompt = "原 prompt"
+        req.extra_user_content_parts = []
         req.func_tool = {"tools": []}
         asyncio.run(plugin._route_directive_inject(MagicMock(), req))
         self.assertEqual(req.system_prompt, "原 prompt")
+        self.assertEqual(len(req.extra_user_content_parts), 0)
 
 class TestDedupGuard(unittest.TestCase):
     """防重只拦完全重复路由，同回合不同追问/不同子代理放行"""
