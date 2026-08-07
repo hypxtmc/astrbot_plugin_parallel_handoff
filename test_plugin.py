@@ -29,7 +29,12 @@ _fake_event.filter = MagicMock()
 _fake_event.AstrMessageEvent = MagicMock()
 
 _fake_event_filter = MagicMock()
+# 关键：所有 filter 装饰器返回 identity，避免 @filter.on_llm_request() 等把
+# 被装饰方法替换成 MagicMock（否则 asyncio.run 拿不到真实 coroutine 函数）
+for _deco_name in ("on_llm_request", "on_decorating_result", "regex", "command", "llm_tool"):
+    getattr(_fake_event_filter, _deco_name).side_effect = lambda *a, **k: (lambda f: f)
 _fake_event_filter.llm_tool = MagicMock()
+_fake_event.filter = _fake_event_filter  # 统一 from astrbot.api.event import filter 解析到同一 mock
 
 _fake_star = MagicMock()
 _fake_star.Context = MagicMock()
@@ -325,6 +330,134 @@ class TestPrefixDedup(unittest.TestCase):
         self.assertTrue(text.startswith("【阿米娅】\n"))
         # 前缀后内容应与原文一致
         self.assertEqual(text[len(prefix_str):], "纯文本回复")
+
+
+class TestRouteDirective(unittest.TestCase):
+    """测试路由强制指令生成（_build_route_directive）"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.PluginClass = _load_plugin_class()
+
+    def _make_plugin(self, config: dict = None):
+        mock_context = MagicMock()
+        if config is None:
+            config = {}
+        return self.PluginClass(context=mock_context, config=config)
+
+    def test_direct_parallel_directive(self):
+        """direct + parallel：指令含显示名映射与 parallel 规范"""
+        plugin = self._make_plugin({
+            "route_mode": "direct",
+            "call_mode": "parallel",
+            "direct_delivery_agents": "amiya,closure,tech,unmapped_agent",
+            "enable_route_directive": True,
+        })
+        d = plugin._build_route_directive()
+        self.assertIn("阿米娅、可露希尔", d)      # 显示名映射生效
+        self.assertIn("技术Agent", d)             # 映射 id 显示为内置中文名
+        self.assertIn("unmapped_agent", d)        # 未映射 id 保留原名
+        self.assertIn("direct", d)
+        self.assertIn("parallel", d)
+        self.assertNotIn("chained", d)
+
+    def test_relay_chained_directive(self):
+        """relay + chained：指令含 relay 与接龙规范"""
+        plugin = self._make_plugin({
+            "route_mode": "relay",
+            "call_mode": "chained",
+            "direct_delivery_agents": "amiya,closure",
+        })
+        d = plugin._build_route_directive()
+        self.assertIn("relay", d)
+        self.assertIn("禁止并行双发", d)
+        self.assertIn("chained", d)
+
+    def test_empty_agents_no_directive(self):
+        """direct_delivery_agents 为空时不注入"""
+        plugin = self._make_plugin({
+            "route_mode": "direct",
+            "call_mode": "parallel",
+            "direct_delivery_agents": "",
+        })
+        self.assertEqual(plugin._build_route_directive(), "")
+
+
+class TestRouteDirectiveInject(unittest.TestCase):
+    """测试 OnLLMRequestEvent 钩子注入逻辑"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.PluginClass = _load_plugin_class()
+
+    def _make_plugin(self, config: dict = None):
+        mock_context = MagicMock()
+        if config is None:
+            config = {}
+        return self.PluginClass(context=mock_context, config=config)
+
+    def test_inject_and_preserve_prompt(self):
+        """正常注入：原 prompt 保留，返回 False 不拦截，工具列表不动"""
+        import asyncio
+        plugin = self._make_plugin({
+            "route_mode": "direct",
+            "call_mode": "parallel",
+            "direct_delivery_agents": "amiya,closure,tech",
+            "enable_route_directive": True,
+        })
+        req = MagicMock()
+        req.system_prompt = "【人格】原 prompt"
+        req.func_tool = {"tools": ["parallel_handoff", "transfer_to_tech"]}
+        ret = asyncio.run(plugin._route_directive_inject(MagicMock(), req))
+        self.assertIs(ret, False)                      # 不拦截
+        self.assertIn("【人格】原 prompt", req.system_prompt)
+        self.assertIn("【路由强制指令·parallel_handoff】", req.system_prompt)
+        self.assertEqual(req.func_tool["tools"], ["parallel_handoff", "transfer_to_tech"])  # 工具保留
+
+    def test_marker_dedup(self):
+        """已含标记时跳过重复注入"""
+        import asyncio
+        plugin = self._make_plugin({
+            "route_mode": "direct",
+            "call_mode": "parallel",
+            "direct_delivery_agents": "amiya",
+            "enable_route_directive": True,
+        })
+        req = MagicMock()
+        req.system_prompt = "【路由强制指令·parallel_handoff】已有"
+        req.func_tool = {"tools": []}
+        asyncio.run(plugin._route_directive_inject(MagicMock(), req))
+        self.assertEqual(req.system_prompt, "【路由强制指令·parallel_handoff】已有")
+
+    def test_disabled_no_inject(self):
+        """开关关闭时不注入"""
+        import asyncio
+        plugin = self._make_plugin({
+            "route_mode": "direct",
+            "call_mode": "parallel",
+            "direct_delivery_agents": "amiya",
+            "enable_route_directive": False,
+        })
+        req = MagicMock()
+        req.system_prompt = "原 prompt"
+        req.func_tool = {"tools": []}
+        asyncio.run(plugin._route_directive_inject(MagicMock(), req))
+        self.assertEqual(req.system_prompt, "原 prompt")
+
+    def test_no_agents_no_inject(self):
+        """direct_delivery_agents 为空时不注入"""
+        import asyncio
+        plugin = self._make_plugin({
+            "route_mode": "direct",
+            "call_mode": "parallel",
+            "direct_delivery_agents": "",
+            "enable_route_directive": True,
+        })
+        req = MagicMock()
+        req.system_prompt = "原 prompt"
+        req.func_tool = {"tools": []}
+        asyncio.run(plugin._route_directive_inject(MagicMock(), req))
+        self.assertEqual(req.system_prompt, "原 prompt")
 
 
 if __name__ == "__main__":
