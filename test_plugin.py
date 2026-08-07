@@ -459,6 +459,95 @@ class TestRouteDirectiveInject(unittest.TestCase):
         asyncio.run(plugin._route_directive_inject(MagicMock(), req))
         self.assertEqual(req.system_prompt, "原 prompt")
 
+class TestDedupGuard(unittest.TestCase):
+    """防重只拦完全重复路由，同回合不同追问/不同子代理放行"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.PluginClass = _load_plugin_class()
+
+    def _make_plugin(self, config: dict = None):
+        mock_context = MagicMock()
+        if config is None:
+            config = {}
+        return self.PluginClass(context=mock_context, config=config)
+
+    def _make_event(self, mid="test-mid-1"):
+        ev = MagicMock()
+        ev.message_obj.message_id = mid
+        return ev
+
+    def test_same_agent_same_input_blocked(self):
+        """同消息同代理同 input：第二次短路"""
+        plugin = self._make_plugin()
+        ev = self._make_event()
+        calls = [{"agent_name": "tech", "input": "问题A"}]
+        self.assertIsNone(plugin._dedup_guard(ev, calls=calls))
+        ret = plugin._dedup_guard(ev, calls=calls)
+        self.assertIsNotNone(ret)
+        self.assertIn("dedup", ret)
+
+    def test_same_agent_different_input_allowed(self):
+        """同消息同代理不同 input：追问放行，不误杀"""
+        plugin = self._make_plugin()
+        ev = self._make_event()
+        self.assertIsNone(
+            plugin._dedup_guard(ev, calls=[{"agent_name": "tech", "input": "问题A"}])
+        )
+        self.assertIsNone(
+            plugin._dedup_guard(ev, calls=[{"agent_name": "tech", "input": "问题B"}])
+        )
+
+    def test_different_agent_allowed(self):
+        """同消息不同子代理：各自放行"""
+        plugin = self._make_plugin()
+        ev = self._make_event()
+        self.assertIsNone(
+            plugin._dedup_guard(ev, calls=[{"agent_name": "amiya", "input": "问题A"}])
+        )
+        self.assertIsNone(
+            plugin._dedup_guard(ev, calls=[{"agent_name": "tech", "input": "问题A"}])
+        )
+
+    def test_calls_order_insensitive(self):
+        """同批子代理同 input 顺序不同仍算重复"""
+        plugin = self._make_plugin()
+        ev = self._make_event()
+        self.assertIsNone(
+            plugin._dedup_guard(
+                ev,
+                calls=[
+                    {"agent_name": "amiya", "input": "问题A"},
+                    {"agent_name": "tech", "input": "问题B"},
+                ],
+            )
+        )
+        ret = plugin._dedup_guard(
+            ev,
+            calls=[
+                {"agent_name": "tech", "input": "问题B"},
+                {"agent_name": "amiya", "input": "问题A"},
+            ],
+        )
+        self.assertIsNotNone(ret)
+
+    def test_message_mode_duplicate_blocked(self):
+        """消歧模式（无 calls 有 message）：同消息同 message 第二次短路"""
+        plugin = self._make_plugin()
+        ev = self._make_event()
+        self.assertIsNone(plugin._dedup_guard(ev, message="继续问 tech"))
+        ret = plugin._dedup_guard(ev, message="继续问 tech")
+        self.assertIsNotNone(ret)
+
+    def test_different_message_allowed(self):
+        """消歧模式同消息不同 message：放行"""
+        plugin = self._make_plugin()
+        ev = self._make_event()
+        self.assertIsNone(plugin._dedup_guard(ev, message="继续问 tech"))
+        self.assertIsNone(plugin._dedup_guard(ev, message="换成问 amiya"))
+
+
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

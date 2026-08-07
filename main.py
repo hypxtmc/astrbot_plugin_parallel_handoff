@@ -22,6 +22,7 @@
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import time
@@ -643,27 +644,58 @@ class ParallelHandoffPlugin(Star):
         yield event.plain_result(f"✅ {verb}「{chinese_name}」的名字前缀")
 
     # ── 核心 tool ────────────────────────────────────────────
-    def _tool_call_dedup_key(self, event: AstrMessageEvent, agents: list = None) -> str:
-        """生成工具调用防重 key：消息 ID + 路由目标子代理签名。
+    def _tool_call_dedup_key(
+        self,
+        event: AstrMessageEvent,
+        agents: list = None,
+        calls: list = None,
+        message: str = None,
+    ) -> str:
+        """生成工具调用防重 key：消息 ID + 调用内容签名。
 
-        agents 参与 key 计算：同一条消息内串行调用不同子代理各自放行，
-        只有完全重复的路由（同一批子代理）才短路。agents 为空时回退纯消息 key。
+        只有完全重复的路由才命中同一 key：同一批子代理 + 相同 input。
+        同一条消息内串行调不同子代理、或对同一子代理追问不同问题，各自放行。
+        签名优先级：calls(agent+input 对) > message(消歧模式) > agents 名单。
         """
         mid = getattr(getattr(event, "message_obj", None), "message_id", None)
         base = f"mid:{mid}" if mid else f"evt:{id(event)}"
-        if agents:
+        if calls:
+            parts = []
+            for c in calls:
+                if not isinstance(c, dict):
+                    continue
+                a = str(c.get("agent_name", "")).strip()
+                i = str(c.get("input", "")).strip()
+                if a or i:
+                    parts.append(f"{a}::{i}")
+            if parts:
+                sig = hashlib.md5(",".join(sorted(parts)).encode("utf-8")).hexdigest()[:16]
+                return f"{base}|sig:{sig}"
+        elif message:
+            m = str(message).strip()
+            if m:
+                sig = hashlib.md5(m.encode("utf-8")).hexdigest()[:16]
+                return f"{base}|msg:{sig}"
+        elif agents:
             sig = ",".join(sorted({str(a).strip() for a in agents if str(a).strip()}))
             if sig:
                 return f"{base}|agents:{sig}"
         return base
 
-    def _dedup_guard(self, event: AstrMessageEvent, agents: list = None):
-        """LLM 同回合重复调用防重：同一消息对同一批子代理的重复路由短路，不同子代理放行。
+    def _dedup_guard(
+        self,
+        event: AstrMessageEvent,
+        agents: list = None,
+        calls: list = None,
+        message: str = None,
+    ):
+        """LLM 同回合重复调用防重：只有完全重复的路由（同批子代理 + 相同 input）才短路。
 
+        同消息内追问不同问题、调不同子代理，各自放行。
         返回 None 表示放行；返回 str 表示命中重复，直接作为工具结果返回。
         窗口 60s，覆盖一次完整 LLM 生成回合；过期自动清理防内存膨胀。
         """
-        dedup_key = self._tool_call_dedup_key(event, agents)
+        dedup_key = self._tool_call_dedup_key(event, agents, calls, message)
         seen = self._tool_call_seen.get(dedup_key)
         if seen and time.time() - seen[0] < 60:
             logger.info(f"[parallel_handoff] 同消息重复调用已短路: key={dedup_key}")
@@ -708,7 +740,9 @@ Args:
         # ── LLM 同回合重复调用防重：同一消息对同一批子代理的重复路由短路 ──
         # 防重 key 含本次路由目标子代理名单，串行调不同子代理可各自放行
         target_agents = [c.get("agent_name") for c in (calls or []) if isinstance(c, dict)]
-        dedup_result = self._dedup_guard(event, agents=target_agents)
+        dedup_result = self._dedup_guard(
+            event, agents=target_agents, calls=calls, message=message
+        )
         if dedup_result is not None:
             return dedup_result
 
