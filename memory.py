@@ -1,0 +1,160 @@
+"""memory.py — parallel_handoff livingmemory 集成 + 召回 + 记忆工具过滤（P0 拆模块）
+
+对应原 main.py 的 42-64 行（_strip_chain_injection 模块级函数）+
+843-854 行（livingmemory 插件查找）+ 911-961 行区域（记忆召回/工具过滤）+
+1009-1026 行区域（记忆存储）。
+双层排除逻辑收敛为单一 exclude_agents 集合（P1）：tech/技术Agent 默认
+硬编码在集合里，配置只能追加不能删除。
+"""
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent
+from astrbot.api.provider import ProviderRequest
+from astrbot.core.agent.tool import ToolSet
+
+
+def _strip_chain_injection(text: str) -> str:
+    """剥离接龙注入的前文块（临时上下文），避免污染子代理长期记忆。
+
+    接龙模式（call_mode=chained）会把上一个子代理的输出注入下一个的
+    input，这部分是临时上下文，不应进入本子代理的记忆召回/存储链路。
+    """
+    marker = "（接龙·上一位）"
+    if marker not in text:
+        return text
+    idx = text.find(marker)
+    end_marker = "请接续上文，现在轮到你回应："
+    end = text.find(end_marker, idx)
+    if end == -1:
+        return text[:idx]
+    tail = text[end + len(end_marker):]
+    return text[:idx] + tail.lstrip("\n")
+
+
+class MemoryMixin:
+    """长期记忆集成：接龙注入剥离 / livingmemory 查找 / 召回 / 存储 / 工具过滤"""
+
+    def _strip_chain_injection(self, text: str) -> str:
+        """实例方法包装：接龙注入前文块剥离（供 dispatch 通过 self 调用）"""
+        return _strip_chain_injection(text)
+
+    # ── 长期记忆插件查找 ─────────────────────────────────
+    def _find_livingmemory_plugin(self):
+        """在已加载插件中查找 livingmemory 插件类，找不到返回 None"""
+        livingmemory_plugin = None
+        try:
+            all_stars = self.context.get_all_stars()
+            for star in all_stars:
+                name = getattr(star, "name", "")
+                if "livingmemory" in name.lower():
+                    livingmemory_plugin = star.star_cls
+                    break
+        except Exception:
+            pass
+        return livingmemory_plugin
+
+    # ── 记忆召回：注入长期记忆 ──
+    async def _memory_recall(
+        self,
+        event: AstrMessageEvent,
+        agent_name: str,
+        clean_input: str,
+        livingmemory_plugin,
+    ) -> list:
+        """召回 livingmemory 长期记忆，返回记忆注入内容列表（供透传子代理 provider）。
+
+        接龙注入的前文是临时上下文：记忆链路（召回/存储）统一剥离，
+        避免上一个子代理的输出污染本子代理的长期记忆（clean_input 由调用方剥离）。
+        """
+        if livingmemory_plugin:
+            try:
+                event.persona_id = agent_name
+                req = ProviderRequest(
+                    prompt=clean_input,
+                    extra_user_content_parts=[],
+                )
+                await livingmemory_plugin.handle_memory_recall(event, req)
+
+                # 保留记忆注入内容，透传给子代理的 provider
+                return list(req.extra_user_content_parts or [])
+            except Exception as e:
+                logger.warning(
+                    f"[parallel_handoff] Memory recall failed for "
+                    f"{agent_name}: {e}"
+                )
+                return []
+        return []
+
+    # ── 构建子代理工具集（记忆工具过滤） ──
+    def _build_memory_tools(self, agent_name: str):
+        """为子代理构建记忆工具集（仅含 recall/memorize 两个工具）。
+
+        排除逻辑收敛为单一 exclude_agents 集合：tech/技术Agent 默认硬编码在集合里，
+        配置（subagent_memory.exclude_agents 或扁平 exclude_agents）只能追加不能删除。
+        """
+        subagent_tools = None
+        try:
+            # 子代理记忆配置：扁平字段优先，兼容旧的 subagent_memory 嵌套对象
+            memory_cfg = self._cfg("subagent_memory", {})
+            if isinstance(memory_cfg, dict) and memory_cfg:
+                memory_enabled = self._cfg("recall_enabled", memory_cfg.get("enabled", True))
+                exclude_raw = self._cfg("exclude_agents", memory_cfg.get("exclude_agents", "tech,技术Agent"))
+            else:
+                memory_enabled = self._cfg("recall_enabled", True)
+                exclude_raw = self._cfg("exclude_agents", "tech,技术Agent")
+            exclude_agents = {name.strip() for name in exclude_raw.split(",") if name.strip()}
+            # P1: 收敛为单一 exclude_agents 集合：tech/技术Agent 硬编码不可删，配置只能追加
+            exclude_agents.update({"tech", "技术Agent"})
+            if memory_enabled and agent_name not in exclude_agents:
+                global_tools = getattr(
+                    self.context.provider_manager, "llm_tools", None
+                )
+                if global_tools and not global_tools.empty():
+                    memory_tools = []
+                    for tool in global_tools.func_list:
+                        if tool.name in (
+                            "recall_long_term_memory",
+                            "memorize_long_term_memory",
+                        ):
+                            memory_tools.append(tool)
+                    if memory_tools:
+                        subagent_tools = ToolSet(tools=memory_tools)
+        except Exception as e:
+            logger.warning(
+                f"[parallel_handoff] Failed to build agent tools for "
+                f"{agent_name}: {e}"
+            )
+        return subagent_tools
+
+    # ── 记忆存储：存入长期记忆 ──
+    async def _memory_store(
+        self,
+        livingmemory_plugin,
+        event: AstrMessageEvent,
+        agent_name: str,
+        final_input: str,
+        raw_response: str,
+    ):
+        """将本轮 user/assistant 消息写入 livingmemory 对话管理器并做消息数限制"""
+        if livingmemory_plugin:
+            try:
+                conv_mgr = (
+                    livingmemory_plugin
+                    .event_handler._memory_recall.conversation_manager
+                )
+                await conv_mgr.add_message_from_event(
+                    event, role="user", content=self._strip_chain_injection(final_input)
+                )
+                await conv_mgr.add_message_from_event(
+                    event, role="assistant", content=raw_response
+                )
+                session_id = event.unified_msg_origin
+                await (
+                    livingmemory_plugin
+                    .event_handler._memory_recall.message_utils
+                    .enforce_message_limit(session_id)
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[parallel_handoff] Memory storage failed for "
+                    f"{agent_name}: {e}"
+                )

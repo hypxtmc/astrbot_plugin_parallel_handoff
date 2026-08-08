@@ -53,6 +53,12 @@
     "default": false,
     "hint": "开启后主代理自身回复按空行拆分，逐条单独发送。关闭则整个回复作为一条消息发送。子代理分段转发由 enable_segmented_forward 独立控制。"
   },
+  "allow_mainagent_after_direct": {
+    "description": "子代理直发后允许主代理发言",
+    "type": "bool",
+    "default": true,
+    "hint": "direct 分段转发子代理回复后，若主代理生成了实质台词则加【名字】前缀放行；false 时恢复旧行为（无条件清空主代理输出）。关闭可防重复，开启可让主代理下场说话。"
+  },
   "main_agent_name": {
     "description": "主代理显示名",
     "type": "string",
@@ -87,7 +93,13 @@
     "description": "直接发送到用户的子代理列表",
     "type": "string",
     "default": "agent_a,agent_b,agent_c,xi",
-    "hint": "逗号分隔的子代理名。列表中的子代理回复会直接分段发送到用户。不在列表中的（如tech）回复会返回给主代理处理。"
+    "hint": "逗号分隔的子代理名。列表中的子代理回复会直接分段发送到用户。不在列表中的非黑名单子代理回复会返回给主代理处理。强制直连黑名单（handoff_blacklist_agents）中的子代理不受此配置影响，永远走 transfer_to_* 直连。"
+  },
+  "handoff_blacklist_agents": {
+    "description": "强制直连子代理黑名单（transfer_to_* 直连，不走并行插件中转）",
+    "type": "string",
+    "default": "tech,技术Agent",
+    "hint": "逗号分隔的子代理名。列出的子代理（如 tech/技术Agent）永远不走 parallel_handoff 插件的 relay 中转，必须由主代理直接调用 transfer_to_xxx 工具直连；parallel_handoff / call_subagent 调用这些代理会被拦截并提示改用 transfer_to_*。"
   },
   "subagent_context_enabled": {
     "description": "启用跨轮对话上下文",
@@ -117,7 +129,7 @@
     "description": "子代理路由模式",
     "type": "string",
     "default": "direct",
-    "hint": "direct=用call_subagent路由，子代理回复直接发用户端不中转；relay=用transfer_to_*路由，子代理回复返回主代理转发。WebUI切换后直接生效，无需重启。"
+    "hint": "direct=用call_subagent路由，子代理回复直接发用户端不中转；relay=用transfer_to_*路由，子代理回复返回主代理转发。强制直连黑名单（handoff_blacklist_agents）中的子代理不受本配置影响，永远走 transfer_to_* 直连。WebUI切换后直接生效，无需重启。"
   },
   "call_mode": {
     "description": "子代理调用模式",
@@ -136,5 +148,35 @@
     "type": "bool",
     "default": true,
     "hint": "关闭后子代理不再接收基线内容"
+  },
+  "chain_summary_enabled": {
+    "description": "接龙长回复精简开关",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，接龙模式下上一位子代理回复超过阈值时自动压缩为摘要+首尾，避免长文塞爆下一位的上下文。关闭则原样传递完整回复。"
+  },
+  "chain_summary_model": {
+    "description": "接龙精简模型（Provider ID）",
+    "type": "string",
+    "default": "",
+    "hint": "用于压缩接龙长回复的模型 Provider ID（如 deepseek、glm-4.7-flash 等，需与 AstrBot 中已配置的 provider id 一致）。留空则使用当前会话的模型。"
+  },
+  "chain_summary_threshold": {
+    "description": "接龙精简触发阈值（字符数）",
+    "type": "int",
+    "default": 600,
+    "hint": "上一位子代理回复超过该字符数才触发精简，未超过则原样传递。"
+  },
+  "chain_summary_keep_head_tail": {
+    "description": "精简时保留首尾字符数",
+    "type": "int",
+    "default": 120,
+    "hint": "压缩时保留原文开头和结尾各 N 个字符，中间用摘要衔接，兼顾剧情连贯与上下文压缩。"
+  },
+  "enable_route_directive": {
+    "description": "启用路由强制指令注入（OnLLMRequestEvent 钩子）",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后插件在每次主代理 LLM 请求时，按 route_mode/call_mode/direct_delivery_agents 自动生成路由路径规范注入 extra_user_content_parts，主代理必须照走；工具全保留不摘除。关闭则纯靠主代理自觉。"
   }
 }
