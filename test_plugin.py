@@ -1,4 +1,5 @@
 """test_plugin.py — parallel_handoff 插件单元测试"""
+import asyncio
 import json
 import os
 import sys
@@ -33,7 +34,8 @@ _fake_event_filter = MagicMock()
 # 被装饰方法替换成 MagicMock（否则 asyncio.run 拿不到真实 coroutine 函数）
 for _deco_name in ("on_llm_request", "on_decorating_result", "regex", "command", "llm_tool"):
     getattr(_fake_event_filter, _deco_name).side_effect = lambda *a, **k: (lambda f: f)
-_fake_event_filter.llm_tool = MagicMock()
+# 注意：不要再对 llm_tool 单独赋值 MagicMock——会覆盖上面的 identity side_effect，
+# 使 @llm_tool 装饰的方法（parallel_handoff/call_subagent）在测试环境退化为 MagicMock。
 _fake_event.filter = _fake_event_filter  # 统一 from astrbot.api.event import filter 解析到同一 mock
 
 _fake_star = MagicMock()
@@ -391,6 +393,35 @@ class TestRouteDirective(unittest.TestCase):
         })
         self.assertEqual(plugin._build_route_directive(), "")
 
+    def test_blacklist_in_direct_directive(self):
+        """direct 模式：指令含黑名单 transfer_to_* 直连规范，且不再把 tech 列为 relay"""
+        plugin = self._make_plugin({
+            "route_mode": "direct",
+            "call_mode": "parallel",
+            "direct_delivery_agents": "amiya,closure",
+            "handoff_blacklist_agents": "tech,技术Agent",
+        })
+        d = plugin._build_route_directive()
+        self.assertIn("强制直连黑名单", d)
+        self.assertIn("技术Agent", d)
+        self.assertIn("transfer_to_xxx", d)
+        self.assertIn("禁止用 parallel_handoff / call_subagent 调用", d)
+        # 黑名单代理不应再被描述为"走 relay 返回主代理"
+        self.assertNotIn("技术Agent）走 relay", d)
+
+    def test_blacklist_in_relay_directive(self):
+        """relay 模式：黑名单直连规范仍然生效"""
+        plugin = self._make_plugin({
+            "route_mode": "relay",
+            "call_mode": "parallel",
+            "direct_delivery_agents": "amiya,closure",
+            "handoff_blacklist_agents": "tech,技术Agent",
+        })
+        d = plugin._build_route_directive()
+        self.assertIn("强制直连黑名单", d)
+        self.assertIn("transfer_to_xxx", d)
+        self.assertIn("非黑名单子代理", d)
+
 
 class TestRouteDirectiveInject(unittest.TestCase):
     """测试 OnLLMRequestEvent 钩子注入逻辑"""
@@ -564,6 +595,327 @@ class TestDedupGuard(unittest.TestCase):
         self.assertIsNone(plugin._dedup_guard(ev, message="换成问 amiya"))
 
 
+class TestHandoffBlacklist(unittest.TestCase):
+    """测试强制直连黑名单机制（handoff_blacklist_agents）"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.PluginClass = _load_plugin_class()
+
+    def _make_plugin(self, config: dict = None):
+        mock_context = MagicMock()
+        if config is None:
+            config = {}
+        return self.PluginClass(context=mock_context, config=config)
+
+    def test_get_blacklist_default(self):
+        """默认黑名单包含 tech 与 技术Agent"""
+        plugin = self._make_plugin({})
+        blacklist = plugin._get_handoff_blacklist()
+        self.assertIn("tech", blacklist)
+        self.assertIn("技术Agent", blacklist)
+
+    def test_get_blacklist_custom(self):
+        """自定义黑名单生效"""
+        plugin = self._make_plugin({
+            "handoff_blacklist_agents": "tech,memory",
+        })
+        blacklist = plugin._get_handoff_blacklist()
+        self.assertEqual(blacklist, {"tech", "memory"})
+
+    def test_get_blacklist_empty(self):
+        """空配置返回空集"""
+        plugin = self._make_plugin({"handoff_blacklist_agents": ""})
+        self.assertEqual(plugin._get_handoff_blacklist(), set())
+
+    def test_call_one_blocks_blacklist_tech(self):
+        """parallel_handoff 调用黑名单 tech 被拦截，提示改用 transfer_to_tech"""
+        mock_context = MagicMock()
+        # 构造 orchestrator + handoffs（含 tech）
+        class _FakeAgent:
+            name = "tech"
+            instructions = ""
+            tools = None
+            begin_dialogs = None
+        class _FakeHandoff:
+            agent = _FakeAgent()
+            provider_id = None
+            name = "transfer_to_tech"
+        mock_context.subagent_orchestrator.handoffs = [_FakeHandoff()]
+        mock_context.get_all_stars.return_value = []
+        plugin = self.PluginClass(context=mock_context, config={
+            "enable_scene_inject": False,
+            "enable_segmented_forward": False,
+            "handoff_blacklist_agents": "tech,技术Agent",
+            "enable_disambiguation": False,
+            "enable_subagent_name_prefix": False,
+            "subagent_context_enabled": False,
+        })
+        plugin.context = mock_context  # mock Star.__init__ 不存 context，手动补
+        ev = MagicMock()
+        ev.unified_msg_origin = "session-test"
+        ev.message_obj.message_id = "msg-blacklist-test"
+        raw = asyncio.run(plugin.parallel_handoff(
+            ev,
+            calls=[{"agent_name": "tech", "input": "帮我查个问题"}],
+        ))
+        data = json.loads(raw)
+        self.assertEqual(data["results"][0]["success"], False)
+        self.assertIn("强制直连黑名单", data["results"][0]["response"])
+        self.assertIn("transfer_to_tech", data["results"][0]["response"])
+
+    def test_call_one_allows_non_blacklist(self):
+        """非黑名单代理（amiya）不受拦截，进入实际调用流程"""
+        mock_context = MagicMock()
+        class _FakeAgent:
+            name = "amiya"
+            instructions = ""
+            tools = None
+            begin_dialogs = None
+        class _FakeHandoff:
+            agent = _FakeAgent()
+            provider_id = None
+            name = "transfer_to_amiya"
+        mock_context.subagent_orchestrator.handoffs = [_FakeHandoff()]
+        mock_context.get_all_stars.return_value = []
+        # llm_generate 返回 fake 响应（async 版本，parallel_handoff 内 await 它）
+        class _FakeLLMResp:
+            completion_text = "阿米娅的回复"
+        from unittest.mock import AsyncMock
+        mock_context.llm_generate = AsyncMock(return_value=_FakeLLMResp())
+        mock_context.get_current_chat_provider_id = AsyncMock(return_value="prov")
+        plugin = self.PluginClass(context=mock_context, config={
+            "enable_scene_inject": False,
+            "enable_segmented_forward": False,
+            "handoff_blacklist_agents": "tech,技术Agent",
+            "enable_disambiguation": False,
+            "enable_subagent_name_prefix": False,
+            "subagent_context_enabled": False,
+        })
+        plugin.context = mock_context  # mock Star.__init__ 不存 context，手动补
+        ev = MagicMock()
+        ev.unified_msg_origin = "session-test"
+        ev.message_obj.message_id = "msg-amiya-test"
+        raw = asyncio.run(plugin.parallel_handoff(
+            ev,
+            calls=[{"agent_name": "amiya", "input": "你好"}],
+        ))
+        data = json.loads(raw)
+        self.assertEqual(data["results"][0]["success"], True)
+        self.assertEqual(data["results"][0]["agent_name"], "amiya")
+        self.assertIn("阿米娅的回复", data["results"][0]["response"])
+
+
+
+
+class TestBaselineIsolation(unittest.TestCase):
+    """测试剧情基线注入隔离（enable_baseline_inject / shared_scene_baseline）"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.PluginClass = _load_plugin_class()
+
+    def _make_plugin(self, config=None, handoff_names=("amiya", "tech")):
+        """构造插件实例；默认含 amiya + tech 两个 handoff（黑名单检查在 handoff 检查之后）"""
+        from unittest.mock import AsyncMock
+        mock_context = MagicMock()
+        handoffs = []
+        for name in handoff_names:
+            agent = type("_FakeAgent", (), {
+                "name": name,
+                "instructions": "",
+                "tools": None,
+                "begin_dialogs": None,
+            })()
+            handoff = type("_FakeHandoff", (), {
+                "agent": agent,
+                "provider_id": None,
+                "name": f"transfer_to_{name}",
+            })()
+            handoffs.append(handoff)
+        mock_context.subagent_orchestrator.handoffs = handoffs
+        mock_context.get_all_stars.return_value = []
+        class _FakeLLMResp:
+            completion_text = "阿米娅的回复"
+        mock_context.llm_generate = AsyncMock(return_value=_FakeLLMResp())
+        mock_context.get_current_chat_provider_id = AsyncMock(return_value="prov")
+        base_cfg = {
+            "enable_scene_inject": True,
+            "enable_segmented_forward": False,
+            "handoff_blacklist_agents": "tech,技术Agent",
+            "enable_disambiguation": False,
+            "enable_subagent_name_prefix": False,
+            "subagent_context_enabled": False,
+        }
+        if config:
+            base_cfg.update(config)
+        plugin = self.PluginClass(context=mock_context, config=base_cfg)
+        plugin.context = mock_context
+        return plugin, mock_context
+
+    def _make_event(self):
+        ev = MagicMock()
+        ev.unified_msg_origin = "session-baseline"
+        ev.message_obj.message_id = "msg-baseline"
+        ev.get_sender_name.return_value = "博士"
+        ev.get_sender_id.return_value = "u-1"
+        mt = MagicMock()
+        mt.value = "friend"
+        ev.get_message_type.return_value = mt
+        return ev
+
+    def test_baseline_injected_to_subagent(self):
+        """enable_baseline_inject=true + 基线配置：非黑名单子代理 prompt 含基线"""
+        plugin, mock_context = self._make_plugin({
+            "enable_baseline_inject": True,
+            "shared_scene_baseline": "这里是罗德岛，大家都在为未来努力。",
+        })
+        ev = self._make_event()
+        raw = asyncio.run(plugin.parallel_handoff(
+            ev,
+            calls=[{"agent_name": "amiya", "input": "你好"}],
+        ))
+        data = json.loads(raw)
+        self.assertEqual(data["results"][0]["success"], True)
+        prompt = mock_context.llm_generate.call_args.kwargs["prompt"]
+        self.assertIn("【共用剧情场景基线】", prompt)
+        self.assertIn("这里是罗德岛", prompt)
+
+    def test_baseline_disabled_no_inject(self):
+        """enable_baseline_inject=false：prompt 不含基线"""
+        plugin, mock_context = self._make_plugin({
+            "enable_baseline_inject": False,
+            "shared_scene_baseline": "这里是罗德岛，大家都在为未来努力。",
+        })
+        ev = self._make_event()
+        asyncio.run(plugin.parallel_handoff(
+            ev,
+            calls=[{"agent_name": "amiya", "input": "你好"}],
+        ))
+        prompt = mock_context.llm_generate.call_args.kwargs["prompt"]
+        self.assertNotIn("【共用剧情场景基线】", prompt)
+
+    def test_baseline_empty_no_inject(self):
+        """shared_scene_baseline 为空：prompt 不含基线"""
+        plugin, mock_context = self._make_plugin({
+            "enable_baseline_inject": True,
+            "shared_scene_baseline": "",
+        })
+        ev = self._make_event()
+        asyncio.run(plugin.parallel_handoff(
+            ev,
+            calls=[{"agent_name": "amiya", "input": "你好"}],
+        ))
+        prompt = mock_context.llm_generate.call_args.kwargs["prompt"]
+        self.assertNotIn("【共用剧情场景基线】", prompt)
+
+    def test_baseline_does_not_leak_to_blacklist(self):
+        """黑名单代理在 _call_one 入口被拦截，碰不到基线注入代码：响应不含基线"""
+        plugin, mock_context = self._make_plugin({
+            "enable_baseline_inject": True,
+            "shared_scene_baseline": "这里是罗德岛，大家都在为未来努力。",
+        })
+        ev = self._make_event()
+        raw = asyncio.run(plugin.parallel_handoff(
+            ev,
+            calls=[{"agent_name": "tech", "input": "帮我查个问题"}],
+        ))
+        data = json.loads(raw)
+        self.assertEqual(data["results"][0]["success"], False)
+        self.assertIn("强制直连黑名单", data["results"][0]["response"])
+        # 黑名单拦截发生在基线注入之前，响应中不应出现基线内容
+        self.assertNotIn("这里是罗德岛", data["results"][0]["response"])
+        # llm_generate 不应被调用（黑名单直接拦截，不进入生成流程）
+        mock_context.llm_generate.assert_not_called()
+
+    def test_blacklist_chinese_name_blocked(self):
+        """中文名「技术Agent」归一为 tech 后同样被黑名单拦截"""
+        plugin, mock_context = self._make_plugin({
+            "enable_baseline_inject": True,
+            "shared_scene_baseline": "这里是罗德岛，大家都在为未来努力。",
+        })
+        ev = self._make_event()
+        raw = asyncio.run(plugin.parallel_handoff(
+            ev,
+            calls=[{"agent_name": "技术Agent", "input": "帮我查个问题"}],
+        ))
+        data = json.loads(raw)
+        self.assertEqual(data["results"][0]["success"], False)
+        self.assertIn("强制直连黑名单", data["results"][0]["response"])
+        self.assertIn("transfer_to_tech", data["results"][0]["response"])
+        mock_context.llm_generate.assert_not_called()
+
+
+class TestBuildScenePrefix(unittest.TestCase):
+    """测试 _build_scene_prefix 场景 + 剧情基线前缀构建（scene.py）"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.PluginClass = _load_plugin_class()
+
+    def _make_plugin(self, config=None):
+        mock_context = MagicMock()
+        plugin = self.PluginClass(context=mock_context, config=config or {})
+        return plugin
+
+    def _make_event(self):
+        ev = MagicMock()
+        ev.get_sender_name.return_value = "博士"
+        ev.get_sender_id.return_value = "u-1"
+        mt = MagicMock()
+        mt.value = "friend"
+        ev.get_message_type.return_value = mt
+        return ev
+
+    def test_scene_only(self):
+        """仅场景注入：无基线"""
+        plugin = self._make_plugin({
+            "enable_baseline_inject": True,
+            "shared_scene_baseline": "",
+        })
+        prefix = plugin._build_scene_prefix(self._make_event(), True)
+        self.assertIn("[场景信息]", prefix)
+        self.assertNotIn("【共用剧情场景基线】", prefix)
+
+    def test_scene_plus_baseline(self):
+        """场景 + 基线拼接"""
+        plugin = self._make_plugin({
+            "enable_baseline_inject": True,
+            "shared_scene_baseline": "罗德岛",
+        })
+        prefix = plugin._build_scene_prefix(self._make_event(), True)
+        self.assertIn("[场景信息]", prefix)
+        self.assertIn("【共用剧情场景基线】", prefix)
+        self.assertIn("罗德岛", prefix)
+
+    def test_baseline_only_no_scene(self):
+        """enable_scene_inject=false 时 _build_scene_prefix 仍组装基线（由 _call_one 决定是否使用）"""
+        plugin = self._make_plugin({
+            "enable_baseline_inject": True,
+            "shared_scene_baseline": "罗德岛",
+        })
+        prefix = plugin._build_scene_prefix(self._make_event(), False)
+        self.assertNotIn("[场景信息]", prefix)
+        self.assertIn("【共用剧情场景基线】", prefix)
+        self.assertIn("罗德岛", prefix)
+
+    def test_baseline_disabled(self):
+        """enable_baseline_inject=false：无基线"""
+        plugin = self._make_plugin({
+            "enable_baseline_inject": False,
+            "shared_scene_baseline": "罗德岛",
+        })
+        prefix = plugin._build_scene_prefix(self._make_event(), True)
+        self.assertIn("[场景信息]", prefix)
+        self.assertNotIn("【共用剧情场景基线】", prefix)
+
+    def test_all_disabled(self):
+        """场景与基线均关闭：返回空串"""
+        plugin = self._make_plugin({
+            "enable_baseline_inject": False,
+            "shared_scene_baseline": "",
+        })
+        self.assertEqual(plugin._build_scene_prefix(self._make_event(), False), "")
 
 
 if __name__ == "__main__":
