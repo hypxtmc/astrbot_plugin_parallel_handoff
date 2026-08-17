@@ -92,6 +92,196 @@ class DispatchMixin:
         self._tool_call_seen[dedup_key] = (now_ts, None)
         return None
 
+    def _maybe_prefix(self, agent_name: str, text: str, enable_name_prefix: bool) -> str:
+        """子代理回复姓名前缀（render 块方法化）：先查覆盖表，再走全局开关"""
+        overrides = self._get_name_prefix_overrides()
+        if isinstance(overrides, dict) and agent_name in overrides:
+            should_prefix = overrides[agent_name]
+        else:
+            should_prefix = enable_name_prefix
+        if should_prefix:
+            display_name = self._display_name(agent_name)
+            prefix_str = f"【{display_name}】\n"
+            if not text.startswith(prefix_str):
+                text = prefix_str + text
+        return text
+
+    async def _call_one(
+        self,
+        call: dict,
+        *,
+        event,
+        handoff_map: dict,
+        scene_prefix: str,
+        livingmemory_plugin,
+        enable_name_prefix: bool,
+        timeout: int,
+    ) -> dict:
+        """调用单个子代理，带超时和错误隔离。
+
+        原为 parallel_handoff 内嵌闭包，捕获 6 个外层变量——
+        提升为显式方法，捕获变量转显式参数（同一引用，行为等价），
+        使消费点/分支可被单测直接调用定位。
+        """
+        agent_name = (call.get("agent_name") or "").strip()
+        # 中文名/大小写兼容：阿米娅 -> amiya，Amiya -> amiya（写回 call，后续统一用英文 id）
+        agent_name = self._resolve_agent_name(agent_name)
+        call["agent_name"] = agent_name
+        input_text = (call.get("input") or "").strip()
+        order = call.get("order")
+
+        if not agent_name:
+            return {
+                "agent_name": "(missing)",
+                "success": False,
+                "response": "Missing agent_name field",
+                "order": order,
+            }
+        if not input_text:
+            return {
+                "agent_name": agent_name,
+                "success": False,
+                "response": "Missing input field",
+                "order": order,
+            }
+
+        handoff = handoff_map.get(agent_name)
+        if not handoff:
+            return {
+                "agent_name": agent_name,
+                "success": False,
+                "response": (
+                    f"Subagent '{agent_name}' not found. "
+                    f"Available: {sorted(handoff_map.keys())}"
+                ),
+                "order": order,
+            }
+
+        # 强制直连黑名单拦截：黑名单子代理不走并行插件中转，
+        # 必须由主代理直接调用 transfer_to_xxx 直连（博士 2026-08-08 硬性指令）
+        if agent_name in self._get_handoff_blacklist():
+            return {
+                "agent_name": agent_name,
+                "success": False,
+                "response": (
+                    f"子代理 '{agent_name}' 在强制直连黑名单中：不允许通过 "
+                    f"parallel_handoff / call_subagent 调用，请改用 "
+                    f"transfer_to_{agent_name} 工具直连调用。"
+                ),
+                "order": order,
+            }
+
+        # 场景/基线前缀消费点：由 _apply_scene_prefix 决定（基线独立于场景开关）
+        final_input = self._apply_scene_prefix(input_text, scene_prefix)
+
+        # ── 记忆召回：注入长期记忆（memory.py） ──
+        # 接龙注入的前文是临时上下文：记忆链路（召回/存储）统一剥离，
+        # 避免上一个子代理的输出污染本子代理的长期记忆。
+        clean_input = self._strip_chain_injection(final_input)
+        memory_extra_parts = await self._memory_recall(
+            event, agent_name, clean_input, livingmemory_plugin
+        )
+
+        # ── 构建子代理工具集（memory.py 记忆工具过滤） ──
+        subagent_tools = self._build_memory_tools(agent_name)
+
+        t0 = time.perf_counter()
+        try:
+            umo = event.unified_msg_origin
+            prov_id = (
+                handoff.provider_id
+                or await self.context.get_current_chat_provider_id(umo)
+            )
+
+            # ── 上下文注入：跨轮对话历史 ──
+            if self._ctx_enabled:
+                ctx_session_id = event.unified_msg_origin
+                ctx_key = f"{agent_name}:{ctx_session_id}"
+                ctx_history = self._subagent_contexts.get(ctx_key, [])
+                if ctx_history:
+                    ctx_turns = len(ctx_history) // 2
+                    if ctx_turns <= self._ctx_max_turns:
+                        ctx_text = self._format_context_history(ctx_history)
+                        final_input = f"--- 对话历史 ---\n{ctx_text}\n--- 新的输入 ---\n{final_input}"
+                    else:
+                        try:
+                            ctx_text = await self._compress_context_history(
+                                agent_name, ctx_session_id, ctx_history, prov_id, handoff, timeout
+                            )
+                        except Exception:
+                            max_msgs = self._ctx_max_turns * 2
+                            ctx_text = self._format_context_history(ctx_history[-max_msgs:])
+                        final_input = f"--- 对话历史 ---\n{ctx_text}\n--- 新的输入 ---\n{final_input}"
+
+            llm_resp = await asyncio.wait_for(
+                self.context.llm_generate(
+                    chat_provider_id=prov_id,
+                    prompt=final_input,
+                    system_prompt=handoff.agent.instructions or "",
+                    tools=subagent_tools,
+                    extra_user_content_parts=memory_extra_parts,
+                ),
+                timeout=timeout,
+            )
+            latency_ms = int((time.perf_counter() - t0) * 1000)
+            raw_response = llm_resp.completion_text
+
+            # ── 记忆存储：存入长期记忆（memory.py） ──
+            await self._memory_store(
+                livingmemory_plugin, event, agent_name, final_input, raw_response
+            )
+
+            # 清理 persona_id（由上方的记忆召回阶段设置），确保下轮调用不残留
+            if hasattr(event, "persona_id"):
+                delattr(event, "persona_id")
+
+            # ── 上下文存储：追加到跨轮对话历史 ──
+            if self._ctx_enabled:
+                self._append_context(agent_name, event.unified_msg_origin, input_text, raw_response)
+
+            # 自动转发已由 parallel_handoff 的分段转发负责,此处不再重复推送
+            raw_response = self._maybe_prefix(agent_name, raw_response, enable_name_prefix)
+
+            return {
+                "agent_name": agent_name,
+                "success": True,
+                "response": raw_response,
+                "latency_ms": latency_ms,
+                "order": order,
+            }
+        except asyncio.TimeoutError:
+            latency_ms = int((time.perf_counter() - t0) * 1000)
+            logger.warning(
+                f"[parallel_handoff] Subagent '{agent_name}' timed out after {timeout}s"
+            )
+            if hasattr(event, "persona_id"):
+                delattr(event, "persona_id")
+            err_text = f"Timeout after {timeout}s"
+            err_text = self._maybe_prefix(agent_name, err_text, enable_name_prefix)
+            return {
+                "agent_name": agent_name,
+                "success": False,
+                "response": err_text,
+                "latency_ms": latency_ms,
+                "order": order,
+            }
+        except Exception as e:
+            if hasattr(event, "persona_id"):
+                delattr(event, "persona_id")
+            latency_ms = int((time.perf_counter() - t0) * 1000)
+            logger.error(
+                f"[parallel_handoff] Subagent '{agent_name}' failed: {e}"
+            )
+            err_text = f"Error: {e}"
+            err_text = self._maybe_prefix(agent_name, err_text, enable_name_prefix)
+            return {
+                "agent_name": agent_name,
+                "success": False,
+                "response": err_text,
+                "latency_ms": latency_ms,
+                "order": order,
+            }
+
     # ── 核心 tool 实现（装饰器 @llm_tool 在 main.py 壳方法上） ──
     async def parallel_handoff(
         self,
@@ -173,196 +363,7 @@ Args:
         livingmemory_plugin = self._find_livingmemory_plugin()
 
         # ── 单子代理调用 ─────────────────────────────────────
-        async def _call_one(call: dict) -> dict:
-            """调用单个子代理,带超时和错误隔离"""
-            agent_name = (call.get("agent_name") or "").strip()
-            # 中文名/大小写兼容：阿米娅 -> amiya，Amiya -> amiya（写回 call，后续统一用英文 id）
-            agent_name = self._resolve_agent_name(agent_name)
-            call["agent_name"] = agent_name
-            input_text = (call.get("input") or "").strip()
-            order = call.get("order")
-
-            if not agent_name:
-                return {
-                    "agent_name": "(missing)",
-                    "success": False,
-                    "response": "Missing agent_name field",
-                    "order": order,
-                }
-            if not input_text:
-                return {
-                    "agent_name": agent_name,
-                    "success": False,
-                    "response": "Missing input field",
-                    "order": order,
-                }
-
-            handoff = handoff_map.get(agent_name)
-            if not handoff:
-                return {
-                    "agent_name": agent_name,
-                    "success": False,
-                    "response": (
-                        f"Subagent '{agent_name}' not found. "
-                        f"Available: {sorted(handoff_map.keys())}"
-                    ),
-                    "order": order,
-                }
-
-            # 强制直连黑名单拦截：黑名单子代理不走并行插件中转，
-            # 必须由主代理直接调用 transfer_to_xxx 直连（博士 2026-08-08 硬性指令）
-            if agent_name in self._get_handoff_blacklist():
-                return {
-                    "agent_name": agent_name,
-                    "success": False,
-                    "response": (
-                        f"子代理 '{agent_name}' 在强制直连黑名单中：不允许通过 "
-                        f"parallel_handoff / call_subagent 调用，请改用 "
-                        f"transfer_to_{agent_name} 工具直连调用。"
-                    ),
-                    "order": order,
-                }
-
-            # 场景注入：在 input 前拼接场景上下文
-            # 场景/基线前缀消费点：由 _apply_scene_prefix 决定（基线独立于场景开关）
-            final_input = self._apply_scene_prefix(input_text, scene_prefix)
-
-            # ── 记忆召回：注入长期记忆（memory.py） ──
-            # 接龙注入的前文是临时上下文：记忆链路（召回/存储）统一剥离，
-            # 避免上一个子代理的输出污染本子代理的长期记忆。
-            clean_input = self._strip_chain_injection(final_input)
-            memory_extra_parts = await self._memory_recall(
-                event, agent_name, clean_input, livingmemory_plugin
-            )
-
-            # ── 构建子代理工具集（memory.py 记忆工具过滤） ──
-            subagent_tools = self._build_memory_tools(agent_name)
-
-            t0 = time.perf_counter()
-            try:
-                umo = event.unified_msg_origin
-                prov_id = (
-                    handoff.provider_id
-                    or await self.context.get_current_chat_provider_id(umo)
-                )
-
-                # ── 上下文注入：跨轮对话历史 ──
-                if self._ctx_enabled:
-                    ctx_session_id = event.unified_msg_origin
-                    ctx_key = f"{agent_name}:{ctx_session_id}"
-                    ctx_history = self._subagent_contexts.get(ctx_key, [])
-                    if ctx_history:
-                        ctx_turns = len(ctx_history) // 2
-                        if ctx_turns <= self._ctx_max_turns:
-                            ctx_text = self._format_context_history(ctx_history)
-                            final_input = f"--- 对话历史 ---\n{ctx_text}\n--- 新的输入 ---\n{final_input}"
-                        else:
-                            try:
-                                ctx_text = await self._compress_context_history(
-                                    agent_name, ctx_session_id, ctx_history, prov_id, handoff, timeout
-                                )
-                            except Exception:
-                                max_msgs = self._ctx_max_turns * 2
-                                ctx_text = self._format_context_history(ctx_history[-max_msgs:])
-                            final_input = f"--- 对话历史 ---\n{ctx_text}\n--- 新的输入 ---\n{final_input}"
-
-                llm_resp = await asyncio.wait_for(
-                    self.context.llm_generate(
-                        chat_provider_id=prov_id,
-                        prompt=final_input,
-                        system_prompt=handoff.agent.instructions or "",
-                        tools=subagent_tools,
-                        extra_user_content_parts=memory_extra_parts,
-                    ),
-                    timeout=timeout,
-                )
-                latency_ms = int((time.perf_counter() - t0) * 1000)
-                raw_response = llm_resp.completion_text
-
-                # ── 记忆存储：存入长期记忆（memory.py） ──
-                await self._memory_store(
-                    livingmemory_plugin, event, agent_name, final_input, raw_response
-                )
-
-                # 清理 persona_id（由上方的记忆召回阶段设置），确保下轮调用不残留
-                if hasattr(event, "persona_id"):
-                    delattr(event, "persona_id")
-
-                # ── 上下文存储：追加到跨轮对话历史 ──
-                if self._ctx_enabled:
-                    self._append_context(agent_name, event.unified_msg_origin, input_text, raw_response)
-
-                # 自动转发已由 parallel_handoff 的分段转发负责,此处不再重复推送
-                # 姓名前缀（先查覆盖表,再走全局开关）
-                overrides = self._get_name_prefix_overrides()
-                if isinstance(overrides, dict) and agent_name in overrides:
-                    should_prefix = overrides[agent_name]
-                else:
-                    should_prefix = enable_name_prefix
-
-                if should_prefix:
-                    display_name = self._display_name(agent_name)
-                    prefix_str = f"【{display_name}】\n"
-                    if not raw_response.startswith(prefix_str):
-                        raw_response = prefix_str + raw_response
-
-                return {
-                    "agent_name": agent_name,
-                    "success": True,
-                    "response": raw_response,
-                    "latency_ms": latency_ms,
-                    "order": order,
-                }
-            except asyncio.TimeoutError:
-                latency_ms = int((time.perf_counter() - t0) * 1000)
-                logger.warning(
-                    f"[parallel_handoff] Subagent '{agent_name}' timed out after {timeout}s"
-                )
-                if hasattr(event, "persona_id"):
-                    delattr(event, "persona_id")
-                err_text = f"Timeout after {timeout}s"
-                overrides = self._get_name_prefix_overrides()
-                if isinstance(overrides, dict) and agent_name in overrides:
-                    should_prefix = overrides[agent_name]
-                else:
-                    should_prefix = enable_name_prefix
-                if should_prefix:
-                    display_name = self._display_name(agent_name)
-                    prefix_str = f"【{display_name}】\n"
-                    if not err_text.startswith(prefix_str):
-                        err_text = prefix_str + err_text
-                return {
-                    "agent_name": agent_name,
-                    "success": False,
-                    "response": err_text,
-                    "latency_ms": latency_ms,
-                    "order": order,
-                }
-            except Exception as e:
-                if hasattr(event, "persona_id"):
-                    delattr(event, "persona_id")
-                latency_ms = int((time.perf_counter() - t0) * 1000)
-                logger.error(
-                    f"[parallel_handoff] Subagent '{agent_name}' failed: {e}"
-                )
-                err_text = f"Error: {e}"
-                overrides = self._get_name_prefix_overrides()
-                if isinstance(overrides, dict) and agent_name in overrides:
-                    should_prefix = overrides[agent_name]
-                else:
-                    should_prefix = enable_name_prefix
-                if should_prefix:
-                    display_name = self._display_name(agent_name)
-                    prefix_str = f"【{display_name}】\n"
-                    if not err_text.startswith(prefix_str):
-                        err_text = prefix_str + err_text
-                return {
-                    "agent_name": agent_name,
-                    "success": False,
-                    "response": err_text,
-                    "latency_ms": latency_ms,
-                    "order": order,
-                }
+        # 单子代理调用已迁为 self._call_one 方法（捕获变量显式参数化）
 
         # ── 并行调度 ─────────────────────────────────────────
         if not calls:
@@ -432,7 +433,15 @@ Args:
                             f"请接续上文，现在轮到你回应："
                         )
                     c["input"] = chain_note + (c.get("input") or "")
-                r = await _call_one(c)
+                r = await self._call_one(
+                    c,
+                    event=event,
+                    handoff_map=handoff_map,
+                    scene_prefix=scene_prefix,
+                    livingmemory_plugin=livingmemory_plugin,
+                    enable_name_prefix=enable_name_prefix,
+                    timeout=timeout,
+                )
                 results.append(r)
                 # ── 流式转发：本条立刻发出，不等整条链 ──
                 if enable_segmented_forward:
@@ -449,7 +458,18 @@ Args:
             # 接龙模式保持调用顺序发送，不按 order 重排（order 仅对并行模式生效）
         else:
             # ── 并行模式（默认）──
-            tasks = [_call_one(c) for c in calls]
+            tasks = [
+                self._call_one(
+                    c,
+                    event=event,
+                    handoff_map=handoff_map,
+                    scene_prefix=scene_prefix,
+                    livingmemory_plugin=livingmemory_plugin,
+                    enable_name_prefix=enable_name_prefix,
+                    timeout=timeout,
+                )
+                for c in calls
+            ]
             results = await asyncio.gather(*tasks)
             # 按 order 排序（如果有的话）
             has_order = any(r.get("order") is not None for r in results)
