@@ -100,7 +100,7 @@ class DispatchMixin:
         timeout: int = 30,
         message: str = None,
     ) -> str:
-        """并行调用多个子代理（如助手A、助手C、tech、memory、search）,
+        """并行调用多个子代理（如助手A、助手B、助手C、夕、令等）,
 同时获取它们的回复并汇总。
 
 使用场景：当需要多个子代理从不同角度回答同一个问题时使用此工具。
@@ -209,7 +209,7 @@ Args:
                     "order": order,
                 }
 
-            # 强制直连黑名单拦截：黑名单子代理（如 tech/技术Agent）不走并行插件中转，
+            # 强制直连黑名单拦截：黑名单子代理不走并行插件中转，
             # 必须由主代理直接调用 transfer_to_xxx 直连（顾主 2026-08-08 硬性指令）
             if agent_name in self._get_handoff_blacklist():
                 return {
@@ -224,9 +224,8 @@ Args:
                 }
 
             # 场景注入：在 input 前拼接场景上下文
-            final_input = input_text
-            if enable_scene_inject and scene_prefix:
-                final_input = f"{scene_prefix}\n\n{input_text}"
+            # 场景/基线前缀消费点：由 _apply_scene_prefix 决定（基线独立于场景开关）
+            final_input = self._apply_scene_prefix(input_text, scene_prefix)
 
             # ── 记忆召回：注入长期记忆（memory.py） ──
             # 接龙注入的前文是临时上下文：记忆链路（召回/存储）统一剥离，
@@ -248,7 +247,7 @@ Args:
                 )
 
                 # ── 上下文注入：跨轮对话历史 ──
-                if self._ctx_enabled and agent_name not in ("tech", "技术Agent"):
+                if self._ctx_enabled:
                     ctx_session_id = event.unified_msg_origin
                     ctx_key = f"{agent_name}:{ctx_session_id}"
                     ctx_history = self._subagent_contexts.get(ctx_key, [])
@@ -290,7 +289,7 @@ Args:
                     delattr(event, "persona_id")
 
                 # ── 上下文存储：追加到跨轮对话历史 ──
-                if self._ctx_enabled and agent_name not in ("tech", "技术Agent"):
+                if self._ctx_enabled:
                     self._append_context(agent_name, event.unified_msg_origin, input_text, raw_response)
 
                 # 自动转发已由 parallel_handoff 的分段转发负责,此处不再重复推送
@@ -445,7 +444,7 @@ Args:
                         # 失败：已通知，统一转发阶段跳过
                         r["_sent"] = True
                         await self._send_failure_notify(r, event)
-                    # 非 direct 且成功（如 tech）：不打 _sent，
+                    # 非 direct 且成功：不打 _sent，
                     # 交由统一转发阶段收集进 return_agent_results 返回完整回复
             # 接龙模式保持调用顺序发送，不按 order 重排（order 仅对并行模式生效）
         else:
@@ -493,7 +492,7 @@ Args:
                 if r.get("success") and is_direct:
                     await self._forward_segmented(r.get("response", ""), event)
                 elif r.get("success"):
-                    # 非直接发送代理（如tech）— 收集完整回复返回给主代理
+                    # 非直接发送代理 — 收集完整回复返回给主代理
                     if agent_name not in [ra.get("agent_name") for ra in return_agent_results]:
                         return_agent_results.append(r)
                 else:
@@ -537,7 +536,7 @@ Args:
             # 注释掉: 此flag由钩子清空chain后自行复位, 不在工具内复位以拦截后续回显
             # self._suppress_mainagent_prefix = False
             # 返回子代理回复文本供主代理转发。
-            # 修复：非 direct 代理（如 tech）的完整回复收集在 return_agent_results 中，
+            # 修复：非 direct 代理的完整回复收集在 return_agent_results 中，
             # 只返回 pending_text 会把回复吞成 "✓"——有完整回复时必须返回摘要 JSON。
             if pending_text:
                 return pending_text
@@ -670,7 +669,7 @@ Args:
 - 相比 transfer_to_* 工具，本工具确保回复直接发到用户而不用主代理转述
 
 Args:
-    agent_name (string): 子代理名称。支持英文 id（agent_a, agent_b, agent_c, tech, xi 等）和中文名（助手A, 助手B, 助手C, 技术Agent, 夕 等），大小写不敏感
+    agent_name (string): 子代理名称。支持英文 id（agent_a, agent_b, agent_c, xi 等）和中文名（助手A, 助手B, 助手C, 夕 等），大小写不敏感
     input (string): 传给子代理的完整问题或指令
 """
         calls = [{"agent_name": agent_name, "input": input}]

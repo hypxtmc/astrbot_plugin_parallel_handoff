@@ -3,15 +3,28 @@
 对应原 main.py 的 577-603 行（_build_scene_context）+
 829-841 行区域（parallel_handoff 内的场景/基线前缀构建，抽成 _build_scene_prefix）。
 
-语义固定：enable_baseline_inject 只对 relay 子代理生效（direct 子代理回复
-直接发送不经主代理，基线注入对它们无意义）；黑名单（tech/技术Agent）在
-_call_one 入口 return，碰不到这段代码。
+语义固定：基线注入对所有非黑名单子代理统一生效（direct 与 relay 一致，
+回复发送方式不影响输入侧预处理）；黑名单子代理在 _call_one 入口 return，
+碰不到这段代码。基线与场景解耦：场景段归 enable_scene_inject，基线段归
+enable_baseline_inject，消费点 _apply_scene_prefix 只认 scene_prefix 非空。
 """
 from astrbot.api.event import AstrMessageEvent
 
 
 class SceneMixin:
     """场景上下文构建 + 共用剧情基线注入"""
+
+    # ── 场景/基线前缀消费点（Bug#1 修复）────────────
+    def _apply_scene_prefix(self, input_text: str, scene_prefix: str) -> str:
+        """消费点：scene_prefix 非空即拼接到 input 前，与场景开关解耦。
+
+        基线拼接原来被 enable_scene_inject 短路：场景开关一关，基线也
+        跟着被吞。现在基线受 enable_baseline_inject 独立控制，消费点
+        只认 scene_prefix 非空（顾主 2026-08-17 实锤修复）。
+        """
+        if scene_prefix:
+            return f"{scene_prefix}\n\n{input_text}"
+        return input_text
 
     # ── 场景注入 ─────────────────────────────────────────────
     def _build_scene_context(self, event: AstrMessageEvent) -> str:
