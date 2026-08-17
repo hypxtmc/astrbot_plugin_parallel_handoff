@@ -15,13 +15,23 @@ from astrbot.core.message.message_event_result import MessageChain
 
 # 怀孕插件文本自动识别接入（可选依赖：baby 插件未加载时静默跳过）
 # 运行时插件挂载在 data.plugins 前缀下；顶层包名仅作兼容兜底
-try:
-    from data.plugins.astrbot_plugin_baby.analyzer import feed_text as _baby_feed_text
-except Exception:
-    try:
-        from astrbot_plugin_baby.analyzer import feed_text as _baby_feed_text
-    except Exception:
-        _baby_feed_text = None
+# 懒加载：首次实际分发时才探测 import，规避插件/热重载加载顺序不可控
+_BABY_FEED_CACHE = None
+_BABY_FEED_TRIED = False
+
+
+def _get_baby_feed():
+    global _BABY_FEED_CACHE, _BABY_FEED_TRIED
+    if not _BABY_FEED_TRIED:
+        _BABY_FEED_TRIED = True
+        try:
+            from data.plugins.astrbot_plugin_baby.analyzer import feed_text as _BABY_FEED_CACHE
+        except Exception:
+            try:
+                from astrbot_plugin_baby.analyzer import feed_text as _BABY_FEED_CACHE
+            except Exception:
+                _BABY_FEED_CACHE = None
+    return _BABY_FEED_CACHE
 
 
 
@@ -71,9 +81,10 @@ class ForwardMixin:
                     msg = f"{prefix}\n{seg_text}"
                 else:
                     msg = seg_text
-                if _baby_feed_text is not None:
+                _baby = _get_baby_feed()
+                if _baby is not None:
                     try:
-                        _baby_feed_text(msg, sender_id=event.get_sender_id())
+                        _baby(msg, sender_id=event.get_sender_id())
                     except Exception:
                         pass
                 await self.context.send_message(
