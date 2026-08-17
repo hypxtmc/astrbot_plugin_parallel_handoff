@@ -8,7 +8,10 @@
 碰不到这段代码。基线与场景解耦：场景段归 enable_scene_inject，基线段归
 enable_baseline_inject，消费点 _apply_scene_prefix 只认 scene_prefix 非空。
 """
+import logging
 from astrbot.api.event import AstrMessageEvent
+
+_logger = logging.getLogger("parallel_handoff.scene")
 
 
 class SceneMixin:
@@ -23,7 +26,9 @@ class SceneMixin:
         只认 scene_prefix 非空（博士 2026-08-17 实锤修复）。
         """
         if scene_prefix:
+            _logger.debug("scene/基线前缀注入: %d chars -> %.40s...", len(scene_prefix), scene_prefix.replace("\n", " ")[:40])
             return f"{scene_prefix}\n\n{input_text}"
+        _logger.debug("scene/基线前缀为空，原样透传 input")
         return input_text
 
     # ── 场景注入 ─────────────────────────────────────────────
