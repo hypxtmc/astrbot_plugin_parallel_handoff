@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 *.bak*
 .codegraph/
+
+# 外部插件测试产物,与本插件无关
+/data/
