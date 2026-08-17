@@ -13,6 +13,17 @@ from astrbot.api.event import AstrMessageEvent
 from astrbot.core.message.components import Plain
 from astrbot.core.message.message_event_result import MessageChain
 
+# 怀孕插件文本自动识别接入（可选依赖：baby 插件未加载时静默跳过）
+# 运行时插件挂载在 data.plugins 前缀下；顶层包名仅作兼容兜底
+try:
+    from data.plugins.astrbot_plugin_baby.analyzer import feed_text as _baby_feed_text
+except Exception:
+    try:
+        from astrbot_plugin_baby.analyzer import feed_text as _baby_feed_text
+    except Exception:
+        _baby_feed_text = None
+
+
 
 class ForwardMixin:
     """子代理分段转发 / 主代理分段转发 / 姓名前缀 / 主代理前缀注入"""
@@ -60,6 +71,11 @@ class ForwardMixin:
                     msg = f"{prefix}\n{seg_text}"
                 else:
                     msg = seg_text
+                if _baby_feed_text is not None:
+                    try:
+                        _baby_feed_text(msg, sender_id=event.get_sender_id())
+                    except Exception:
+                        pass
                 await self.context.send_message(
                     event.unified_msg_origin,
                     MessageChain([Plain(msg)]),
@@ -111,7 +127,14 @@ class ForwardMixin:
                 await asyncio.sleep(self.config.get("fragment_interval", 0.3))
         except Exception as e:
             logger.error(f"[inject_mainagent_prefix] 分段发送失败: {e}")
-            return False
+            # [修复 2026-08-16] 分段已发出部分段时禁止 return False——那会触发
+            # 框架兜底重发整条，造成重复（NapCat sendMsg 超时 retcode 1200 场景
+            # 消息可能实际已送达）。仅当一段都未发出（异常发生在循环前）才保留链
+            # 交给调用方整条兜底，此时重发无重复风险。
+            if "idx" not in locals():
+                return False
+            result.chain.clear()
+            return True
         # 清空原始链，不让框架重复发送
         result.chain.clear()
         return True
