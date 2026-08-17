@@ -193,25 +193,11 @@ class DispatchMixin:
                 or await self.context.get_current_chat_provider_id(umo)
             )
 
-            # ── 上下文注入：跨轮对话历史 ──
-            if self._ctx_enabled:
-                ctx_session_id = event.unified_msg_origin
-                ctx_key = f"{agent_name}:{ctx_session_id}"
-                ctx_history = self._subagent_contexts.get(ctx_key, [])
-                if ctx_history:
-                    ctx_turns = len(ctx_history) // 2
-                    if ctx_turns <= self._ctx_max_turns:
-                        ctx_text = self._format_context_history(ctx_history)
-                        final_input = f"--- 对话历史 ---\n{ctx_text}\n--- 新的输入 ---\n{final_input}"
-                    else:
-                        try:
-                            ctx_text = await self._compress_context_history(
-                                agent_name, ctx_session_id, ctx_history, prov_id, handoff, timeout
-                            )
-                        except Exception:
-                            max_msgs = self._ctx_max_turns * 2
-                            ctx_text = self._format_context_history(ctx_history[-max_msgs:])
-                        final_input = f"--- 对话历史 ---\n{ctx_text}\n--- 新的输入 ---\n{final_input}"
+            # ── 上下文注入：跨轮对话历史（ContextEngine 独立引擎） ──
+            final_input = await self._ctx_engine.inject(
+                agent_name, event.unified_msg_origin, final_input,
+                prov_id, handoff, timeout,
+            )
 
             llm_resp = await asyncio.wait_for(
                 self.context.llm_generate(
@@ -235,9 +221,8 @@ class DispatchMixin:
             if hasattr(event, "persona_id"):
                 delattr(event, "persona_id")
 
-            # ── 上下文存储：追加到跨轮对话历史 ──
-            if self._ctx_enabled:
-                self._append_context(agent_name, event.unified_msg_origin, input_text, raw_response)
+            # ── 上下文存储：追加到跨轮对话历史（ContextEngine） ──
+            self._ctx_engine.append(agent_name, event.unified_msg_origin, input_text, raw_response)
 
             # 自动转发已由 parallel_handoff 的分段转发负责,此处不再重复推送
             raw_response = self._maybe_prefix(agent_name, raw_response, enable_name_prefix)
@@ -579,100 +564,7 @@ Args:
             indent=2,
         )
 
-    # ── 跨轮上下文辅助方法 ─────────────────────────────────
-
-    def _format_context_history(self, history: list[dict]) -> str:
-        """格式化对话历史列表为文本"""
-        lines = []
-        for msg in history:
-            role_label = "user" if msg["role"] == "user" else "assistant"
-            lines.append(f"{role_label}: {msg['content']}")
-        return "\n".join(lines)
-
-    async def _compress_context_history(
-        self, agent_name: str, session_id: str, history: list[dict],
-        prov_id: str, handoff, timeout: int
-    ) -> str:
-        """压缩对话历史：保留最近 N 轮完整对话 + LLM 摘要旧对话"""
-        keep_count = self._ctx_keep_recent * 2
-        if len(history) <= keep_count:
-            return self._format_context_history(history)
-
-        recent = history[-keep_count:]
-        old = history[:-keep_count]
-
-        old_text = self._format_context_history(old)
-        compress_prompt = (
-            f"请将以下对话历史压缩为一段简洁的摘要，保留关键信息、上下文和决策。"
-            f"压缩后长度约为原文的{self._ctx_compress_ratio}%。"
-            f"只输出摘要文本，不要加任何前缀或解释。\n\n{old_text}"
-        )
-
-        llm_resp = await asyncio.wait_for(
-            self.context.llm_generate(
-                chat_provider_id=prov_id,
-                prompt=compress_prompt,
-                system_prompt="你是一个对话摘要助手。请简洁地总结对话内容。",
-            ),
-            timeout=min(timeout, 30),
-        )
-        summary = llm_resp.completion_text.strip()
-
-        recent_text = self._format_context_history(recent)
-        return f"[历史摘要]\n{summary}\n\n[最近对话]\n{recent_text}"
-
-    async def _summarize_chain_reply(
-        self, prev_display: str, text: str, prov_id, timeout: int
-    ) -> str | None:
-        """接龙长回复精简：压缩为 摘要+原文首尾 格式。
-
-        - 超阈值才触发，保留首尾各 N 字符，中间用摘要衔接
-        - 保留「（接龙·上一位）」与「请接续上文，现在轮到你回应：」标记，
-          使 _strip_chain_injection 的记忆剥离链路不受影响
-        - 精简失败返回 None，由调用方降级为原样注入
-        """
-        keep = max(20, int(self._cfg("chain_summary_keep_head_tail", 120)))
-        head = text[:keep]
-        tail = text[-keep:] if len(text) > keep * 2 else ""
-        prompt = (
-            f"请将下面这段角色回复压缩为一段简洁的摘要，保留关键剧情、情绪、伏笔和重要原话。"
-            f"摘要控制在 {max(keep, 150)} 字以内，只输出摘要内容，不要加任何前缀或解释。\n\n{text}"
-        )
-        try:
-            llm_resp = await asyncio.wait_for(
-                self.context.llm_generate(
-                    chat_provider_id=prov_id,
-                    prompt=prompt,
-                    system_prompt="你是一个剧情摘要助手，负责把接龙中上一位角色的长回复压缩为简练摘要，保留剧情关键信息。",
-                ),
-                timeout=min(timeout, 30),
-            )
-            summary = (llm_resp.completion_text or "").strip()
-            if not summary:
-                return None
-            return (
-                f"（接龙·上一位）【{prev_display}】的回复（已精简·原文{len(text)}字）：\n"
-                f"【摘要】{summary}\n"
-                f"【原文开头】{head}\n"
-                f"【原文结尾】{tail}\n\n"
-                f"请接续上文，现在轮到你回应："
-            )
-        except Exception as e:
-            logger.warning(f"[parallel_handoff] 接龙精简失败，降级原样注入: {e}")
-            return None
-
-    def _append_context(self, agent_name: str, session_id: str, user_input: str, assistant_response: str):
-        """追加一轮对话到上下文历史，上限 200 条消息"""
-        ctx_key = f"{agent_name}:{session_id}"
-        if ctx_key not in self._subagent_contexts:
-            self._subagent_contexts[ctx_key] = []
-
-        history = self._subagent_contexts[ctx_key]
-        history.append({"role": "user", "content": user_input})
-        history.append({"role": "assistant", "content": assistant_response})
-
-        if len(history) > 200:
-            self._subagent_contexts[ctx_key] = history[-200:]
+    # ── 跨轮上下文已迁至 ctx_engine.ContextEngine ──
 
     # ── 统一单代理路由实现（装饰器 @llm_tool 在 main.py 壳方法上） ──
     async def call_subagent(

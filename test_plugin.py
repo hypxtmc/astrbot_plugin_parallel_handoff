@@ -937,3 +937,52 @@ class TestBuildScenePrefix(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestContextEngine:
+    """ContextEngine 直接单测：独立引擎可单测（不 mock 整个插件）"""
+
+    def test_inject_append_roundtrip(self):
+        import asyncio
+        from ctx_engine import ContextEngine
+
+        eng = ContextEngine(enabled=True, max_turns=5, keep_recent=5)
+        key_fn = lambda a, s: f"{a}:{s}"
+        # 存储一轮对话
+        eng.append("amiya", "sess1", "你好", "你好呀博士")
+        hist = eng.histories.get(key_fn("amiya", "sess1"))
+        assert hist and len(hist) == 2
+        assert hist[0]["role"] == "user" and hist[0]["content"] == "你好"
+
+        # 注入：历史拼进输入
+        out = asyncio.run(eng.inject("amiya", "sess1", "新的问题"))
+        assert "对话历史" in out and "新的输入" in out
+        assert "assistant: 你好呀博士" in out
+
+        # 无历史时原样返回
+        out2 = asyncio.run(eng.inject("closure", "sess1", "独自"))
+        assert out2 == "独自"
+
+    def test_compress_fallback_without_llm(self):
+        import asyncio
+        from ctx_engine import ContextEngine
+
+        # max_turns=1：第2轮起触发压缩；未绑定 llm → 截断降级，不抛
+        eng = ContextEngine(enabled=True, max_turns=1, keep_recent=1, llm_generate=None)
+        for i in range(3):
+            eng.append("theresia", "s9", f"问{i}", f"答{i}")
+        out = asyncio.run(eng.inject("theresia", "s9", "继续"))
+        # 3轮(6条) > 1轮 → 压缩尝试;降级后保留最近 1 轮完整=2 条
+        assert out.count("assistant:") == 1
+        assert "答2" in out and "新的输入" in out
+        assert "历史摘要" not in out
+
+    def test_disabled_noop(self):
+        import asyncio
+        from ctx_engine import ContextEngine
+
+        eng = ContextEngine(enabled=False)
+        eng.append("amiya", "sx", "甲", "乙")
+        assert eng.histories == {}
+        out = asyncio.run(eng.inject("amiya", "sx", "原样"))
+        assert out == "原样"

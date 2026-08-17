@@ -34,6 +34,7 @@ try:
     from . import memory as _memory_mod
     from . import dispatch as _dispatch_mod
     from . import forward as _forward_mod
+    from . import ctx_engine as _ctx_engine_mod
 except ImportError:
     import config as _config_mod
     import directive as _directive_mod
@@ -41,6 +42,7 @@ except ImportError:
     import memory as _memory_mod
     import dispatch as _dispatch_mod
     import forward as _forward_mod
+    import ctx_engine as _ctx_engine_mod
 
 
 @register(
@@ -85,11 +87,17 @@ class ParallelHandoffPlugin(
         # LLM 工具调用防重标记：{message_key -> (ts, None)}，同一消息重复路由直接短路
         self._tool_call_seen: dict[str, tuple[float, None]] = {}
         # 跨轮对话上下文：{agent_name:session_id -> [{"role": ..., "content": ...}, ...]}
-        self._subagent_contexts: dict[str, list[dict]] = {}
-        self._ctx_enabled = bool(self._cfg("subagent_context_enabled", True))
-        self._ctx_max_turns = int(self._cfg("subagent_context_max_turns", 100))
-        self._ctx_keep_recent = int(self._cfg("subagent_context_keep_recent", 5))
-        self._ctx_compress_ratio = int(self._cfg("subagent_context_compress_ratio", 15))
+        # 跨轮对话上下文：独立引擎 ContextEngine（压缩参数构造注入，可独立调参）
+        self._ctx_engine = _ctx_engine_mod.ContextEngine(
+            enabled=self._cfg("subagent_context_enabled", True),
+            max_turns=self._cfg("subagent_context_max_turns", 100),
+            keep_recent=self._cfg("subagent_context_keep_recent", 5),
+            compress_ratio=self._cfg("subagent_context_compress_ratio", 15),
+            llm_generate=lambda *a, **k: (
+                self.context.llm_generate(*a, **k)
+                if hasattr(self, "context") and self.context else None
+            ),
+        )
 
     # ── 事件注册：主代理前缀自动注入（实现见 forward.py ForwardMixin） ──
     @filter.on_decorating_result()
