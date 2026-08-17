@@ -163,18 +163,18 @@ class TestDisplayName(unittest.TestCase):
         plugin = self._make_plugin({"name_display_map": "{}"})
         self.assertEqual(plugin._display_name("amiya"), "阿米娅")
         self.assertEqual(plugin._display_name("theresia"), "特蕾西娅")
-        self.assertEqual(plugin._display_name("tech"), "tech")  # tech 已移除映射，回退原名
+        self.assertEqual(plugin._display_name("demo"), "demo")  # tech 已移除映射，回退原名
 
     def test_display_name_config(self):
         """name_display_map 配置值生效，覆盖硬编码"""
         plugin = self._make_plugin({
             "name_display_map": json.dumps({
                 "amiya": "小阿米娅",
-                "tech": "技术小哥",
+                "demo": "技术小哥",
             })
         })
         self.assertEqual(plugin._display_name("amiya"), "小阿米娅")
-        self.assertEqual(plugin._display_name("tech"), "技术小哥")
+        self.assertEqual(plugin._display_name("demo"), "技术小哥")
         # 未在配置中，回退到硬编码
         self.assertEqual(plugin._display_name("theresia"), "特蕾西娅")
         # 既不在配置也不在硬编码，返回原名
@@ -217,10 +217,10 @@ class TestPrefixOverrides(unittest.TestCase):
     def test_get_prefix_overrides_string(self):
         """JSON 字符串格式的覆盖表"""
         plugin = self._make_plugin({
-            "name_prefix_overrides": json.dumps({"amiya": False, "tech": True})
+            "name_prefix_overrides": json.dumps({"amiya": False, "demo": True})
         })
         result = plugin._get_name_prefix_overrides()
-        self.assertEqual(result, {"amiya": False, "tech": True})
+        self.assertEqual(result, {"amiya": False, "demo": True})
 
     def test_get_prefix_overrides_dict(self):
         """直接传 dict 格式也能正确读取"""
@@ -394,20 +394,20 @@ class TestRouteDirective(unittest.TestCase):
         self.assertEqual(plugin._build_route_directive(), "")
 
     def test_blacklist_in_direct_directive(self):
-        """direct 模式：指令含黑名单 transfer_to_* 直连规范，且不再把 tech 列为 relay"""
+        """direct 模式：指令含黑名单直连规范，黑名单 ID 动态注入"""
         plugin = self._make_plugin({
             "route_mode": "direct",
             "call_mode": "parallel",
             "direct_delivery_agents": "amiya,closure",
-            "handoff_blacklist_agents": "tech,技术Agent",
+            "handoff_blacklist_agents": "demo,canary",
         })
         d = plugin._build_route_directive()
         self.assertIn("强制直连黑名单", d)
-        self.assertIn("技术Agent", d)
+        self.assertIn("demo", d)
         self.assertIn("transfer_to_xxx", d)
         self.assertIn("禁止用 parallel_handoff / call_subagent 调用", d)
-        # 黑名单代理不应再被描述为"走 relay 返回主代理"
-        self.assertNotIn("技术Agent）走 relay", d)
+        # 黑名单代理不被描述为走 relay 返回主代理
+        self.assertNotIn("demo）走 relay", d)
 
     def test_blacklist_in_relay_directive(self):
         """relay 模式：黑名单直连规范仍然生效"""
@@ -415,7 +415,7 @@ class TestRouteDirective(unittest.TestCase):
             "route_mode": "relay",
             "call_mode": "parallel",
             "direct_delivery_agents": "amiya,closure",
-            "handoff_blacklist_agents": "tech,技术Agent",
+            "handoff_blacklist_agents": "demo,canary",
         })
         d = plugin._build_route_directive()
         self.assertIn("强制直连黑名单", d)
@@ -442,19 +442,19 @@ class TestRouteDirectiveInject(unittest.TestCase):
         plugin = self._make_plugin({
             "route_mode": "direct",
             "call_mode": "parallel",
-            "direct_delivery_agents": "amiya,closure,tech",
+            "direct_delivery_agents": "amiya,closure,demo",
             "enable_route_directive": True,
         })
         req = MagicMock()
         req.system_prompt = "【人格】原 prompt"
         req.extra_user_content_parts = []
-        req.func_tool = {"tools": ["parallel_handoff", "transfer_to_tech"]}
+        req.func_tool = {"tools": ["parallel_handoff", "transfer_to_demo"]}
         ret = asyncio.run(plugin._route_directive_inject(MagicMock(), req))
         self.assertIs(ret, False)                      # 不拦截
         self.assertEqual(req.system_prompt, "【人格】原 prompt")  # 系统提示前缀零改动
         self.assertEqual(len(req.extra_user_content_parts), 1)   # 注入到请求尾部
         self.assertIn("【路由强制指令·parallel_handoff】", req.extra_user_content_parts[0].text)
-        self.assertEqual(req.func_tool["tools"], ["parallel_handoff", "transfer_to_tech"])  # 工具保留
+        self.assertEqual(req.func_tool["tools"], ["parallel_handoff", "transfer_to_demo"])  # 工具保留
 
     def test_marker_dedup(self):
         """已含标记时跳过重复注入"""
@@ -529,7 +529,7 @@ class TestDedupGuard(unittest.TestCase):
         """同消息同代理同 input：第二次短路"""
         plugin = self._make_plugin()
         ev = self._make_event()
-        calls = [{"agent_name": "tech", "input": "问题A"}]
+        calls = [{"agent_name": "demo", "input": "问题A"}]
         self.assertIsNone(plugin._dedup_guard(ev, calls=calls))
         ret = plugin._dedup_guard(ev, calls=calls)
         self.assertIsNotNone(ret)
@@ -540,10 +540,10 @@ class TestDedupGuard(unittest.TestCase):
         plugin = self._make_plugin()
         ev = self._make_event()
         self.assertIsNone(
-            plugin._dedup_guard(ev, calls=[{"agent_name": "tech", "input": "问题A"}])
+            plugin._dedup_guard(ev, calls=[{"agent_name": "demo", "input": "问题A"}])
         )
         self.assertIsNone(
-            plugin._dedup_guard(ev, calls=[{"agent_name": "tech", "input": "问题B"}])
+            plugin._dedup_guard(ev, calls=[{"agent_name": "demo", "input": "问题B"}])
         )
 
     def test_different_agent_allowed(self):
@@ -554,7 +554,7 @@ class TestDedupGuard(unittest.TestCase):
             plugin._dedup_guard(ev, calls=[{"agent_name": "amiya", "input": "问题A"}])
         )
         self.assertIsNone(
-            plugin._dedup_guard(ev, calls=[{"agent_name": "tech", "input": "问题A"}])
+            plugin._dedup_guard(ev, calls=[{"agent_name": "demo", "input": "问题A"}])
         )
 
     def test_calls_order_insensitive(self):
@@ -566,14 +566,14 @@ class TestDedupGuard(unittest.TestCase):
                 ev,
                 calls=[
                     {"agent_name": "amiya", "input": "问题A"},
-                    {"agent_name": "tech", "input": "问题B"},
+                    {"agent_name": "demo", "input": "问题B"},
                 ],
             )
         )
         ret = plugin._dedup_guard(
             ev,
             calls=[
-                {"agent_name": "tech", "input": "问题B"},
+                {"agent_name": "demo", "input": "问题B"},
                 {"agent_name": "amiya", "input": "问题A"},
             ],
         )
@@ -583,15 +583,15 @@ class TestDedupGuard(unittest.TestCase):
         """消歧模式（无 calls 有 message）：同消息同 message 第二次短路"""
         plugin = self._make_plugin()
         ev = self._make_event()
-        self.assertIsNone(plugin._dedup_guard(ev, message="继续问 tech"))
-        ret = plugin._dedup_guard(ev, message="继续问 tech")
+        self.assertIsNone(plugin._dedup_guard(ev, message="继续问 demo"))
+        ret = plugin._dedup_guard(ev, message="继续问 demo")
         self.assertIsNotNone(ret)
 
     def test_different_message_allowed(self):
         """消歧模式同消息不同 message：放行"""
         plugin = self._make_plugin()
         ev = self._make_event()
-        self.assertIsNone(plugin._dedup_guard(ev, message="继续问 tech"))
+        self.assertIsNone(plugin._dedup_guard(ev, message="继续问 demo"))
         self.assertIsNone(plugin._dedup_guard(ev, message="换成问 amiya"))
 
 
@@ -616,35 +616,35 @@ class TestHandoffBlacklist(unittest.TestCase):
     def test_get_blacklist_custom(self):
         """自定义黑名单生效"""
         plugin = self._make_plugin({
-            "handoff_blacklist_agents": "tech,memory",
+            "handoff_blacklist_agents": "demo,memory",
         })
         blacklist = plugin._get_handoff_blacklist()
-        self.assertEqual(blacklist, {"tech", "memory"})
+        self.assertEqual(blacklist, {"demo", "memory"})
 
     def test_get_blacklist_empty(self):
         """空配置返回空集"""
         plugin = self._make_plugin({"handoff_blacklist_agents": ""})
         self.assertEqual(plugin._get_handoff_blacklist(), set())
 
-    def test_call_one_blocks_blacklist_tech(self):
-        """parallel_handoff 调用黑名单 tech 被拦截，提示改用 transfer_to_tech"""
+    def test_call_one_blocks_blacklist_demo(self):
+        """parallel_handoff 调用黑名单 demo 被拦截，提示改用 transfer_to_demo"""
         mock_context = MagicMock()
-        # 构造 orchestrator + handoffs（含 tech）
+        # 构造 orchestrator + handoffs（含 demo）
         class _FakeAgent:
-            name = "tech"
+            name = "demo"
             instructions = ""
             tools = None
             begin_dialogs = None
         class _FakeHandoff:
             agent = _FakeAgent()
             provider_id = None
-            name = "transfer_to_tech"
+            name = "transfer_to_demo"
         mock_context.subagent_orchestrator.handoffs = [_FakeHandoff()]
         mock_context.get_all_stars.return_value = []
         plugin = self.PluginClass(context=mock_context, config={
             "enable_scene_inject": False,
             "enable_segmented_forward": False,
-            "handoff_blacklist_agents": "tech,技术Agent",
+            "handoff_blacklist_agents": "demo,canary",
             "enable_disambiguation": False,
             "enable_subagent_name_prefix": False,
             "subagent_context_enabled": False,
@@ -655,12 +655,12 @@ class TestHandoffBlacklist(unittest.TestCase):
         ev.message_obj.message_id = "msg-blacklist-test"
         raw = asyncio.run(plugin.parallel_handoff(
             ev,
-            calls=[{"agent_name": "tech", "input": "帮我查个问题"}],
+            calls=[{"agent_name": "demo", "input": "帮我查个问题"}],
         ))
         data = json.loads(raw)
         self.assertEqual(data["results"][0]["success"], False)
         self.assertIn("强制直连黑名单", data["results"][0]["response"])
-        self.assertIn("transfer_to_tech", data["results"][0]["response"])
+        self.assertIn("transfer_to_demo", data["results"][0]["response"])
 
     def test_call_one_allows_non_blacklist(self):
         """非黑名单代理（amiya）不受拦截，进入实际调用流程"""
@@ -685,7 +685,7 @@ class TestHandoffBlacklist(unittest.TestCase):
         plugin = self.PluginClass(context=mock_context, config={
             "enable_scene_inject": False,
             "enable_segmented_forward": False,
-            "handoff_blacklist_agents": "tech,技术Agent",
+            "handoff_blacklist_agents": "demo,canary",
             "enable_disambiguation": False,
             "enable_subagent_name_prefix": False,
             "subagent_context_enabled": False,
@@ -713,7 +713,7 @@ class TestBaselineIsolation(unittest.TestCase):
     def setUpClass(cls):
         cls.PluginClass = _load_plugin_class()
 
-    def _make_plugin(self, config=None, handoff_names=("amiya", "tech")):
+    def _make_plugin(self, config=None, handoff_names=("amiya", "demo")):
         """构造插件实例；默认含 amiya + tech 两个 handoff（黑名单检查在 handoff 检查之后）"""
         from unittest.mock import AsyncMock
         mock_context = MagicMock()
@@ -740,7 +740,7 @@ class TestBaselineIsolation(unittest.TestCase):
         base_cfg = {
             "enable_scene_inject": True,
             "enable_segmented_forward": False,
-            "handoff_blacklist_agents": "tech,技术Agent",
+            "handoff_blacklist_agents": "demo,canary",
             "enable_disambiguation": False,
             "enable_subagent_name_prefix": False,
             "subagent_context_enabled": False,
@@ -811,12 +811,13 @@ class TestBaselineIsolation(unittest.TestCase):
         """黑名单代理在 _call_one 入口被拦截，碰不到基线注入代码：响应不含基线"""
         plugin, mock_context = self._make_plugin({
             "enable_baseline_inject": True,
-            "shared_scene_baseline": "这里是罗德岛，大家都在为未来努力。",
+
+            "handoff_blacklist_agents": "demo",            "shared_scene_baseline": "这里是罗德岛，大家都在为未来努力。",
         })
         ev = self._make_event()
         raw = asyncio.run(plugin.parallel_handoff(
             ev,
-            calls=[{"agent_name": "tech", "input": "帮我查个问题"}],
+            calls=[{"agent_name": "demo", "input": "帮我查个问题"}],
         ))
         data = json.loads(raw)
         self.assertEqual(data["results"][0]["success"], False)

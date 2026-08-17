@@ -53,9 +53,10 @@ class ConfigMixin:
     # ── 配置持久化 ─────────────────────────────────────────
     def _save_config(self, overrides: dict):
         """将 name_prefix_overrides 写入配置文件并同步内存"""
+        # 绝对路径锚定：插件目录向上两级 = data/，配置统一归 data/config/
         config_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "..", "..", "config", "astrbot_plugin_parallel_handoff_config.json",
+            os.path.dirname(os.path.abspath(__file__)), "..", "..",
+            "config", "astrbot_plugin_parallel_handoff_config.json",
         )
         config_path = os.path.normpath(config_path)
 
