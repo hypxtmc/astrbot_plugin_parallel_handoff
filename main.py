@@ -64,7 +64,6 @@ class ParallelHandoffPlugin(
     AGENT_DISPLAY_NAME = {
         "amiya": "阿米娅",
         "theresia": "特蕾西娅",
-        "tech": "技术Agent",
         "memory": "记忆管家",
         "search": "搜索Agent",
         "closure": "可露希尔",
@@ -73,6 +72,7 @@ class ParallelHandoffPlugin(
         "shu": "黍",
         "nian": "年",
         "ling": "令",
+        "liino": "梨诺",
     }
     # 中文显示名 -> agent_name 反向映射
     AGENT_NAME_REVERSE = {v: k for k, v in AGENT_DISPLAY_NAME.items()}
@@ -169,7 +169,7 @@ class ParallelHandoffPlugin(
         timeout: int = 30,
         message: str = None,
     ) -> str:
-        """并行调用多个子代理（如阿米娅、特蕾西娅、tech、memory、search）,
+        """并行调用多个子代理（如阿米娅、可露希尔、特蕾西娅、夕、令等）,
 同时获取它们的回复并汇总。
 
 使用场景：当需要多个子代理从不同角度回答同一个问题时使用此工具。
@@ -201,7 +201,7 @@ Args:
 - 相比 transfer_to_* 工具，本工具确保回复直接发到用户而不用主代理转述
 
 Args:
-    agent_name (string): 子代理名称。支持英文 id（amiya, closure, theresia, tech, xi 等）和中文名（阿米娅, 可露希尔, 特蕾西娅, 技术Agent, 夕 等），大小写不敏感
+    agent_name (string): 子代理名称。支持英文 id（amiya, closure, theresia, xi 等）和中文名（阿米娅, 可露希尔, 特蕾西娅, 夕 等），大小写不敏感
     input (string): 传给子代理的完整问题或指令
 """
         return await super().call_subagent(event, agent_name, input)

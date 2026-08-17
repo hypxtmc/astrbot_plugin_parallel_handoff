@@ -163,7 +163,7 @@ class TestDisplayName(unittest.TestCase):
         plugin = self._make_plugin({"name_display_map": "{}"})
         self.assertEqual(plugin._display_name("amiya"), "阿米娅")
         self.assertEqual(plugin._display_name("theresia"), "特蕾西娅")
-        self.assertEqual(plugin._display_name("tech"), "技术Agent")
+        self.assertEqual(plugin._display_name("tech"), "tech")  # tech 已移除映射，回退原名
 
     def test_display_name_config(self):
         """name_display_map 配置值生效，覆盖硬编码"""
@@ -361,12 +361,12 @@ class TestRouteDirective(unittest.TestCase):
         plugin = self._make_plugin({
             "route_mode": "direct",
             "call_mode": "parallel",
-            "direct_delivery_agents": "amiya,closure,tech,unmapped_agent",
+            "direct_delivery_agents": "amiya,closure,liino,unmapped_agent",
             "enable_route_directive": True,
         })
         d = plugin._build_route_directive()
         self.assertIn("阿米娅、可露希尔", d)      # 显示名映射生效
-        self.assertIn("技术Agent", d)             # 映射 id 显示为内置中文名
+        self.assertIn("梨诺", d)                  # 映射 id 显示为内置中文名
         self.assertIn("unmapped_agent", d)        # 未映射 id 保留原名
         self.assertIn("direct", d)
         self.assertIn("parallel", d)
@@ -609,11 +609,9 @@ class TestHandoffBlacklist(unittest.TestCase):
         return self.PluginClass(context=mock_context, config=config)
 
     def test_get_blacklist_default(self):
-        """默认黑名单包含 tech 与 技术Agent"""
+        """默认黑名单为空（tech 已下架，黑名单改由配置驱动）"""
         plugin = self._make_plugin({})
-        blacklist = plugin._get_handoff_blacklist()
-        self.assertIn("tech", blacklist)
-        self.assertIn("技术Agent", blacklist)
+        self.assertEqual(plugin._get_handoff_blacklist(), set())
 
     def test_get_blacklist_custom(self):
         """自定义黑名单生效"""
@@ -828,21 +826,22 @@ class TestBaselineIsolation(unittest.TestCase):
         # llm_generate 不应被调用（黑名单直接拦截，不进入生成流程）
         mock_context.llm_generate.assert_not_called()
 
-    def test_blacklist_chinese_name_blocked(self):
-        """中文名「技术Agent」归一为 tech 后同样被黑名单拦截"""
+    def test_blacklist_custom_blocked(self):
+        """自定义黑名单子代理被拦截，提示 transfer_to 直连"""
         plugin, mock_context = self._make_plugin({
             "enable_baseline_inject": True,
             "shared_scene_baseline": "这里是罗德岛，大家都在为未来努力。",
-        })
+            "handoff_blacklist_agents": "bb",
+        }, handoff_names=("amiya", "bb"))
         ev = self._make_event()
         raw = asyncio.run(plugin.parallel_handoff(
             ev,
-            calls=[{"agent_name": "技术Agent", "input": "帮我查个问题"}],
+            calls=[{"agent_name": "bb", "input": "帮我查个问题"}],
         ))
         data = json.loads(raw)
         self.assertEqual(data["results"][0]["success"], False)
         self.assertIn("强制直连黑名单", data["results"][0]["response"])
-        self.assertIn("transfer_to_tech", data["results"][0]["response"])
+        self.assertIn("transfer_to_bb", data["results"][0]["response"])
         mock_context.llm_generate.assert_not_called()
 
 
@@ -889,7 +888,7 @@ class TestBuildScenePrefix(unittest.TestCase):
         self.assertIn("罗德岛", prefix)
 
     def test_baseline_only_no_scene(self):
-        """enable_scene_inject=false 时 _build_scene_prefix 仍组装基线（由 _call_one 决定是否使用）"""
+        """enable_scene_inject=false 时 _build_scene_prefix 仍组装基线（消费点 _apply_scene_prefix 直接使用，不再被场景开关短路）"""
         plugin = self._make_plugin({
             "enable_baseline_inject": True,
             "shared_scene_baseline": "罗德岛",
@@ -908,6 +907,23 @@ class TestBuildScenePrefix(unittest.TestCase):
         prefix = plugin._build_scene_prefix(self._make_event(), True)
         self.assertIn("[场景信息]", prefix)
         self.assertNotIn("【共用剧情场景基线】", prefix)
+
+    def test_apply_scene_prefix_consumes_baseline_when_scene_off(self):
+        """Bug#1 回归：基线消费点不再被 enable_scene_inject 短路（博士 2026-08-17 实锤）"""
+        plugin = self._make_plugin({
+            "enable_baseline_inject": True,
+            "shared_scene_baseline": "罗德岛",
+        })
+        prefix = plugin._build_scene_prefix(self._make_event(), False)
+        self.assertIn("【共用剧情场景基线】", prefix)
+        final = plugin._apply_scene_prefix("早上好", prefix)
+        self.assertIn("罗德岛", final)
+        self.assertIn("早上好", final)
+
+    def test_apply_scene_prefix_empty_noop(self):
+        """scene_prefix 空串：原样返回，不拼接"""
+        plugin = self._make_plugin({})
+        self.assertEqual(plugin._apply_scene_prefix("嗨", ""), "嗨")
 
     def test_all_disabled(self):
         """场景与基线均关闭：返回空串"""

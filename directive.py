@@ -15,7 +15,7 @@ class DirectiveMixin:
     """路由强制指令构建 + 强制直连黑名单映射"""
 
     def _get_handoff_blacklist(self) -> set:
-        """读取强制直连黑名单（handoff_blacklist_agents 配置，默认 tech/技术Agent）。
+        """读取强制直连黑名单（handoff_blacklist_agents 配置，默认空 = 无黑名单）。
 
         黑名单子代理永远不走 parallel_handoff 插件的 relay 中转：
         - parallel_handoff / call_subagent 调用它们会被拦截，提示改用 transfer_to_xxx 直连
@@ -24,7 +24,7 @@ class DirectiveMixin:
         返回值：规范化后的 agent id 集合（英文 id + 中文名均按配置原样收录，
         拦截时由 _resolve_agent_name 归一后比对，兼容两种写法）。
         """
-        raw = str(self._cfg("handoff_blacklist_agents", "tech,技术Agent") or "").strip()
+        raw = str(self._cfg("handoff_blacklist_agents", "") or "").strip()
         return {name.strip() for name in raw.split(",") if name.strip()}
 
     # ── 路由强制指令注入（OnLLMRequestEvent 钩子实现）────────

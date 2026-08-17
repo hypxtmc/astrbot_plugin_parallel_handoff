@@ -3,8 +3,7 @@
 对应原 main.py 的 42-64 行（_strip_chain_injection 模块级函数）+
 843-854 行（livingmemory 插件查找）+ 911-961 行区域（记忆召回/工具过滤）+
 1009-1026 行区域（记忆存储）。
-双层排除逻辑收敛为单一 exclude_agents 集合（P1）：tech/技术Agent 默认
-硬编码在集合里，配置只能追加不能删除。
+排除逻辑收敛为单一 exclude_agents 集合：由配置直接控制（默认空 = 全部子代理可召回）。
 """
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
@@ -67,6 +66,25 @@ class MemoryMixin:
         """
         if livingmemory_plugin:
             try:
+                # livingmemory 未就绪时其 handle_memory_recall 会静默短路，
+                # 这里先快查初始化状态，区分「插件未就绪」与「确实无记忆」，
+                # 且不等其内部最长 30s 的初始化轮询，避免拖慢子代理调用
+                initializer = getattr(livingmemory_plugin, "initializer", None)
+                if initializer is not None:
+                    if getattr(initializer, "is_failed", False):
+                        logger.warning(
+                            f"[parallel_handoff] livingmemory 初始化失败，跳过 "
+                            f"{agent_name} 记忆召回: "
+                            f"{getattr(initializer, 'error_message', 'unknown')}"
+                        )
+                        return []
+                    if not getattr(initializer, "is_initialized", False):
+                        logger.warning(
+                            f"[parallel_handoff] livingmemory 未就绪（初始化中），"
+                            f"跳过 {agent_name} 记忆召回"
+                        )
+                        return []
+
                 event.persona_id = agent_name
                 req = ProviderRequest(
                     prompt=clean_input,
@@ -75,7 +93,13 @@ class MemoryMixin:
                 await livingmemory_plugin.handle_memory_recall(event, req)
 
                 # 保留记忆注入内容，透传给子代理的 provider
-                return list(req.extra_user_content_parts or [])
+                parts = list(req.extra_user_content_parts or [])
+                if not parts:
+                    logger.debug(
+                        f"[parallel_handoff] {agent_name} 记忆召回为空"
+                        f"（插件就绪，无匹配记忆）"
+                    )
+                return parts
             except Exception as e:
                 logger.warning(
                     f"[parallel_handoff] Memory recall failed for "
@@ -88,8 +112,8 @@ class MemoryMixin:
     def _build_memory_tools(self, agent_name: str):
         """为子代理构建记忆工具集（仅含 recall/memorize 两个工具）。
 
-        排除逻辑收敛为单一 exclude_agents 集合：tech/技术Agent 默认硬编码在集合里，
-        配置（subagent_memory.exclude_agents 或扁平 exclude_agents）只能追加不能删除。
+        排除逻辑收敛为单一 exclude_agents 集合：由配置直接控制（默认空 = 全部子代理可召回），
+        配置（subagent_memory.exclude_agents 或扁平 exclude_agents）决定集合内容。
         """
         subagent_tools = None
         try:
@@ -97,13 +121,11 @@ class MemoryMixin:
             memory_cfg = self._cfg("subagent_memory", {})
             if isinstance(memory_cfg, dict) and memory_cfg:
                 memory_enabled = self._cfg("recall_enabled", memory_cfg.get("enabled", True))
-                exclude_raw = self._cfg("exclude_agents", memory_cfg.get("exclude_agents", "tech,技术Agent"))
+                exclude_raw = self._cfg("exclude_agents", memory_cfg.get("exclude_agents", ""))
             else:
                 memory_enabled = self._cfg("recall_enabled", True)
-                exclude_raw = self._cfg("exclude_agents", "tech,技术Agent")
+                exclude_raw = self._cfg("exclude_agents", "")
             exclude_agents = {name.strip() for name in exclude_raw.split(",") if name.strip()}
-            # P1: 收敛为单一 exclude_agents 集合：tech/技术Agent 硬编码不可删，配置只能追加
-            exclude_agents.update({"tech", "技术Agent"})
             if memory_enabled and agent_name not in exclude_agents:
                 global_tools = getattr(
                     self.context.provider_manager, "llm_tools", None
