@@ -11,7 +11,7 @@ import re
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 from astrbot.core.message.components import Plain
-from astrbot.core.message.message_event_result import MessageChain
+from astrbot.core.message.message_event_result import MessageChain, ResultContentType
 
 # 怀孕插件文本自动识别接入（可选依赖：baby 插件未加载时静默跳过）
 # 运行时插件挂载在 data.plugins 前缀下；顶层包名仅作兼容兜底
@@ -105,6 +105,119 @@ class ForwardMixin:
                     full_text += text
         return full_text.strip()
 
+    def _looks_like_markdown(self, text: str) -> bool:
+        """[方案B 2026-08-19] 检测文本是否含 markdown 语法特征。
+
+        含 markdown 特征时返回 True——调用方应走完整发送（不分段），
+        避免拆碎的 markdown 片段无法渲染。
+        """
+        if not text:
+            return False
+        for line in text.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            # 标题：## 标题
+            if re.match(r"^#{1,6}\s+\S", s):
+                return True
+            # 有序/无序列表
+            if re.match(r"^[-*+]\s+\S", s) or re.match(r"^\d+[.、]\s+\S", s):
+                return True
+            # 引用
+            if re.match(r"^>\s?", s):
+                return True
+            # 分割线
+            # [2026-08-20] 分割线不再作为 md 特征：纯文本消息里的 --- 装饰线不再触发整条渲染
+            # 水平线改由 _inject_section_dividers 自动插入，手写 --- 仅作普通文本/分段过滤
+            # 代码块围栏
+            if s.startswith("```"):
+                return True
+        # 行内特征：加粗 / 斜体 / 行内代码 / 链接 / 图片
+        if re.search(r"\*\*[^*]+\*\*", text) or re.search(r"__[^_]+__", text):
+            return True
+        if re.search(r"`[^`\n]+`", text):
+            return True
+        if re.search(r"!?\[[^\]]*\]\([^)\s]+\)", text):
+            return True
+        return False
+
+    def _looks_like_latex(self, text: str) -> bool:
+        """[方案D 2026-08-19] 检测文本是否含 LaTeX 公式特征。"""
+        if not text:
+            return False
+        if re.search(r"\$\$[\s\S]*?\$\$", text):
+            return True
+        if re.search(r"\\\([\s\S]*?\\\)", text):
+            return True
+        if re.search(r"(?<!\$)\$[^$\n]+\$(?!\$)", text):
+            return True
+        if re.search(r"\\begin\{[a-zA-Z]+\}", text):
+            return True
+        if re.search(
+            r"\\(?:frac|sum|int|sqrt|lim|log|ln|sin|cos|tan|sec|csc|cot|"
+            r"alpha|beta|gamma|delta|epsilon|zeta|eta|theta|iota|kappa|lambda|mu|nu|xi|"
+            r"pi|rho|sigma|tau|upsilon|phi|chi|psi|omega|times|cdot|pm|mp|div|"
+            r"le|ge|neq|approx|equiv|sim|propto|infty|partial|nabla|forall|exists|"
+            r"rightarrow|leftarrow|Leftrightarrow|mapsto|subset|supset|cap|cup|"
+            r"text|mathrm|mathbf|mathbb|mathcal|operatorname|left|right)\b",
+            text,
+        ):
+            return True
+        return False
+
+    def _inject_section_dividers(self, result, full_text: str) -> None:
+        """[方案D 2026-08-19] 一条消息内为纯文本/markdown/latex 区域插入分割线。
+
+        按空行拆段后逐段分类，相邻不同类型的段之间插入 --- 分割线，
+        重组后替换 result.chain，交给正常管线整条发送（markdown payload 渲染）。
+        """
+        segments = [s.strip() for s in full_text.split("\n\n") if s.strip() and not re.match(r"^(-{2,}|\*{2,}|_{2,})$", s.strip())]
+        classified = []
+        for seg in segments:
+            if self._looks_like_latex(seg):
+                seg_type = "latex"
+            elif self._looks_like_markdown(seg):
+                seg_type = "md"
+            else:
+                seg_type = "text"
+            classified.append((seg_type, seg))
+        # [简化 2026-08-19] 说明文字（text）后紧邻公式（latex）→ 合并为 formula 块，
+        # 一体展示（无分割线、无标签），公式跟着说明走，减少繁杂
+        merged = []
+        i = 0
+        while i < len(classified):
+            t, seg = classified[i]
+            if (t == "text" and i + 1 < len(classified) and classified[i + 1][0] == "latex"
+                    and seg.rstrip().endswith(("：", ":"))):
+                # 仅以冒号结尾的短说明文字才与公式合并（公式跟着说明走）
+                merged.append(("formula", seg + "\n\n" + classified[i + 1][1]))
+                i += 2
+            else:
+                merged.append((t, seg))
+                i += 1
+        new_parts = []
+        prev_type = None
+        for seg_type, seg in merged:
+            if prev_type is not None:
+                if seg_type != prev_type:
+                    # 块类型转换处：formula/latex 边界用重等号线 ═×21，其余用粗线 ━×21
+                    if seg_type in ("formula", "latex") or prev_type in ("formula", "latex"):
+                        new_parts.append("---")
+                    else:
+                        new_parts.append("---")
+                elif seg_type in ("formula", "latex") and prev_type in ("formula", "latex"):
+                    # [2026-08-19] 连续不同公式之间用普通水平线 --- 分割（说明+公式内部保持一体不分割）
+                    new_parts.append("---")
+            # ◆ 公式 标签：只在独立公式（无说明文字跟随）时加，避免重复繁杂
+            if seg_type == "latex":
+                new_parts.append("◆ 公式")
+            new_parts.append(seg)
+            prev_type = seg_type
+        new_content = "\n\n".join(new_parts)
+        if new_content != full_text:
+            # 注意：result.chain 是组件列表（list），不是 MessageChain 对象
+            result.chain = [Plain(new_content)]
+
     async def _send_mainagent_segmented(self, result, event) -> bool:
         """主代理回复分段发送：按空行拆分，段落数>1时逐条直发。
 
@@ -119,7 +232,77 @@ class ForwardMixin:
             return False
         # [主代理亲修 03:08] 剥离首部【名字】前缀，防止与下方 add_prefix 叠加成双前缀
         full_text = re.sub(r"^\s*【[^】]*】\s*\n?", "", full_text, count=1)
-        segments = [s.strip() for s in full_text.split("\n\n") if s.strip()]
+        # [美化 2026-08-19] 状态符号简约化：emoji → 几何符号，简约风格统一
+        normalized = (full_text
+                      .replace("✅", "✓")
+                      .replace("❌", "✗")
+                      .replace("⚠️", "△")
+                      .replace("🚧", "△")
+                      .replace("⏳", "○"))
+        if normalized != full_text:
+            full_text = normalized
+            result.chain = [Plain(full_text)]  # 同步链，保证 return False 路径也生效
+        # [方案D 2026-08-19] 含 markdown/latex 时：一条消息内插入区域分割线（---），
+        # 区分纯文本/markdown/latex 区域，交给正常管线整条发送渲染
+        if self._looks_like_markdown(full_text) or self._looks_like_latex(full_text):
+            self._inject_section_dividers(result, full_text)
+            return False
+        # [2026-08-20 01:46 重写] 分段规则（顾主定稿）：按行扫描，横线行即分段信号——
+        # 单行横线=软分隔（并入当前段，两句不拆，横线保留为普通文本）；
+        # 连续两行及以上横线=硬分隔（当前段落盘，横线丢弃，前后拆开）。
+        # 无横线行时退回按空行分段（原逻辑）。
+        _hr_line = re.compile(r"^(-{1,}|\*{1,}|_{1,})$")
+        lines = full_text.split("\n")
+        has_hr = any(_hr_line.match(l.strip()) for l in lines if l.strip())
+        if has_hr:
+            segments = []
+            current = []
+            pending_hr = []
+            for line in lines:
+                s = line.strip()
+                if not s:
+                    # [2026-08-20 preL] 空行跳过：不打断横线连续性——
+                    # "---\n\n---"（两个横线隔空行）仍视为连续两行横线，触发硬分隔
+                    continue
+                if _hr_line.match(s):
+                    pending_hr.append(line)
+                    continue
+                if pending_hr:
+                    if len(pending_hr) >= 2:
+                        # 多行横线：硬分隔——落盘当前段
+                        if current:
+                            segments.append("\n".join(current).strip())
+                            current = []
+                    else:
+                        # 单行横线：软分隔——并入当前段（或作前导），前后补空行供 md 渲染
+                        # （避免 "文本\n---" 被 markdown 误判为 setext 二级标题）
+                        if current:
+                            current.append("")
+                            current.append(pending_hr[0])
+                            current.append("")
+                        else:
+                            current.append("")
+                            current.append(pending_hr[0])
+                            current.append("")
+                    pending_hr = []
+                current.append(line)
+            # 尾部横线处理
+            if pending_hr:
+                if len(pending_hr) == 1:
+                    if current:
+                        current.append("")
+                        current.append(pending_hr[0])
+                        current.append("")
+                    else:
+                        segments.append(pending_hr[0])
+                elif current:
+                    segments.append("\n".join(current).strip())
+                    current = []
+            if current:
+                segments.append("\n".join(current).strip())
+            segments = [s for s in segments if s.strip()]
+        else:
+            segments = [s.strip() for s in full_text.split("\n\n") if s.strip()]
         if len(segments) <= 1:
             return False
         try:
@@ -131,10 +314,19 @@ class ForwardMixin:
                 msg = seg_text
                 if idx == 0 and prefix_str and not msg.startswith("【"):
                     msg = f"{prefix_str}{seg_text}"
-                await self.context.send_message(
-                    event.unified_msg_origin,
-                    MessageChain([Plain(msg)]),
-                )
+                has_hr = any(_hr_line.match(l.strip()) for l in msg.split("\n") if l.strip())
+                if has_hr:
+                    # [2026-08-20 preK] 含横线段的段走被动 markdown 路径（event.send）：
+                    # 主动 markdown 通道（send_markdown_content）不渲染 ---，
+                    # 被动回复通道（_send_text_reply use_markdown=True）渲染为真水平线（方案 D 验证过）
+                    chain = MessageChain([Plain(msg)])
+                    chain.use_markdown_ = True
+                    await event.send(chain)
+                else:
+                    await self.context.send_message(
+                        event.unified_msg_origin,
+                        MessageChain([Plain(msg)]),
+                    )
                 await asyncio.sleep(self.config.get("fragment_interval", 0.3))
         except Exception as e:
             logger.error(f"[inject_mainagent_prefix] 分段发送失败: {e}")
@@ -222,7 +414,25 @@ class ForwardMixin:
         当 enable_mainagent_name_prefix=true 且消息不以任何子代理前缀开头时，
         自动在消息正文前加 "【主代理名】\n" 前缀。
         子代理分段转发期间此钩子被抑制，避免误加。
+
+        [流式守卫 2026-08-20] 借鉴 astrbot_plugin_custome_segment_reply 的
+        "回放不抢发" 思想：流式终态（STREAMING_FINISH）时，LLM 文本已由流式
+        通道逐 token 发给用户，此时再进行 event.send 分段重发必造成重复/乱序
+        （根因）。故流式终态一律让位——直接 return，不 event.send 不重发，
+        让流式那句作为唯一最终结果。子代理直发走独立链路（dispatch 直调
+        _forward_segmented），不经本钩子，故不受流式影响仍完美工作。
         """
+        # [流式守卫 2026-08-20] 流式终态必须让位：流式通道已把整段文本吐给用户，
+        # 钩子此刻若再 event.send 分段重发，必然与流式已发内容重复/乱序。
+        # 直接 return（既不 event.send 也不改 chain），把发送权完整交还流式通道。
+        result = event.get_result()
+        if (
+            result is not None
+            and getattr(result, "result_content_type", None) == ResultContentType.STREAMING_FINISH
+        ):
+            self._suppress_mainagent_prefix = False
+            return
+
         if getattr(self, "_suppress_mainagent_prefix", False):
             # 分段转发已直发子代理回复。主代理若有实质台词则加前缀放行，否则静默。
             # allow_mainagent_after_direct=false 时恢复旧行为：无条件清空。
