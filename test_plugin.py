@@ -32,7 +32,7 @@ _fake_event.AstrMessageEvent = MagicMock()
 _fake_event_filter = MagicMock()
 # 关键：所有 filter 装饰器返回 identity，避免 @filter.on_llm_request() 等把
 # 被装饰方法替换成 MagicMock（否则 asyncio.run 拿不到真实 coroutine 函数）
-for _deco_name in ("on_llm_request", "on_decorating_result", "regex", "command", "llm_tool"):
+for _deco_name in ("on_llm_request", "on_waiting_llm_request", "on_decorating_result", "regex", "command", "llm_tool"):
     getattr(_fake_event_filter, _deco_name).side_effect = lambda *a, **k: (lambda f: f)
 # 注意：不要再对 llm_tool 单独赋值 MagicMock——会覆盖上面的 identity side_effect，
 # 使 @llm_tool 装饰的方法（parallel_handoff/call_subagent）在测试环境退化为 MagicMock。
@@ -934,6 +934,57 @@ class TestBuildScenePrefix(unittest.TestCase):
         })
         self.assertEqual(plugin._build_scene_prefix(self._make_event(), False), "")
 
+
+class TestTailSuppressFix(unittest.TestCase):
+    """回归：_suppress_mainagent_prefix 标记无意中吞掉全新用户消息（21:37 卡死根因）"""
+
+    def _fresh_router(self):
+        # 与线上实际配置对齐：allow_mainagent_after_direct=False 才走源头封堵分支
+        p = _load_plugin_class()(
+            context=MagicMock(),
+            config={
+                "allow_mainagent_after_direct": False,
+                "enable_smart_router": True,   # 命中前置，否则提前 return
+            },
+        )
+        return p
+
+    def _plain_event(self, msg):
+        ev = MagicMock()
+        ev.get_message_str.return_value = msg
+        ev.unified_msg_origin = "sess-tailtest"
+        ev.stop_event = MagicMock()
+        return ev
+
+    def test_plain_user_message_not_swallowed_after_direct(self):
+        """修复点1：直发完成后，下一条含实质内容的新用户消息不落吞尾分支，进入完整路由链"""
+        import time as _t
+        p = self._fresh_router()
+        p._suppress_mainagent_prefix = True
+        p._suppress_mainagent_ts = _t.time() - 30   # 超 15s 窗口（37s 场景）
+        p._suppress_mainagent_msg = "特蕾西娅，你的脚好舒服"
+        ev = self._plain_event("我们继续足交吧")
+        # 吞尾分支判据：same_msg=False → 绝不提前 return，必须进入路由链（_record_user_msg 被调用）
+        p._record_user_msg = MagicMock()
+        with unittest.mock.patch.object(p, "_record_user_msg", wraps=p._record_user_msg):
+            asyncio.run(p._smart_router_check(ev))
+        self.assertTrue(p._record_user_msg.called, "新用户消息被误吞，未进入路由链")
+
+    def test_same_message_within_window_still_swallowed(self):
+        """修复点2：同一条消息短时间内再次触发（工具续写尾巴）仍吞，防主代理尾巴"""
+        import time as _t
+        p = self._fresh_router()
+        p._suppress_mainagent_prefix = True
+        p._suppress_mainagent_ts = _t.time() - 2    # 窗口内
+        p._suppress_mainagent_msg = "特蕾西娅，你的脚好舒服"
+        ev = self._plain_event("特蕾西娅，你的脚好舒服")
+        ev.stop_event = MagicMock()
+        # 吞尾分支判据：同消息+窗口内 → 直接 stop_event 返回，不进入路由链
+        p._record_user_msg = MagicMock()
+        res = asyncio.run(p._smart_router_check(ev))
+        self.assertTrue(ev.stop_event.called, "同消息续写尾巴未被吞")
+        self.assertFalse(p._record_user_msg.called, "吞尾分支应提前 return，不应进入路由链")
+        self.assertTrue(res, "吞尾分支应返回 True（已 stop）")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

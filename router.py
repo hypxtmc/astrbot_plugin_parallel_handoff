@@ -50,6 +50,27 @@ class RouterMixin:
         "对(?:啊|的)?",
         "来了",
         "哈(?:哈)?",
+        # ── 响应式情话承接（2026-08-22 新增，剥离后无残留即视为承接） ──
+        "让我(?:好|也)?舒服(?:起来|点|吧|好不好|一下)?",
+        "想要(?:你|了|吗|嘛|啊)?",
+        "爱(?:死)?你?(?:啊|哟|哦|啦|呀|呢|哇|嘛)?",
+        "用力(?:点|啊|吧|嘛)?",
+        "继续(?:动|做|来|亲)?(?:吧|啊|嗯)?",
+        "接着继续?(?:吧|啊)?",
+        "再来(?:一点|一遍|一轮)?(?:吧|啊)?",
+        "还?想要?(?:你)?(?:嘛|啊|呀)?",
+        "顶(?:进去|到了|到底)?(?:吧|啊)?",
+        "操?(?:我|你)?(?:吧|啊|嘛)?",
+        "干了?(?:我|你)?(?:吧|啊|嘛)?",
+        "快点?(?:动|来|呀|啊)?",
+        "深点?(?:啊|吧|呀)?",
+        "爽(?:死|炸|翻)?了?(?:吧|啊|嘛)?",
+        "还要?(?:你|更多)?(?:吗|嘛|啊)?",
+        "别停(?:啊|嘛|吧)?",
+        "再来?(?:呀|吧|啊)?",
+        "想(?:死|要|坏)(?:你|了|我)?(?:啦|啊|嘛|呀)?",
+        "舒服?(?:嘛|吧|啊|呀)?",
+        "强?(?:奸|上|搞|肏)(?:我|你)?(?:吧|啊|嘛)?",
     )
     _T1_CONTINUE_WORD_RE = re.compile("|".join(T1_CONTINUE_WORDS))
 
@@ -237,7 +258,30 @@ class RouterMixin:
         if not hasattr(self, "_route_last"):
             self._route_last = {}      # session -> (agent_id, ts)
             self._route_msgs = {}      # session -> deque(最近用户消息)
+            self._route_reply = {}     # session -> (agent_id, ts, reply_tail)
         return self._route_last, self._route_msgs
+
+    def _record_direct_reply(self, session_id: str, agent_name: str, reply_text: str):
+        """记录该 session 最近一次子代理直发回复尾部（供 T2 剧情参照，避免承接句判失）。"""
+        if not session_id or not agent_name or not reply_text:
+            return
+        self._route_mem()  # 兜底初始化惰性记忆
+        tail = reply_text.strip()[-300:]
+        self._route_reply[session_id] = (agent_name, time.time(), tail)
+
+    def _last_direct_reply(self, session_id: str, max_age: float = 600.0):
+        """返回 (agent_name, reply_tail|None)；无记录或超时返回 (None, None)。
+
+        max_age：参照有效期（秒），默认 600s。超时后不注入 prompt，
+        避免数小时前的旧剧情误导 T2 判定（宽松于 T1.5 的 300s 续接窗）。
+        """
+        hit = self._route_reply.get(session_id)
+        if not hit:
+            return None, None
+        agent, ts, tail = hit
+        if time.time() - ts > max_age:
+            return None, None
+        return agent, tail
 
     def _record_user_msg(self, event: AstrMessageEvent, message: str):
         """把用户消息追加进会话最近消息环形缓冲（供 T2 上下文注入）。"""
@@ -342,6 +386,7 @@ class RouterMixin:
         _, msgs = self._route_mem()
         buf = msgs.get(event.unified_msg_origin)
         recent_lines = "\n".join(f"- {m[:120]}" for m in (list(buf)[-4:] if buf else []))
+        reply_agent, reply_tail = self._last_direct_reply(event.unified_msg_origin)
         sys_prompt = (
             "你是消息路由判定器。根据用户最新一条消息判断该交给哪位角色回复。\n"
             "可选角色：\n"
@@ -349,9 +394,12 @@ class RouterMixin:
             "- main：普通日常对话、跨角色问询、无法确定对象、技术任务（默认）\n"
             "最近对话（时间正序，仅用户消息）：\n"
             f"{recent_lines or '（无）'}\n"
+            f"最近一次子代理直发回复尾部（剧情参照，可能正是用户承接的对象）：\n"
+            f"{('（'+reply_agent+'）'+reply_tail) if reply_agent else '（无）'}\n"
             "只输出一行 JSON（禁止多余文字）：{\"route\": \"角色id或main\", \"confidence\": 0到1的小数}\n"
             "判定准则：用户明确点名或消息内容强相关才给高分；日常随意闲聊一律 main，confidence 给 0.1-0.3。\n"
-            "若当前消息明显是对上文某位角色的承接（如继续/再来/嗯/然后呢），route 应延续上文最后提到的角色。"
+            "若当前消息明显是对上文某位角色的承接（如继续/再来/嗯/然后呢/让我舒服/用力/爱你），"
+            "route 应延续上文最后提到的角色；若最近一次子代理直发回复尾部语境强相关，也优先延续其子代理。"
         )
         provider = self._router_provider()
         try:
@@ -401,9 +449,19 @@ class RouterMixin:
             getattr(self, "_suppress_mainagent_prefix", False)
             and not self._cfg("allow_mainagent_after_direct", True)
         ):
+            # [修复 2026-08-21] 只有"同一条用户消息在短时间内再次触发 waiting"
+            # （主代理工具续写尾巴）才吞；全新用户消息或超时间窗一律消费标记后放行，
+            # 继续走完整路由链。避免下一条用户消息被误当尾巴吞掉（根因：21:37 卡死）。
+            same_msg = (event.get_message_str() or "").strip() == getattr(
+                self, "_suppress_mainagent_msg", None
+            )
+            fresh = time.time() - getattr(self, "_suppress_mainagent_ts", 0) <= 15
+            if same_msg and fresh:
+                self._suppress_mainagent_prefix = False
+                event.stop_event()
+                return True
+            # 非续写触发（新用户消息/过期）：消费标记后走完整路由链 T1→T1.5→T2→主代理
             self._suppress_mainagent_prefix = False
-            event.stop_event()
-            return True
         if not self._router_enabled():
             return False
         message = (event.get_message_str() or "").strip()
