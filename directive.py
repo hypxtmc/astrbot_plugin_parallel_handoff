@@ -111,5 +111,20 @@ class DirectiveMixin:
             lines.append("- 调用模式 chained：多子代理按接龙顺序串行调用，前一个的回复作为后一个的上下文，禁止并行双发")
         else:
             lines.append("- 调用模式 parallel：多子代理并行调用，各说各话，回复统一汇总返回")
+        # ── 直发前禁止主代理抢先发言（博士设定 2026-08-20） ──
+        # 调子代理路由前，主代理不得先生成引导/转述/解释文本（如“我这就叫她”“她应你了”），
+        # 应直接发起 parallel_handoff 工具调用，让子代理亲口说话。
+        # 与 forward.py 的 allow_mainagent_after_direct（管直发后）互补，管住直发前。
+        if self._cfg("forbid_pre_tool_mainagent_talk", True):
+            lines.append(
+                "- 子代理直发纪律：调用 parallel_handoff 路由子代理时，"
+                "必须在工具调用前留空、不输出任何主代理导语/转述/解释（如“我这就叫她”“她应你了”）"
+                "，直接发起工具调用，由子代理亲口对用户说话；切忌在子代理发言前让主代理插话。"
+            )
+            lines.append(
+                "- 直发后禁言：parallel_handoff 完成子代理直发后，本轮主代理不得再输出任何"
+                "总结/转述/收尾文字（如“已传给她”“她在回你了”）——工具调用即本轮回复结束，"
+                "无需画蛇添足；等你（博士）需要时再开口。"
+            )
         lines.append("- 工具列表保持完整，禁止摘除或绕过任何工具")
         return "\n".join(lines)
