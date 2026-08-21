@@ -35,6 +35,7 @@ try:
     from . import dispatch as _dispatch_mod
     from . import forward as _forward_mod
     from . import ctx_engine as _ctx_engine_mod
+    from . import router as _router_mod
 except ImportError:
     import config as _config_mod
     import directive as _directive_mod
@@ -43,6 +44,7 @@ except ImportError:
     import dispatch as _dispatch_mod
     import forward as _forward_mod
     import ctx_engine as _ctx_engine_mod
+    import router as _router_mod
 
 
 @register(
@@ -58,6 +60,7 @@ class ParallelHandoffPlugin(
     _scene_mod.SceneMixin,
     _directive_mod.DirectiveMixin,
     _config_mod.ConfigMixin,
+    _router_mod.RouterMixin,
     Star,
 ):
     """并行子代理调用插件"""
@@ -125,6 +128,18 @@ class ParallelHandoffPlugin(
         """
         return await super()._route_directive_inject(event, req)
 
+    # ── 事件注册：小模型路由层（T1规则/T2小模型/T3兜底，实现见 router.py RouterMixin） ──
+    @filter.on_waiting_llm_request()
+    async def _smart_router_check(self, event: AstrMessageEvent):
+        """小模型路由层：主代理 LLM 调用前最早停点判向。
+
+        命中（点名/领域词或小模型高置信）→ 子代理直发 + event.stop_event()，
+        主代理流程整体短路，省掉主模型推理与记忆召回；未命中原样放行主代理。
+        总开关 enable_smart_router 默认关，显式开启才生效。
+        """
+        return await super()._smart_router_check(event)
+
+
     # ── 热重载（插件入口命令，完整实现保留本模块） ────────────
     @filter.regex(r"^(热重载一下并行子代理调用插件|热重载并行插件|重载插件|reload_parallel)$")
     async def reload_plugin(self, event: AstrMessageEvent):
@@ -174,7 +189,7 @@ class ParallelHandoffPlugin(
         self,
         event: AstrMessageEvent,
         calls: list[dict] = None,
-        timeout: int = 30,
+        timeout: int = 120,
         message: str = None,
     ) -> str:
         """并行调用多个子代理（如助手A、助手B、助手C、夕、令等）,
@@ -188,7 +203,7 @@ Args:
         - agent_name(string): 子代理名称,可选值: 助手A, 助手B 等（需在 name_display_map 中配置）
         - input(string): 传给该子代理的问题/指令
         - order(integer, 可选): 输出时的排序序号,越小越靠前
-    timeout(number): 单个子代理的超时秒数,默认15秒。超过此时间未返回则跳过该子代理。
+    timeout(number): 单个子代理的超时秒数,默认120秒（顾主设定，永久生效）。超过此时间未返回则跳过该子代理。
     message(string): 当开启消息消歧且不传calls时,传入原始消息文本,工具会自动路由到最近对话的子代理。
 """
         return await super().parallel_handoff(event, calls, timeout, message)

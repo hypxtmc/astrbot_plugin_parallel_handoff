@@ -199,6 +199,9 @@ class DispatchMixin:
                 prov_id, handoff, timeout,
             )
 
+            # 超时上限：顾主硬性设定永久 120 秒（2026-08-20）
+            # 子代理生成长文经常超 30s 被跳，现恒定置 120，彻底解决“次次超时”
+            llm_timeout = 120
             llm_resp = await asyncio.wait_for(
                 self.context.llm_generate(
                     chat_provider_id=prov_id,
@@ -207,7 +210,7 @@ class DispatchMixin:
                     tools=subagent_tools,
                     extra_user_content_parts=memory_extra_parts,
                 ),
-                timeout=timeout,
+                timeout=llm_timeout,
             )
             latency_ms = int((time.perf_counter() - t0) * 1000)
             raw_response = llm_resp.completion_text
@@ -272,7 +275,7 @@ class DispatchMixin:
         self,
         event: AstrMessageEvent,
         calls: list[dict] = None,
-        timeout: int = 30,
+        timeout: int = 120,
         message: str = None,
     ) -> str:
         """并行调用多个子代理（如助手A、助手B、助手C、夕、令等）,
@@ -286,7 +289,7 @@ Args:
         - agent_name(string): 子代理名称,可选值: 助手A, 助手B 等（需在 name_display_map 中配置）
         - input(string): 传给该子代理的问题/指令
         - order(integer, 可选): 输出时的排序序号,越小越靠前
-    timeout(number): 单个子代理的超时秒数,默认15秒。超过此时间未返回则跳过该子代理。
+    timeout(number): 单个子代理的超时秒数,默认120秒（顾主设定，永久生效）。超过此时间未返回则跳过该子代理。
     message(string): 当开启消息消歧且不传calls时,传入原始消息文本,工具会自动路由到最近对话的子代理。
 """
         # ── LLM 同回合重复调用防重：同一消息对同一批子代理的重复路由短路 ──
@@ -472,6 +475,9 @@ Args:
             for r in results:
                 if r.get("success") and r.get("agent_name"):
                     self._last_agent[session_id] = r["agent_name"]
+                    if r.get("agent_name", "").lower() in direct_agents:
+                        # 直发成功的回复尾部记入路由记忆（T2 剧情参照用）
+                        self._record_direct_reply(session_id, r["agent_name"], r.get("response", "") or "")
 
         success_count = sum(1 for r in results if r.get("success"))
         fail_count = len(results) - success_count
@@ -485,6 +491,8 @@ Args:
         # ── 分段转发：按中文括号拆分逐条发送 ─────────────────
         if enable_segmented_forward:
             self._suppress_mainagent_prefix = True
+            self._suppress_mainagent_ts = time.time()
+            self._suppress_mainagent_msg = (event.get_message_str() or "").strip()
             pending_text = ""
             for r in results:
                 agent_name = r.get("agent_name", "")

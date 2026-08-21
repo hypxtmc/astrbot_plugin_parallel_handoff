@@ -59,6 +59,12 @@
     "default": true,
     "hint": "direct 分段转发子代理回复后，若主代理生成了实质台词则加【名字】前缀放行；false 时恢复旧行为（无条件清空主代理输出）。关闭可防重复，开启可让主代理下场说话。"
   },
+  "forbid_pre_tool_mainagent_talk": {
+    "description": "子代理直发前禁止主代理抢先发言",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，路由子代理时主代理必须在调用 parallel_handoff 工具前留空、不输出任何导语/转述/解释（如“我这就叫她”“她应你了”），直接发起工具调用让子代理亲口说话。与 allow_mainagent_after_direct（管直发后）互补，管住直发前。"
+  },
   "main_agent_name": {
     "description": "主代理显示名",
     "type": "string",
@@ -178,5 +184,29 @@
     "type": "bool",
     "default": true,
     "hint": "开启后插件在每次主代理 LLM 请求时，按 route_mode/call_mode/direct_delivery_agents 自动生成路由路径规范注入 extra_user_content_parts，主代理必须照走；工具全保留不摘除。关闭则纯靠主代理自觉。"
+  },
+  "enable_smart_router": {
+    "description": "小模型路由层总开关",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后消息进入主代理 LLM 前先用 T1规则/T2小模型判向，命中子代理直发并短路主代理。默认关，开启后观察路由命中与误伤。"
+  },
+  "router_confidence_threshold": {
+    "description": "T2小模型路由置信度阈值",
+    "type": "float",
+    "default": 0.8,
+    "hint": ">= 该值才直连子代理，低于则落回主代理。阈值越高越保守（宁可多过主代理），顾主设定 0.8。"
+  },
+  "router_provider_id": {
+    "description": "T2路由小模型 Provider ID",
+    "type": "string",
+    "default": "dmxapi/glm-4-flash",
+    "hint": "用于判向的小模型，必须是 AstrBot 中已配置的 provider id。免费 glm-4-flash 即可，勿用主模型。"
+  },
+  "router_timeout": {
+    "description": "T2路由判向超时（秒）",
+    "type": "float",
+    "default": 5,
+    "hint": "小模型判向超时直接放行主代理，不影响体验。"
   }
 }
