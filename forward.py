@@ -430,6 +430,16 @@ class ForwardMixin:
             result is not None
             and getattr(result, "result_content_type", None) == ResultContentType.STREAMING_FINISH
         ):
+            # [流式尾巴兜底 2026-08-21] 流式终态时即使文本已逐 token 吐给用户，
+            # 只要处于"直发后 + 禁主代理补话"状态，仍清掉链上残留内容，防止调度余料被重复发送。
+            if (
+                getattr(self, "_suppress_mainagent_prefix", False)
+                and not self._cfg("allow_mainagent_after_direct", True)
+            ):
+                try:
+                    result.chain.clear()
+                except Exception:
+                    pass
             self._suppress_mainagent_prefix = False
             return
 
