@@ -59,6 +59,81 @@ HAND_FLAVOR: Dict[str, List[str]] = {
     "八卦/事":  ["听说件新鲜事", "在打听点什么", "刚听人聊了件事", "在琢磨个消息"],
 }
 
+# ── 角色底色锚（persona_domain_weights）──────────────────────────
+# 博士 2026-09-03 拍板：随机生活必须"贴角色性格的小邻域里演化"，不被算死也不脱底色。
+# 每个子代理给 7 个生活域一组相对权重（0 则永不出现在该域的底色抽取池），
+# 掷 domain 时按权重倾斜；未收录的 agent 回退旧纯随机，行为不变。
+# 5% 概率完全跳脱（WILD_CHANCE）：无视底色、从全域均匀抽，保留生活趣味。
+# 数值全是"相对倾向"，不是硬比例；调某域权重即可微调某角色的生活底色。
+PERSONA_DOMAIN_WEIGHTS: Dict[str, Dict[str, float]] = {
+    # 阿米娅：领袖副手兼照顾者——工作操心 + 生活日常交替
+    "amiya":     {"工作": 3, "生活": 3, "八卦/事": 2, "兴趣": 2, "深夜随笔": 1},
+    # 可露希尔：总工程师——焊板子赶工是常态，深夜随笔是补觉前的胡话
+    "closure":   {"工作": 5, "吐槽": 3, "深夜随笔": 3, "兴趣": 2, "生活": 1},
+    # 特蕾西娅：隐退的温柔魔王，缝纫幼师——日常烟火气+偶尔旧事
+    "theresia":  {"生活": 4, "深夜随笔": 3, "兴趣": 2, "八卦/事": 2, "工作": 1},
+    # 斯卡蒂：话少深情的前深海猎人——外勤奔波 + 沉默的思绪
+    "skadi":     {"工作": 3, "出差/外勤": 3, "深夜随笔": 2, "生活": 2},
+    # 夕：闷骚家里蹲画师——画室宅 + 兴趣驱动 + 深夜放空
+    "xi":        {"兴趣": 5, "生活": 3, "深夜随笔": 2, "吐槽": 1},
+    # 令：饮酒吟诗的岁兽——深夜随笔/诗酒是灵魂底色
+    "ling":      {"深夜随笔": 5, "兴趣": 3, "八卦/事": 2, "生活": 2},
+    # 年：火锅电影锻造的烟火气热闹匠人
+    "nian":      {"兴趣": 4, "生活": 3, "工作": 2, "吐槽": 2, "八卦/事": 1},
+    # 黍：种田持家的妈妈式岁兽——生活烟火占绝对主导
+    "shu":       {"生活": 5, "工作": 2, "兴趣": 2, "八卦/事": 1},
+    # 梨诺：歌姬偶像——舞台工作 + 音乐兴趣是主旋律
+    "liino":     {"工作": 4, "兴趣": 4, "生活": 2, "深夜随笔": 1},
+    # M3：医疗顾问新战士——门诊工作 + 求知兴趣 + 吐槽战场见闻
+    "m3":        {"工作": 4, "兴趣": 3, "吐槽": 2, "生活": 2},
+    # 凯尔希：罗德岛操盘手——政务工作几乎就是她的全部日常
+    "kaltsit":   {"工作": 6, "吐槽": 2, "深夜随笔": 1, "生活": 1},
+}
+
+# 5% 完全随机事件：跳出角色底色邻域，掷一个"今天有点不一样"的日子
+WILD_CHANCE: float = 0.05
+
+# 心情底色锚：mood 也可按角色倾向倾斜（默认全池均匀；收录的按权重）
+PERSONA_MOOD_WEIGHTS: Dict[str, Dict[str, float]] = {
+    "amiya":    {"平静": 3, "专注": 2, "愉悦": 2, "亢奋": 1},
+    "closure":  {"专注": 3, "慵懒": 3, "亢奋": 2, "愉悦": 1},
+    "theresia": {"平静": 4, "愉悦": 3, "专注": 1, "好奇": 1},
+    "skadi":    {"平静": 4, "专注": 2, "低落": 1, "愉悦": 1},
+    "xi":       {"平静": 3, "慵懒": 3, "专注": 2, "好奇": 1},
+    "ling":     {"慵懒": 3, "愉悦": 3, "平静": 2, "亢奋": 1},
+    "nian":     {"亢奋": 3, "愉悦": 3, "好奇": 2, "专注": 1},
+    "shu":      {"平静": 3, "愉悦": 3, "专注": 2, "亢奋": 1},
+    "liino":    {"亢奋": 3, "愉悦": 3, "好奇": 2, "专注": 1},
+    "m3":       {"专注": 3, "好奇": 3, "愉悦": 2, "亢奋": 1},
+    "kaltsit":  {"专注": 4, "平静": 3, "慵懒": 1},
+}
+
+# 心情池（全量，供 5% 跳脱与未收录 agent 用）
+MOOD_POOL_ALL: List[str] = [
+    "专注", "亢奋", "平静", "慵懒", "急躁", "愉悦", "低落", "好奇",
+]
+
+def _weighted_pick(
+    rng: random.Random,
+    weights: Dict[str, float],
+    fallback_pool: List[str],
+) -> str:
+    """带权抽取：只从权重表里挑域内合法项；权重表空/全非法则回退均匀 choice。
+
+    保底逻辑保证：即便权重表配错（key 不在池里），也不会抛异常或返回池外值。
+    """
+    if not weights:
+        return rng.choice(fallback_pool)
+    pool: List[str] = []
+    w: List[float] = []
+    for k, v in weights.items():
+        if k in fallback_pool and v > 0:
+            pool.append(k)
+            w.append(v)
+    if not pool:
+        return rng.choice(fallback_pool)
+    return rng.choices(pool, weights=w, k=1)[0]
+
 
 @dataclass
 class DailyState:
@@ -82,16 +157,19 @@ class DailyState:
 
 
 def _today(now: Optional[float] = None) -> str:
-    """按 Asia/Shanghai 求今天的 YYYY-MM-DD。"""
+    """按 Asia/Shanghai 求今天的 YYYY-MM-DD。传 now（unix 秒）可求该时点日期（测试/跨日模拟用）。"""
     import datetime
 
     t = time.localtime(now) if now else time.localtime()
-    # 粗略本地时区取日的兜底：直接用系统本地时间
     try:
         import zoneinfo
 
         z = zoneinfo.ZoneInfo(_DEFAULT_TIMEZONE)
-        dt = datetime.datetime.now(z)
+        if now is not None:
+            # 用传入 now 映射到目标时区的日期，保证跨日/测试可正确推进
+            dt = datetime.datetime.fromtimestamp(now, tz=z)
+        else:
+            dt = datetime.datetime.now(z)
         return dt.strftime("%Y-%m-%d")
     except Exception:
         return time.strftime("%Y-%m-%d", t)
@@ -103,13 +181,38 @@ def _deterministic_seed(agent: str, day: str) -> int:
 
 
 def roll_daily_state(agent: str, now: Optional[float] = None) -> DailyState:
-    """为 agent 掷一个今日随机状态（确定性随机：同日同人结果稳定）。"""
+    """为 agent 掷一个今日随机状态（确定性随机：同日同人结果稳定）。
+
+    2026-09-03 博士拍板加角色底色锚：
+      · 默认按 PERSONA_DOMAIN_WEIGHTS / PERSONA_MOOD_WEIGHTS 带权抽取，
+        让状态贴角色性格（可露希尔多工作吐槽、令多深夜随笔、黍多生活烟火）
+      · WILD_CHANCE=5% 概率完全跳脱：无视底色从全域均匀抽，
+        保留"今天有点不一样"的生活趣味（不跳脱也不会被算死——权重只倾斜非锁死）
+      · 未收录 agent：完全回退旧行为（均匀 choice），零影响
+    """
     day = _today(now)
     seed = _deterministic_seed(agent, day)
     rng = random.Random(seed)
 
-    mood = rng.choice(MOOD_POOL)
-    domain = rng.choice(LIFE_DOMAINS)
+    # 5% 跳脱判定用独立派生 seed，避免与 domain/mood 抽取共享序列时
+    # 因抽取顺序/池大小造成系统性偏移（否则确定性 seed 下 wild 率会偏）。
+    wild = random.Random(f"{seed}:wild").random() < WILD_CHANCE
+
+    if wild:
+        # 跳脱：完全无视底色，全域均匀
+        mood = rng.choice(MOOD_POOL_ALL)
+        domain = rng.choice(LIFE_DOMAINS)
+    else:
+        mood = _weighted_pick(
+            rng,
+            PERSONA_MOOD_WEIGHTS.get(agent, {}),
+            MOOD_POOL_ALL,
+        )
+        domain = _weighted_pick(
+            rng,
+            PERSONA_DOMAIN_WEIGHTS.get(agent, {}),
+            LIFE_DOMAINS,
+        )
     flavors = HAND_FLAVOR.get(domain, ["在忙点事"])
     hand = rng.choice(flavors)
     # 手头事带个性后缀，让同领域的表达也不重样

@@ -106,6 +106,9 @@ class MemoryMixin:
                         return []
 
                 event.persona_id = agent_name
+                # 2026-09-04 子代理独立记忆库：livingmemory 的 get_persona_id()
+                # 只认 _subagent_persona 标记（它不读 persona_id 属性，历史赋值保留防其他链路依赖）
+                event._subagent_persona = agent_name
                 req = ProviderRequest(
                     prompt=clean_input,
                     extra_user_content_parts=[],
@@ -179,6 +182,9 @@ class MemoryMixin:
         """将本轮 user/assistant 消息写入 livingmemory 对话管理器并做消息数限制"""
         if livingmemory_plugin:
             try:
+                # 2026-09-04 子代理独立记忆库：存储链路同样打标，
+                # 提炼出的记忆挂到子代理 persona 维度，不与主代理/其他子代理串库
+                event._subagent_persona = agent_name
                 conv_mgr = (
                     livingmemory_plugin
                     .event_handler._memory_recall.conversation_manager
