@@ -4,7 +4,7 @@ import json
 import os
 import sys
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 # 确保插件目录在 sys.path 中
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -32,7 +32,7 @@ _fake_event.AstrMessageEvent = MagicMock()
 _fake_event_filter = MagicMock()
 # 关键：所有 filter 装饰器返回 identity，避免 @filter.on_llm_request() 等把
 # 被装饰方法替换成 MagicMock（否则 asyncio.run 拿不到真实 coroutine 函数）
-for _deco_name in ("on_llm_request", "on_waiting_llm_request", "on_decorating_result", "regex", "command", "llm_tool"):
+for _deco_name in ("on_llm_request", "on_waiting_llm_request", "on_decorating_result", "regex", "command", "llm_tool", "custom_filter"):
     getattr(_fake_event_filter, _deco_name).side_effect = lambda *a, **k: (lambda f: f)
 # 注意：不要再对 llm_tool 单独赋值 MagicMock——会覆盖上面的 identity side_effect，
 # 使 @llm_tool 装饰的方法（parallel_handoff/call_subagent）在测试环境退化为 MagicMock。
@@ -370,7 +370,8 @@ class TestRouteDirective(unittest.TestCase):
         self.assertIn("unmapped_agent", d)        # 未映射 id 保留原名
         self.assertIn("direct", d)
         self.assertIn("parallel", d)
-        self.assertNotIn("chained", d)
+        # 动态覆盖说明存在（提及 chained 作为流水线选项，故原 assertNotIn 不再适用）
+        self.assertIn("动态模式覆盖", d)
 
     def test_relay_chained_directive(self):
         """relay + chained：指令含 relay 与接龙规范"""
@@ -489,6 +490,64 @@ class TestRouteDirectiveInject(unittest.TestCase):
         asyncio.run(plugin._route_directive_inject(MagicMock(), req))
         self.assertEqual(req.system_prompt, "原 prompt")
         self.assertEqual(len(req.extra_user_content_parts), 0)
+
+    def test_smart_mode_route_intent_injects(self):
+        """smart 模式：点名子代理（路由意图）→ 注入完整指令"""
+        import asyncio
+        plugin = self._make_plugin({
+            "route_mode": "direct",
+            "call_mode": "parallel",
+            "direct_delivery_agents": "amiya,closure",
+            "name_display_map": '{"amiya": "阿米娅", "closure": "可露希尔"}',
+            "enable_route_directive": True,
+            "directive_inject_mode": "smart",
+        })
+        event = MagicMock()
+        event.get_message_str.return_value = "我想找阿米娅聊聊天"
+        req = MagicMock()
+        req.system_prompt = "原 prompt"
+        req.extra_user_content_parts = []
+        req.func_tool = {"tools": []}
+        asyncio.run(plugin._route_directive_inject(event, req))
+        self.assertEqual(len(req.extra_user_content_parts), 1)
+        self.assertIn("【路由强制指令·parallel_handoff】", req.extra_user_content_parts[0].text)
+
+    def test_smart_mode_daily_chat_no_inject(self):
+        """smart 模式：日常闲聊（无路由意图）→ 不注入，省 token"""
+        import asyncio
+        plugin = self._make_plugin({
+            "route_mode": "direct",
+            "call_mode": "parallel",
+            "direct_delivery_agents": "amiya,closure",
+            "name_display_map": '{"amiya": "阿米娅", "closure": "可露希尔"}',
+            "enable_route_directive": True,
+            "directive_inject_mode": "smart",
+        })
+        event = MagicMock()
+        event.get_message_str.return_value = "今天天气不错，中午吃了碗面"
+        req = MagicMock()
+        req.system_prompt = "原 prompt"
+        req.extra_user_content_parts = []
+        req.func_tool = {"tools": []}
+        asyncio.run(plugin._route_directive_inject(event, req))
+        self.assertEqual(len(req.extra_user_content_parts), 0)
+
+    def test_smart_mode_default_injects_when_no_text(self):
+        """smart 模式防御：取不到消息文本 → 保守注入（与 always 行为一致）"""
+        import asyncio
+        plugin = self._make_plugin({
+            "route_mode": "direct",
+            "call_mode": "parallel",
+            "direct_delivery_agents": "amiya",
+            "enable_route_directive": True,
+            "directive_inject_mode": "smart",
+        })
+        req = MagicMock()
+        req.system_prompt = "原 prompt"
+        req.extra_user_content_parts = []
+        req.func_tool = {"tools": []}
+        asyncio.run(plugin._route_directive_inject(MagicMock(), req))  # 无 get_message_str
+        self.assertEqual(len(req.extra_user_content_parts), 1)
 
     def test_no_agents_no_inject(self):
         """direct_delivery_agents 为空时不注入"""
@@ -986,6 +1045,586 @@ class TestTailSuppressFix(unittest.TestCase):
         self.assertFalse(p._record_user_msg.called, "吞尾分支应提前 return，不应进入路由链")
         self.assertTrue(res, "吞尾分支应返回 True（已 stop）")
 
+class TestBusyBypass(unittest.TestCase):
+    """[Busy Bypass 2026-08-31] 主代理干活时 T1 点名直达：绕过 follow-up 捕获"""
+
+    def _fresh_router(self):
+        p = _load_plugin_class()(
+            context=MagicMock(),
+            config={
+                "enable_smart_router": True,
+                "name_display_map": json.dumps({
+                    "amiya": "阿米娅",
+                    "theresia": "特蕾西娅",
+                    "closure": "可露希尔",
+                    "skadi": "斯卡蒂",
+                    "xi": "夕",
+                    "shu": "黍",
+                    "nian": "年",
+                    "ling": "令",
+                    "liino": "梨诺",
+                }),
+            },
+        )
+        return p
+
+    def _plain_event(self, msg, umo="sess-busy"):
+        ev = MagicMock()
+        ev.get_message_str.return_value = msg
+        ev.unified_msg_origin = umo
+        ev.stop_event = MagicMock()
+        ev.get_sender_id.return_value = "u1"
+        return ev
+
+    def test_router_disabled_noop(self):
+        """总开关关：不直发、不 stop、返回 False"""
+        import router as router_mod
+        p = _load_plugin_class()(
+            context=MagicMock(),
+            config={
+                "enable_smart_router": False,
+                "name_display_map": "{}",
+            },
+        )
+        router_mod._ACTIVE_AGENT_RUNNERS = {"sess-busy": object()}
+        ev = self._plain_event("特蕾西娅，在吗")
+        p.call_subagent = MagicMock()
+        res = asyncio.run(p._busy_bypass_check(ev))
+        self.assertFalse(res)
+        p.call_subagent.assert_not_called()
+        ev.stop_event.assert_not_called()
+
+    def test_no_active_runner_noop(self):
+        """无活跃 runner（主代理不忙）：不直发、不 stop"""
+        import router as router_mod
+        p = self._fresh_router()
+        router_mod._ACTIVE_AGENT_RUNNERS = {}
+        ev = self._plain_event("特蕾西娅，在吗")
+        p.call_subagent = MagicMock()
+        res = asyncio.run(p._busy_bypass_check(ev))
+        self.assertFalse(res)
+        p.call_subagent.assert_not_called()
+        ev.stop_event.assert_not_called()
+
+    def test_active_runner_t1_hit_direct(self):
+        """活跃 runner + T1 点名命中：直发子代理 + stop_event，返回 True"""
+        import router as router_mod
+        p = self._fresh_router()
+        router_mod._ACTIVE_AGENT_RUNNERS = {"sess-busy": object()}
+        ev = self._plain_event("特蕾西娅，帮我看看这个")
+        p.call_subagent = AsyncMock()
+        res = asyncio.run(p._busy_bypass_check(ev))
+        self.assertTrue(res)
+        p.call_subagent.assert_called_once()
+        kwargs = p.call_subagent.call_args.kwargs
+        self.assertEqual(kwargs["agent_name"], "theresia")
+        self.assertIn("帮我看看这个", kwargs["input"])
+        ev.stop_event.assert_called_once()
+
+    def test_active_runner_no_t1_release(self):
+        """活跃 runner 但未点名（闲聊）：不直发、不 stop，放行 follow-up 给主代理"""
+        import router as router_mod
+        p = self._fresh_router()
+        router_mod._ACTIVE_AGENT_RUNNERS = {"sess-busy": object()}
+        ev = self._plain_event("今天天气不错")
+        p.call_subagent = MagicMock()
+        res = asyncio.run(p._busy_bypass_check(ev))
+        self.assertFalse(res)
+        p.call_subagent.assert_not_called()
+        ev.stop_event.assert_not_called()
+
+    def test_direct_call_failure_release(self):
+        """直发失败：返回 False，不 stop，放行主代理兜底"""
+        import router as router_mod
+        p = self._fresh_router()
+        router_mod._ACTIVE_AGENT_RUNNERS = {"sess-busy": object()}
+        ev = self._plain_event("阿米娅，抱抱")
+        async def _boom(event, agent_name, input):
+            raise RuntimeError("boom")
+        p.call_subagent = _boom
+        res = asyncio.run(p._busy_bypass_check(ev))
+        self.assertFalse(res)
+        ev.stop_event.assert_not_called()
+
+    def test_busy_filter_matches(self):
+        """BusyRunnerFilter：有活跃 runner 才通过"""
+        import router as router_mod
+        router_mod._ACTIVE_AGENT_RUNNERS = {"sess-a": object()}
+        f = router_mod.BusyRunnerFilter()
+        ev = MagicMock()
+        ev.unified_msg_origin = "sess-a"
+        self.assertTrue(f.filter(ev, {}))
+        ev2 = MagicMock()
+        ev2.unified_msg_origin = "sess-b"
+        self.assertFalse(f.filter(ev2, {}))
+
+
+class TestModeConfig(unittest.TestCase):
+    """双模式可选设置：tech_mode_config / affection_mode_config 解析（v2.3.0）"""
+
+    def _make_plugin(self, cfg: dict):
+        _cls = _load_plugin_class()
+        inst = _cls.__new__(_cls)
+        inst.config = cfg
+        return inst
+
+    def test_tech_mode_default(self):
+        inst = self._make_plugin({})
+        m = inst._get_mode_config("tech")
+        assert m["route_mode"] == "relay"
+        assert m["call_mode"] == "parallel"
+        assert m["timeout"] == 120
+
+    def test_affection_mode_default(self):
+        inst = self._make_plugin({})
+        m = inst._get_mode_config("affection")
+        assert m["route_mode"] == "direct"
+        assert m["call_mode"] == "chained"
+        assert m["timeout"] == 120
+
+    def test_tech_mode_json_string(self):
+        cfg = {"tech_mode_config": '{"route_mode": "direct", "call_mode": "chained", "timeout": 60}'}
+        inst = self._make_plugin(cfg)
+        m = inst._get_mode_config("tech")
+        assert m["route_mode"] == "direct"
+        assert m["call_mode"] == "chained"
+        assert m["timeout"] == 60
+
+    def test_affection_mode_partial_override(self):
+        # 只改 timeout，其余回落默认
+        cfg = {"affection_mode_config": '{"timeout": 30}'}
+        inst = self._make_plugin(cfg)
+        m = inst._get_mode_config("affection")
+        assert m["route_mode"] == "direct"
+        assert m["call_mode"] == "chained"
+        assert m["timeout"] == 30
+
+    def test_mode_config_dict_format(self):
+        cfg = {"tech_mode_config": {"route_mode": "relay", "call_mode": "chained", "timeout": 90}}
+        inst = self._make_plugin(cfg)
+        m = inst._get_mode_config("tech")
+        assert m["route_mode"] == "relay"
+        assert m["call_mode"] == "chained"
+        assert m["timeout"] == 90
+
+    def test_mode_config_invalid_json_fallback(self):
+        cfg = {"tech_mode_config": "{not valid json"}
+        inst = self._make_plugin(cfg)
+        m = inst._get_mode_config("tech")
+        assert m["route_mode"] == "relay"
+        assert m["call_mode"] == "parallel"
+
+    def test_mode_config_empty_string_fallback(self):
+        cfg = {"affection_mode_config": ""}
+        inst = self._make_plugin(cfg)
+        m = inst._get_mode_config("affection")
+        assert m["route_mode"] == "direct"
+        assert m["call_mode"] == "chained"
+
+    def test_unknown_mode_fallback(self):
+        inst = self._make_plugin({})
+        m = inst._get_mode_config("nonexistent")
+        assert m == {}
+
+
+class TestResolveModeParams(unittest.TestCase):
+    """博士配置永远优先：mode 命中时模式配置无条件覆盖显式传参（v2.3.1）"""
+
+    def _make_plugin(self, cfg: dict):
+        _cls = _load_plugin_class()
+        inst = _cls.__new__(_cls)
+        inst.config = cfg
+        return inst
+
+    def test_tech_config_overrides_explicit_args(self):
+        # 博士配置 direct+chained+60，模型显式传 relay/parallel/999 → 博士配置胜
+        cfg = {"tech_mode_config": '{"route_mode": "direct", "call_mode": "chained", "timeout": 60}'}
+        inst = self._make_plugin(cfg)
+        r, c, t = inst.resolve_mode_params("tech", "relay", "parallel", 999)
+        assert r == "direct" and c == "chained" and t == 60
+
+    def test_affection_config_overrides_explicit_args(self):
+        cfg = {"affection_mode_config": '{"route_mode": "relay", "call_mode": "parallel", "timeout": 45}'}
+        inst = self._make_plugin(cfg)
+        r, c, t = inst.resolve_mode_params("affection", "direct", "chained", 999)
+        assert r == "relay" and c == "parallel" and t == 45
+
+    def test_timeout_override_no_longer_needs_default_sentinel(self):
+        # 旧逻辑只有 timeout==120 才让位；现在显式传 120 也按博士配置 300
+        cfg = {"tech_mode_config": '{"timeout": 300}'}
+        inst = self._make_plugin(cfg)
+        r, c, t = inst.resolve_mode_params("tech", None, None, 120)
+        assert t == 300
+
+    def test_no_mode_returns_args_unchanged(self):
+        # 不传 mode → 原样返回，交给全局兜底
+        inst = self._make_plugin({})
+        r, c, t = inst.resolve_mode_params(None, "relay", "chained", 60)
+        assert r == "relay" and c == "chained" and t == 60
+
+    def test_no_mode_with_none_args_stays_none(self):
+        inst = self._make_plugin({})
+        r, c, t = inst.resolve_mode_params(None, None, None, None)
+        assert r is None and c is None and t is None
+
+    def test_mode_uppercase_normalized(self):
+        cfg = {"tech_mode_config": '{"timeout": 77}'}
+        inst = self._make_plugin(cfg)
+        r, c, t = inst.resolve_mode_params("TECH", None, None, 120)
+        assert t == 77
+
+
+class TestModeShortcutDecision(unittest.TestCase):
+    """[模式兼容 2026-08-31] T1/T2 命中后的模式裁决：技术干活放行主代理，贴贴按配置短路"""
+
+    def _fresh_router(self, mode_cfg=None, extra=None):
+        cfg = {
+            "enable_smart_router": True,
+            "name_display_map": json.dumps({
+                "amiya": "阿米娅", "closure": "可露希尔", "theresia": "特蕾西娅",
+            }),
+            "direct_delivery_agents": "amiya,closure,theresia",
+        }
+        if mode_cfg:
+            cfg.update(mode_cfg)
+        if extra:
+            cfg.update(extra)
+        p = _load_plugin_class()(context=MagicMock(), config=cfg)
+        return p
+
+    def _plain_event(self, msg):
+        ev = MagicMock()
+        ev.get_message_str.return_value = msg
+        ev.unified_msg_origin = "sess-mode"
+        ev.stop_event = MagicMock()
+        ev.get_sender_id.return_value = "u1"
+        return ev
+
+    # ── 单元：_mode_shortcut_decision ──
+    def test_tech_task_release_to_main(self):
+        """技术干活任务（含 tech 特征）：放行主代理，不短路"""
+        p = self._fresh_router()
+        msg = "阿米娅帮我查一下这个报错的traceback"
+        assert p._mode_shortcut_decision(self._plain_event(msg), msg, "amiya") is False
+
+    def test_affection_direct_shortcut(self):
+        """贴贴任务 + affection 默认 direct：短路直发"""
+        p = self._fresh_router()
+        msg = "阿米娅，抱抱"
+        assert p._mode_shortcut_decision(self._plain_event(msg), msg, "amiya") is True
+
+    def test_affection_relay_release(self):
+        """贴贴任务 + 博士配置 affection relay：放行主代理收卷"""
+        p = self._fresh_router(mode_cfg={
+            "affection_mode_config": '{"route_mode": "relay", "call_mode": "parallel", "timeout": 60}'
+        })
+        msg = "阿米娅，抱抱"
+        assert p._mode_shortcut_decision(self._plain_event(msg), msg, "amiya") is False
+
+    def test_unclassified_default_shortcut(self):
+        """无 tech 特征也无点名（分类 None）：保持原行为短路（兜底）"""
+        p = self._fresh_router()
+        msg = "今天天气不错"
+        # None 分类时裁决返回 True（原行为短路兜底）
+        assert p._mode_shortcut_decision(self._plain_event(msg), msg, "amiya") is True
+
+    # ── 集成：_smart_router_check 完整链路 ──
+    def test_smart_router_tech_release_no_direct(self):
+        """T1 命中 tech 任务 → 放行主代理，不 call_subagent、不 stop_event"""
+        p = self._fresh_router()
+        ev = self._plain_event("阿米娅帮我查一下这个报错的traceback")
+        p.call_subagent = AsyncMock()
+        res = asyncio.run(p._smart_router_check(ev))
+        assert res is False
+        p.call_subagent.assert_not_called()
+        ev.stop_event.assert_not_called()
+
+    def test_smart_router_affection_direct_shortcut(self):
+        """T1 命中贴贴任务（affection direct 默认）→ 短路直发"""
+        p = self._fresh_router()
+        ev = self._plain_event("阿米娅，抱抱")
+        p.call_subagent = AsyncMock()
+        res = asyncio.run(p._smart_router_check(ev))
+        assert res is True
+        p.call_subagent.assert_called_once()
+        ev.stop_event.assert_called_once()
+
+
+class TestRouteSuggestionHandoff(unittest.TestCase):
+    """[判向传递 2026-08-31] T1/T2 裁决放行时暂存判向目标，directive 注入时附加给主代理"""
+
+    def _fresh_router(self, extra=None):
+        cfg = {
+            "enable_smart_router": True,
+            "name_display_map": json.dumps({
+                "amiya": "阿米娅", "closure": "可露希尔", "theresia": "特蕾西娅",
+            }),
+            "direct_delivery_agents": "amiya,closure,theresia",
+        }
+        if extra:
+            cfg.update(extra)
+        return _load_plugin_class()(context=MagicMock(), config=cfg)
+
+    def _plain_event(self, msg):
+        ev = MagicMock()
+        ev.get_message_str.return_value = msg
+        ev.unified_msg_origin = "sess-sug"
+        ev.stop_event = MagicMock()
+        ev.get_sender_id.return_value = "u1"
+        return ev
+
+    def test_tech_release_records_suggestion(self):
+        """tech 任务放行主代理时，T1 判向目标被暂存"""
+        p = self._fresh_router()
+        ev = self._plain_event("阿米娅帮我查一下这个报错的traceback")
+        p.call_subagent = AsyncMock()
+        res = asyncio.run(p._smart_router_check(ev))
+        assert res is False
+        assert p._pop_route_suggestion() == "amiya"
+
+    def test_shortcut_does_not_record_suggestion(self):
+        """短路直发（affection direct）不暂存判向目标——直发不经主代理"""
+        p = self._fresh_router()
+        ev = self._plain_event("阿米娅，抱抱")
+        p.call_subagent = AsyncMock()
+        res = asyncio.run(p._smart_router_check(ev))
+        assert res is True
+        assert p._pop_route_suggestion() is None
+
+    def test_busy_bypass_release_records_suggestion(self):
+        """忙碌旁路裁决放行时同样暂存判向目标"""
+        import router as router_mod
+        if router_mod._ACTIVE_AGENT_RUNNERS is None:
+            return  # 环境无 follow-up 模块，跳过
+        router_mod._ACTIVE_AGENT_RUNNERS = {"sess-sug": object()}
+        try:
+            p = self._fresh_router()
+            ev = self._plain_event("可露希尔帮我改一下这段代码的逻辑")
+            p.call_subagent = AsyncMock()
+            res = asyncio.run(p._busy_bypass_check(ev))
+            assert res is False  # tech 放行
+            assert p._pop_route_suggestion() == "closure"
+        finally:
+            router_mod._ACTIVE_AGENT_RUNNERS = {}
+
+    def test_suggestion_expires_after_30s(self):
+        """判向目标 30s 过期清除，不污染后续消息"""
+        p = self._fresh_router()
+        p._record_route_suggestion("amiya")
+        assert p._pop_route_suggestion() == "amiya"
+        # 模拟过期
+        p._route_suggestion = ("amiya", __import__("time").time() - 31)
+        assert p._pop_route_suggestion() is None
+        # 过期后属性被清
+        assert p._route_suggestion is None
+
+    def test_directive_appends_suggestion(self):
+        """directive 注入时把判向目标附加进指令文本"""
+        p = self._fresh_router()
+        p._record_route_suggestion("amiya")
+        ev = self._plain_event("阿米娅帮我查一下这个报错的traceback")
+        req = MagicMock()
+        req.extra_user_content_parts = []
+        asyncio.run(p._route_directive_inject(ev, req))
+        parts = req.extra_user_content_parts
+        assert len(parts) == 1
+        text = parts[0].text
+        assert "路由目标建议" in text
+        assert "阿米娅" in text
+        assert "amiya" in text
+
+
+class TestReadAirArbitrate(unittest.TestCase):
+    """[读空气·段二 2026-09-03] 宁静权观察逻辑：默认关零行为变化，观察仅日志不拦截"""
+
+    def _fresh_plugin(self, read_air=False):
+        from arbitrate import ArbitrationMixin, ConversationPresence
+
+        cfg = {
+            "enable_smart_router": True,
+            "name_display_map": json.dumps({
+                "amiya": "阿米娅", "closure": "可露希尔", "theresia": "特蕾西娅",
+                "kaltsit": "凯尔希", "presis": "普瑞赛斯",
+            }),
+            "direct_delivery_agents": "amiya,closure,theresia",
+            "enable_read_air_arbitrate": read_air,
+            "read_air_presence_window": 6,
+        }
+        p = _load_plugin_class()(context=MagicMock(), config=cfg)
+        # 断言 mixin 已混入 MRO
+        assert isinstance(p, ArbitrationMixin)
+        return p
+
+    def _plain_event(self, msg):
+        ev = MagicMock()
+        ev.get_message_str.return_value = msg
+        ev.unified_msg_origin = "sess-readair"
+        ev.stop_event = MagicMock()
+        ev.get_sender_id.return_value = "u-readair"
+        return ev
+
+    def test_read_air_quiet_when_main_just_replied(self):
+        """R1：主代理刚回过话 → 倾向克制（让主代理继续，不抢派）"""
+        from arbitrate import MAIN_SPEAKER
+
+        p = self._fresh_plugin()
+        p._presence_get(self._plain_event("阿米娅帮我看看")).record(MAIN_SPEAKER, "main", "我回了一句")
+        assert p._read_air_wants_quiet("阿米娅帮我看看", p._presence_get(self._plain_event("阿米娅帮我看看")))
+
+    def test_read_air_not_quiet_when_subagent_owns_floor(self):
+        """主代理没接话、单条子代理在正常回 → 不加戏克制"""
+        p = self._fresh_plugin()
+        p._presence_get(self._plain_event("夕，过来帮我")).record("xi", "forward", "夕先回")
+        assert not p._read_air_wants_quiet("夕，过来帮我", p._presence_get(self._plain_event("夕，过来帮我")))
+
+    def test_read_air_quiet_on_old_rivalry(self):
+        """R4：旧怨组（普瑞赛斯×凯尔希）近条密集互抛 → 倾向主代理兜，避免针锋相对"""
+        p = self._fresh_plugin()
+        pp = p._presence_get(self._plain_event("两位在争什么"))
+        pp.record("presis", "forward", "普一句")
+        pp.record("kaltsit", "forward", "凯一句")
+        pp.record("presis", "forward", "普二句")
+        pp.record("kaltsit", "forward", "凯二句")
+        assert p._read_air_wants_quiet("两位在争什么", pp)
+
+    def test_arbitrate_directive_default_off_no_intercept(self):
+        """默认关：_arbitrate_directive 返回 None，不拦截路由、零行为变化"""
+        p = self._fresh_plugin(read_air=False)
+        ev = self._plain_event("阿米娅帮我查报错")
+        assert p._arbitrate_directive(ev, "阿米娅帮我查报错", "amiya", True) is None
+
+    def test_arbitrate_directive_on_observe_only(self):
+        """开启后也是 observe-only：仍返回 None，绝不实际拦截短路"""
+        p = self._fresh_plugin(read_air=True)
+        ev = self._plain_event("阿米娅帮我查报错")
+        # 命中 T1 -> amiya 且 mode 放行短路
+        assert p._arbitrate_directive(ev, "阿米娅帮我查报错", "amiya", True) is None
+
+
+class TestDirectiveTaskClassify(unittest.TestCase):
+    """指令注入智能规则：任务分类（tech/affection/None，v2.3.0）"""
+
+    def _make_plugin(self, cfg: dict):
+        _cls = _load_plugin_class()
+        inst = _cls.__new__(_cls)
+        # 默认带 name_display_map，T1 点名判定依赖它
+        base = {
+            "name_display_map": '{"amiya": "阿米娅", "closure": "可露希尔", "theresia": "特蕾西娅"}',
+            "direct_delivery_agents": "amiya,closure,theresia",
+        }
+        base.update(cfg)
+        inst.config = base
+        return inst
+
+    def _fake_event(self, text: str):
+        ev = MagicMock()
+        ev.get_message_str.return_value = text
+        return ev
+
+    def test_tech_code_keyword(self):
+        inst = self._make_plugin({})
+        assert inst._classify_directive_task(self._fake_event("帮我写个python脚本处理日志")) == "tech"
+
+    def test_tech_error_keyword(self):
+        inst = self._make_plugin({})
+        assert inst._classify_directive_task(self._fake_event("报错了，traceback 贴出来")) == "tech"
+
+    def test_tech_query_keyword(self):
+        inst = self._make_plugin({})
+        assert inst._classify_directive_task(self._fake_event("查一下这个接口的文档")) == "tech"
+
+    def test_affection_mention(self):
+        inst = self._make_plugin({})
+        assert inst._classify_directive_task(self._fake_event("阿米娅，多和博士亲亲")) == "affection"
+
+    def test_affection_domain_word(self):
+        inst = self._make_plugin({})
+        assert inst._classify_directive_task(self._fake_event("找可露希尔聊聊")) == "affection"
+
+    def test_plain_chat_no_inject(self):
+        inst = self._make_plugin({})
+        assert inst._classify_directive_task(self._fake_event("今天天气不错")) is None
+
+    def test_empty_message_defensive_affection(self):
+        inst = self._make_plugin({})
+        assert inst._classify_directive_task(self._fake_event("")) == "affection"
+
+    def test_tech_wins_over_mention(self):
+        # 技术关键词优先：点名同时技术任务 → tech（统帅收卷，不直发）
+        inst = self._make_plugin({})
+        assert inst._classify_directive_task(self._fake_event("阿米娅，帮我整理这份数据表格")) == "tech"
+
+
+class TestBuildRouteDirectiveMode(unittest.TestCase):
+    """按任务类型生成指令（v2.3.0）"""
+
+    def _make_plugin(self, cfg: dict):
+        _cls = _load_plugin_class()
+        inst = _cls.__new__(_cls)
+        inst.config = cfg
+        return inst
+
+    def test_tech_directive_contains_mode_label(self):
+        cfg = {"direct_delivery_agents": "amiya,closure"}
+        inst = self._make_plugin(cfg)
+        d = inst._build_route_directive("tech")
+        assert "技术干活" in d
+        assert "mode=\"tech\"" in d
+        assert "relay" in d
+
+    def test_affection_directive_contains_mode_label(self):
+        cfg = {"direct_delivery_agents": "amiya,closure"}
+        inst = self._make_plugin(cfg)
+        d = inst._build_route_directive("affection")
+        assert "后宫贴贴" in d
+        assert "mode=\"affection\"" in d
+        assert "direct" in d
+
+    def test_always_mode_no_task_kind(self):
+        cfg = {"direct_delivery_agents": "amiya,closure"}
+        inst = self._make_plugin(cfg)
+        d = inst._build_route_directive(None)
+        assert "【本次任务分类" not in d
+
+    def test_tech_directive_no_agents_returns_empty(self):
+        inst = self._make_plugin({"direct_delivery_agents": ""})
+        assert inst._build_route_directive("tech") == ""
+
+    def test_need_route_directive_delegates(self):
+        inst = self._make_plugin({"direct_delivery_agents": "amiya,closure"})
+        ev = MagicMock()
+        ev.get_message_str.return_value = "帮我看看这段代码报错"
+        assert inst._need_route_directive(ev) is True
+        ev2 = MagicMock()
+        ev2.get_message_str.return_value = "今天晚饭吃什么"
+        assert inst._need_route_directive(ev2) is False
+
+
+class TestConfSchemaRegistration(unittest.TestCase):
+    """配置 schema 一致性：所有运行时读取的配置 key 必须注册进 _conf_schema.json（v2.3.0 返工）"""
+
+    def test_mode_configs_registered_in_schema(self):
+        """tech_mode_config / affection_mode_config 必须在 _conf_schema.json 中注册，
+        否则 WebUI 不显示，且热重载时会被 AstrBotConfig 按 schema 重建丢弃。"""
+        schema_path = os.path.join(PLUGIN_DIR, "_conf_schema.json")
+        with open(schema_path, "r", encoding="utf-8") as f:
+            schema = json.load(f)
+        assert "tech_mode_config" in schema, "tech_mode_config 未注册到 _conf_schema.json，WebUI 不显示"
+        assert "affection_mode_config" in schema, "affection_mode_config 未注册到 _conf_schema.json，WebUI 不显示"
+        assert schema["tech_mode_config"]["type"] == "string"
+        assert schema["affection_mode_config"]["type"] == "string"
+
+    def test_schema_all_keys_have_required_fields(self):
+        """schema 每个 key 必须含 description/type/default，hint 可选。"""
+        schema_path = os.path.join(PLUGIN_DIR, "_conf_schema.json")
+        with open(schema_path, "r", encoding="utf-8") as f:
+            schema = json.load(f)
+        for key, spec in schema.items():
+            for field in ("description", "type", "default"):
+                assert field in spec, f"schema[{key}] 缺 {field}"
+            assert spec["type"] in ("string", "int", "float", "bool", "text"), \
+                f"schema[{key}] type 非法: {spec['type']}"
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
@@ -1037,3 +1676,30 @@ class TestContextEngine:
         assert eng.histories == {}
         out = asyncio.run(eng.inject("amiya", "sx", "原样"))
         assert out == "原样"
+
+    def test_ctx_injection_stripped_for_memory_store(self):
+        """2026-08-31 修复回归：存储链路必须剥离 ctx_engine 历史块，
+        只存本轮干净输入（此前整块随轮次越滚越大，召回拼进查询文本膨胀 token）"""
+        from memory import _strip_ctx_injection, _strip_chain_injection
+
+        # 模拟 inject 产物（带用户身份注入 + 历史块）
+        injected = (
+            "--- 对话历史 ---\n"
+            "user: 你好\nassistant: 你好呀博士\n"
+            "--- 新的输入 ---\n"
+            "[用户身份] 当前对话用户 user_id=TESTUSER00000000000000000000000000\n"
+            "阿米娅，多和博士亲亲"
+        )
+        stored = _strip_chain_injection(_strip_ctx_injection(injected))
+        assert stored == (
+            "[用户身份] 当前对话用户 user_id=TESTUSER00000000000000000000000000\n"
+            "阿米娅，多和博士亲亲"
+        )
+        assert "对话历史" not in stored
+
+        # 无历史块时原样返回
+        plain = "普通消息"
+        assert _strip_ctx_injection(plain) == plain
+
+        # 空串安全
+        assert _strip_ctx_injection("") == ""
