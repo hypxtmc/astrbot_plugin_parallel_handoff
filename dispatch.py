@@ -518,9 +518,10 @@ class DispatchMixin:
                 livingmemory_plugin, event, agent_name, final_input, raw_response
             )
 
-            # 清理 persona_id（由上方的记忆召回阶段设置），确保下轮调用不残留
-            if hasattr(event, "persona_id"):
-                delattr(event, "persona_id")
+            # 清理 persona_id / _subagent_persona（记忆隔离标记），确保下轮调用不残留
+            for _attr in ("persona_id", "_subagent_persona"):
+                if hasattr(event, _attr):
+                    delattr(event, _attr)
 
             # ── 上下文存储：追加到跨轮对话历史（ContextEngine） ──
             self._ctx_engine.append(agent_name, event.unified_msg_origin, input_text, raw_response)
@@ -549,8 +550,9 @@ class DispatchMixin:
             logger.warning(
                 f"[parallel_handoff] Subagent '{agent_name}' timed out after {timeout}s"
             )
-            if hasattr(event, "persona_id"):
-                delattr(event, "persona_id")
+            for _attr in ("persona_id", "_subagent_persona"):
+                if hasattr(event, _attr):
+                    delattr(event, _attr)
             err_text = f"Timeout after {timeout}s"
             err_text = self._maybe_prefix(agent_name, err_text, enable_name_prefix)
             return {
@@ -561,8 +563,9 @@ class DispatchMixin:
                 "order": order,
             }
         except Exception as e:
-            if hasattr(event, "persona_id"):
-                delattr(event, "persona_id")
+            for _attr in ("persona_id", "_subagent_persona"):
+                if hasattr(event, _attr):
+                    delattr(event, _attr)
             latency_ms = int((time.perf_counter() - t0) * 1000)
             logger.error(
                 f"[parallel_handoff] Subagent '{agent_name}' failed: {e}"
