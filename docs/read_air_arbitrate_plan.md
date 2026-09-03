@@ -136,6 +136,8 @@ class ArbitrationMixin:
 > 却误带多人时打日志提示「本批是否只需某人」，绝不砍 calls（V2 关键约束）。4 个收敛测试全过 + 全量 126/0 绿。
 
 **段四·回归+部署**：全量 test_arbitrate.py + test_plugin.py 过，`py_compile` 三查，`hot_reload_plugin` 上线。博士验收四类场景：点名、群聊杂谈、承接句、多人并行。
+> 🔧 段四回归+部署已完成（2026-09-03 14:3x）：py_compile 三查通过；test_plugin.py 全量 **112 passed**（含 9 个读空气测试）；total 126=112+旧归档 test_plugin_20260822(14，非本次验收)；hot_reload 生效、插件 v2.3.0 正常加载、日志无异常。
+> 博士四类场景验收需真实环境触发（点名/群聊杂谈/承接句/多人并行）→ 开关默认 False，三期补齐后一起实验性开启。
 
 ---
 
