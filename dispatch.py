@@ -218,6 +218,94 @@ class DispatchMixin:
             "（这是你记得的家里人的关系与近况，自然地带进对话，不必刻意提）"
         )
 
+    # ── 今日状态引擎（三期 M1/M2 接入主线｜2026-09-03 普瑞赛斯） ──────────────
+    # random_state.py 每日确定性状态机 + daily_life.py GLM-4-Flash 离线注入器，
+    # 原本只挂在读空气观察层，角色说话从未吃到今日状态。现并进 extra_user_content
+    # 注入链，让每个子代理真正"过着"这一天（心情/手头事/话题域）。开关默认 False。
+    def _ensure_daily_life_engine(self):
+        """懒初始化今日状态引擎（RNG + GLM 注入器），首用才建，防内存堆积。"""
+        if getattr(self, "_daily_life_engine_ready", False):
+            return
+        try:
+            from . import random_state as _rs
+            from . import daily_life as _dl
+        except Exception:  # noqa: BLE001  绝对导入失败时回退相对包内导入（astrbot 加载坑）
+            import random_state as _rs  # type: ignore
+            import daily_life as _dl  # type: ignore
+
+        self._rng = getattr(self, "_rng", None) or _rs.RandomStateManager()
+        self._daily_life_engine_ready = True
+        self._rs_mod = _rs
+        self._dl_mod = _dl
+        # 注入器懒建（需要 async llm_generate，稍后取用）
+        self._daily_life_injector = getattr(self, "_daily_life_injector", None)
+
+    async def _daily_life_refresh_once(self, scene, handoff_map):
+        """每日每场景仅补一次 LLM 状态注入（GLM 每日一次的节流）。
+
+        首次（该场景今日还没注入过）才触发 DailyLifeInjector.inject —— 它离线读
+        近期对话改各 agent 今日状态；其余时候直接走 RNG 内存态（跨天自动重掷）。
+        保持 M2 铁律：LLM 只当眼睛不当手，任何异常降级纯规则随机，绝不致命。
+        """
+        try:
+            if getattr(self, "_daily_llm_injected_scenes", None) is None:
+                self._daily_llm_injected_scenes = set()
+            # 判断该场景今日是否已注入过（按 场景+日期 记）
+            _today = self._rs_mod._today() if self._rs_mod else ""
+            _key = f"{scene}:{_today}"
+            if _key in self._daily_llm_injected_scenes:
+                return
+            if not self._daily_life_injector:
+                prov_id = self.config.get("glm4flash_provider_id", "")
+                async def _resolve_provider(_umo):
+                    try:
+                        return await self.context.get_current_chat_provider_id(_umo)
+                    except Exception:
+                        return ""
+                self._daily_life_injector = self._dl_mod.DailyLifeInjector(
+                    rng=self._rng,
+                    llm_generate=self.context.llm_generate,
+                    resolve_provider_id=_resolve_provider,
+                    provider_id=prov_id,
+                )
+            # 该场景的 agent 名单（今日至少要把出过场的都覆盖到）
+            agents = self._rng.agents(scene) or list(handoff_map.keys())
+            # 近期日志：取跨轮对话历史（若有）
+            logs = ""
+            try:
+                hist = (self._ctx_engine.histories or {}).get(
+                    f"{next(iter(handoff_map))}:{scene}", []
+                )
+                logs = "\n".join(
+                    f"{m.get('role')}>{m.get('content','')}" for m in hist[-8:]
+                ) or ""
+            except Exception:
+                logs = ""
+            await self._daily_life_injector.inject(scene, agents, logs, umo=scene)
+            self._daily_llm_injected_scenes.add(_key)
+            logger.info(f"[parallel_handoff] 今日状态 LLM 注入完成 scene={scene} agents={len(agents)}")
+        except Exception as _e:  # noqa: BLE001
+            logger.warning(f"[parallel_handoff] 今日状态注入器懒初始化失败(降级规则随机): {_e}")
+
+    def _daily_state_text(self, agent_name, st) -> str:
+        """把某 agent 的今日 DailyState 拼成口吻自然的注入叙述（非紧凑 summary）。"""
+        if st is None:
+            return ""
+        try:
+            _mood = getattr(st, "mood", "") or "平静"
+            _hand = getattr(st, "hand", "") or ""
+            _domain = getattr(st, "domain", "") or "生活"
+            _text = f"【今日日常】你今天心情{_mood}。"
+            if _hand:
+                _text += f"正{_hand}。"
+            # 附一句话题倾向，让角色自然往今日领域靠
+            return (
+                f"{_text}你今日的心思偏向『{_domain}』这一块的事，"
+                "自然地带着这份状态聊天，不必刻意表露。"
+            )
+        except Exception:
+            return ""
+
     async def _call_one(
         self,
         call: dict,
@@ -354,6 +442,28 @@ class DispatchMixin:
                 logger.info(f"[parallel_handoff] 子代理关系网注入 OK [{agent_name}]: {len(_rel_sense)} chars")
         except Exception as _e:
             logger.warning(f"[parallel_handoff] 关系网注入失败 [{agent_name}]: {_e}")
+
+        # ── 今日状态注入：给子代理"过日子"的当天切片（三期 M1/M2 接入主线，2026-09-03 普瑞赛斯） ──
+        #   此前每日状态只挂在读空气观察层，角色说话吃不到今日状态。现并进 extra_user_content
+        #   注入链（与时间感知/关系网平级串联），让角色真正带着今日心情、手头事、话题域聊天。
+        #   开关 enable_daily_random_life 默认 False；每日每场景只补一次 LLM 离线注入，其余走内存态。
+        try:
+            if self._cfg("enable_daily_random_life", False):
+                self._ensure_daily_life_engine()
+                _umo = event.unified_msg_origin
+                await self._daily_life_refresh_once(_umo, handoff_map)
+                _daily_st = self._rng.get(_umo, agent_name)
+                if _daily_st is not None:
+                    _daily_txt = self._daily_state_text(agent_name, _daily_st)
+                    if _daily_txt:
+                        _daily_part = TextPart(text=_daily_txt).mark_as_temp()
+                        memory_extra_parts = [_daily_part] + (memory_extra_parts or [])
+                        logger.info(
+                            f"[parallel_handoff] 子代理今日状态注入 OK [{agent_name}]: "
+                            f"{getattr(_daily_st, 'mood', '')}/{getattr(_daily_st, 'domain', '')}"
+                        )
+        except Exception as _e:
+            logger.warning(f"[parallel_handoff] 今日状态注入失败 [{agent_name}]: {_e}")
 
         # ── 构建子代理工具集（memory.py 记忆工具过滤） ──
         subagent_tools = self._build_memory_tools(agent_name)

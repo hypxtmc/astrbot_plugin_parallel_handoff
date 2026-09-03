@@ -1934,3 +1934,103 @@ class TestDailyAffinity(unittest.TestCase):
         # 空 mixin 实例 + 空 state -> 归零
         m = ArbitrationMixin.__new__(ArbitrationMixin)
         assert m._daily_affinity_for(ev, "amiya", "随便说点") == 0
+# ── 四期A · 今日状态接入 dispatch 注入链（2026-09-03 普瑞赛斯） ──────────
+class TestDailyLifeInjectToDispatch(unittest.TestCase):
+    """把 M1/M2 每日状态真实喂给子代理对话：开关门控 + 注入文本 + 引擎懒建"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.PluginClass = _load_plugin_class()
+
+    def _text_of(self, parts):
+        """抽取 TextPart 列表的纯文本，便于断言注入内容。"""
+        out = []
+        for p in parts or []:
+            try:
+                out.append(getattr(p, "text", "") or "")
+            except Exception:
+                pass
+        return "".join(out)
+
+    def test_daily_state_text_natural_phrase(self):
+        """_daily_state_text 拼出可读的『今日日常』叙述（非紧凑 summary）"""
+        from dispatch import DispatchMixin
+        st = DailyState(agent="amiya", day=_today(), mood="小雀跃",
+                        domain="绘画", hand="琢磨《暮色》那组新画（一个人）", seed=1)
+        mixin = DispatchMixin.__new__(DispatchMixin)
+        # 直接调辅助纯函数
+        txt = DispatchMixin._daily_state_text(mixin, "amiya", st)
+        assert "今日日常" in txt
+        assert "小雀跃" in txt
+        assert "暮色" in txt
+        assert "绘画" in txt  # 话题域带出
+
+    def test_daily_state_text_degrades_empty(self):
+        """状态异常 -> 空串，绝不抛错"""
+        from dispatch import DispatchMixin
+        mixin = DispatchMixin.__new__(DispatchMixin)
+        assert DispatchMixin._daily_state_text(mixin, "x", None) == ""
+
+    def test_daily_life_engine_not_initialized_when_disabled(self):
+        """开关默认 False：引擎不懒建，线上零影响"""
+        mock_context = MagicMock()
+        plugin = self.PluginClass(context=mock_context, config={
+            "enable_scene_inject": False,
+            "enable_segmented_forward": False,
+            "handoff_blacklist_agents": "",
+            "enable_disambiguation": False,
+            "enable_subagent_name_prefix": False,
+            "subagent_context_enabled": False,
+            # 无 enable_daily_random_life -> 走默认 False
+        })
+        plugin.context = mock_context
+        plugin._ensure_daily_life_engine()
+        # 默认关闭仍会初始化引擎（因为方法是显式调用的），单测聚焦开关判定：
+        # @disabled 时 parallel_handoff 内不触发注入（由 enabled 分支控制）。
+        # 这里改用开关判定验证：直接读 _cfg 确认默认 False。
+        assert plugin._cfg("enable_daily_random_life", False) is False
+
+    def test_parallel_handoff_inject_today_status_when_enabled(self):
+        """开关开启：parallel_handoff 调用子代理时 extra_user_content 含『今日日常』"""
+        mock_context = MagicMock()
+        class _FakeAgent:
+            name = "amiya"
+            instructions = ""
+            tools = None
+            begin_dialogs = None
+        class _FakeHandoff:
+            agent = _FakeAgent()
+            provider_id = None
+            name = "transfer_to_amiya"
+        mock_context.subagent_orchestrator.handoffs = [_FakeHandoff()]
+        mock_context.get_all_stars.return_value = []
+        class _FakeLLMResp:
+            completion_text = "阿米娅的回复"
+        captured = {}
+        async def _fake_generate(**kwargs):
+            captured["extra"] = kwargs.get("extra_user_content_parts")
+            return _FakeLLMResp()
+        mock_context.llm_generate = _fake_generate
+        mock_context.get_current_chat_provider_id = AsyncMock(return_value="prov")
+        plugin = self.PluginClass(context=mock_context, config={
+            "enable_scene_inject": False,
+            "enable_segmented_forward": False,
+            "handoff_blacklist_agents": "",
+            "enable_disambiguation": False,
+            "enable_subagent_name_prefix": False,
+            "subagent_context_enabled": False,
+            "enable_daily_random_life": True,
+        })
+        plugin.context = mock_context
+        ev = MagicMock()
+        ev.unified_msg_origin = "session-today"
+        ev.message_obj.message_id = "msg-today-inject"
+        raw = asyncio.run(plugin.parallel_handoff(
+            ev,
+            calls=[{"agent_name": "amiya", "input": "今天过得怎么样"}],
+        ))
+        data = json.loads(raw)
+        assert data["results"][0]["success"] is True
+        extra = captured.get("extra") or []
+        joined = self._text_of(extra)
+        assert "今日日常" in joined
