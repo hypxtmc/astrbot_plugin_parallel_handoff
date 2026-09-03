@@ -1,0 +1,238 @@
+"""arbitrate.py — parallel_handoff 读空气仲裁（P0 拆模块·段一状态机骨架）
+
+对应 V2 计划书 docs/read_air_arbitrate_plan.md：
+- 段一：ConversationPresence 在场状态模块 + ArbitrationMixin 状态记录方法
+- 本文件当前只做【状态记录】，绝不碰任何路由行为（质量/安全优先的最低侵入原则）
+- 仲裁判定方法 _arbitrate_directive / _arbitrate_tool 先留空壳，段二再填逻辑
+
+设计核心（顾主 2026-09-03 定性）：
+① 随机性是三期任务，一期只做「宁静权」克制、不引入子代理日常随机演化；
+② 旧怨只体现为贫嘴（刀子嘴豆腐心），不针锋相对，绝不作对抗性仲裁判据；
+③ 读空气仲裁 = 在自动路由「该不该派子代理」的犹豫点追加宁静权克制，
+   绝不比 _mode_shortcut_decision 更激进、绝不拦顾主明确点名的人。
+"""
+
+import logging
+from collections import deque
+
+from astrbot.api.event import AstrMessageEvent
+
+_logger = logging.getLogger("parallel_handoff.arbitrate")
+
+# 发言窗口默认宽度（记录最近 N 条发言，供下轮「读空气」参考）
+DEFAULT_PRESENCE_WINDOW = 6
+# 主代理虚拟发言人标记（会话 last_speaker 用 "__main__" 表示主代理回复）
+MAIN_SPEAKER = "__main__"
+
+
+class ConversationPresence:
+    """单会话在场状态（按 unified_msg_origin 隔离）。
+
+    原型：
+        recent       最近 N 条发言 {agent, action(forward/main), text摘要, ts}
+        last_speaker 最近发言者（agent_name 或 MAIN_SPEAKER）
+        active_chain 是否处于连续承接/对话链中
+        pending_batch 本批次待转发的子代理候选（parallel_handoff 多人候选）
+
+    纯内存不持久化；随会话语境自然滚动（deque maxlen 窗口截断）。
+    """
+
+    def __init__(self, window: int = DEFAULT_PRESENCE_WINDOW):
+        self.window = max(1, int(window))
+        self.recent: deque = deque(maxlen=self.window)
+        self.last_speaker: str | None = None
+        self.active_chain: bool = False
+        self.pending_batch: list[str] = []
+
+    def record(self, agent: str, action: str, text: str = "", ts: float | None = None) -> None:
+        """记录一条发言并更新 last_speaker / active_chain。
+
+        agent   发言人（agent_name 或 MAIN_SPEAKER）
+        action  动作类型：'forward'(子代理转发) / 'main'(主代理回复)
+        text    文本摘要（仅记录前 40 字，够「读空气」判断说到哪即可，不存全文）
+        """
+        import time as _time
+
+        ts = ts if ts is not None else _time.time()
+        self.recent.append(
+            {
+                "agent": agent,
+                "action": action,
+                "text": (text or "")[:40],
+                "ts": ts,
+            }
+        )
+        self.last_speaker = agent
+        # 主代理回复视为「断开接管」，后续承接链重置为 False
+        self.active_chain = action != "main"
+
+    def clear(self) -> None:
+        """清空在场状态（会话切换/超时等场景兜底）"""
+        self.recent.clear()
+        self.last_speaker = None
+        self.active_chain = False
+        self.pending_batch = []
+
+
+class ArbitrationMixin:
+    """读空气仲裁 mixin：在场状态管理 + 仲裁判定（混入主壳类 MRO）。
+
+    段一只实现状态管理（_presence_get / _presence_update）；
+    _arbitrate_directive / _arbitrate_tool 为段二逻辑留空壳，默认不介入（返回 None/原 calls）。
+    """
+
+    # 每个会话的在场状态缓存：{unified_msg_origin -> ConversationPresence}
+    _presences: dict = {}
+
+    # ── 开关路由 ─────────────────────────────────────────────
+    def _read_air_enabled(self) -> bool:
+        """读空气仲裁总开关（默认 False）。开启前零行为变化。"""
+        return bool(self._cfg("enable_read_air_arbitrate", False))
+
+    def _presence_window(self) -> int:
+        """发言窗口宽度，可配，默认 6。"""
+        try:
+            return max(1, int(self._cfg("read_air_presence_window", DEFAULT_PRESENCE_WINDOW)))
+        except (TypeError, ValueError):
+            return DEFAULT_PRESENCE_WINDOW
+
+    # ── 状态读取 ─────────────────────────────────────────────
+    def _presence_get(self, event: AstrMessageEvent) -> ConversationPresence:
+        """按 unified_msg_origin 惰性初始化并返回会话在场状态。"""
+        key = getattr(event, "unified_msg_origin", None) or "default"
+        p = self._presences.get(key)
+        if p is None:
+            p = ConversationPresence(window=self._presence_window())
+            self._presences[key] = p
+        return p
+
+    # ── 状态更新 ─────────────────────────────────────────────
+    def _presence_update(
+        self, event: AstrMessageEvent, agent: str, action: str = "forward", text: str = ""
+    ) -> None:
+        """在子代理转发后 / 主代理回复后记录发言。
+
+        agent   实际发言人（agent_name 或 MAIN_SPEAKER）
+        action  'forward' 或 'main'
+        text    文本摘要（可按需传入）
+        """
+        try:
+            p = self._presence_get(event)
+            p.record(agent, action, text)
+            _logger.debug(
+                "[read_air] presence update: session=%s agent=%s action=%s last=%s chain=%s",
+                getattr(event, "unified_msg_origin", "default"),
+                agent,
+                action,
+                p.last_speaker,
+                p.active_chain,
+            )
+        except Exception as e:  # 状态记录失败绝不影响主流程（安全优先）
+            _logger.warning("[read_air] presence update failed (non-fatal): %s", e)
+
+    # ── 路径 A · 自动路由宁静权仲裁（段二：低侵入日志提示） ──
+    def _arbitrate_directive(
+        self,
+        event: AstrMessageEvent,
+        message: str,
+        route: str | None,
+        mode_decision: bool | None,
+    ) -> str | None:
+        """自动路由路径的宁静权仲裁。
+
+        入参：
+            route           T1/T2 已判出的候选 agent_name（None=未命中，兜底主代理）
+            mode_decision   _mode_shortcut_decision 的结果（是否放行主代理的裁决）
+
+        返回：
+            None   不介入（保持现有路由行为）
+            'main' 建议克制落主代理（不短路、不抢派）
+
+        段二节奏（顾主 2026-09-03 12:31 拍板）：
+            - 当前只做【低侵入日志提示】：在自动路由要短路抢派子代理之前，输出
+              Read-Air 判断日志（它想不想克制），但【绝不实际拦截】路由结果。
+            - 等【三期】的随机性日常演化补齐后，再实验性开启真实克制干预。
+            总开关 enable_read_air_arbitrate 只在实验开启时置 True，平时默认 False 零影响。
+        """
+        if not self._read_air_enabled():
+            return None
+
+        # 沉默权/最后切底线（无论开不开都该守住，但段二也只做日志）：
+        # 顾主明确点名的人，读空气绝不建议抢它的派（点名神圣不可侵原则）。
+        # 仍在读空气自己动手的路径上不拦——这里仅在自动路由犹豫点给提示。
+        if not route or not mode_decision:
+            # 无候选或 mode 已放行主代理 → 读空气无克制建议（本来就不短路）
+            return None
+
+        # ── 段二低侵入：仅日志观察「读空气想不想克制」，不实际拦截 ──
+        try:
+            p = self._presence_get(event)
+            quiet = self._read_air_wants_quiet(message, p)
+            if quiet:
+                _logger.info(
+                    "[read_air][observe] 自动路由将短路 %s，但读空气倾向克制落主代理（宁静权）。"
+                    "段二观察模式：不实际拦截，待三期后实验性开启。",
+                    route,
+                )
+            else:
+                _logger.debug(
+                    "[read_air][observe] 自动路由短路 %s，读空气判断无需克制。",
+                    route,
+                )
+        except Exception as e:
+            _logger.warning("[read_air] arbitrate observe failed (non-fatal): %s", e)
+        # 段二不返 'main'：绝不实际拦截路由，只留日志供观察
+        return None
+
+    # ── 读空气是否倾向克制（纯规则，零 LLM，可被 _arbitrate_directive 调用） ──
+    def _read_air_wants_quiet(self, message: str, presence: "ConversationPresence") -> bool:
+        """判断此刻是否倾向「主代理自然接住」而非抢派子代理。
+
+        零成本规则（不调 LLM），供观察日志用：
+        R1 主代理刚回过话（last_speaker 是主代理）→ 顺气口让主代理继续，倾向克制
+        R2 群聊性接句话（短、无点名、无技术特征）已在承接链中 → 倾向让主代理收
+        R3 消息在 subagent 连续承接链深处 → 倾向克制（不插话打断）
+        R4 关系网旧怨子代理 → 特意偏向让主代理兜，避免两旧怨组针锋相对
+
+        返回 True=倾向克制落主代理，False=可让子代理接。
+        段二仅作日志信号，不实际干预。
+        """
+        # R1 主代理刚回过话 → 倾向让主代理继续，别抢
+        if presence.last_speaker == MAIN_SPEAKER:
+            return True
+        # R2 连续承接链已确立，主代理疑似被晾着 → 若消息短且无技术特征倾向克制
+        # step1: 承接链很深（最近都在子代理之间互抛）→ 倾向主代理收尾
+        if presence.active_chain and len(presence.recent) >= 2:
+            # R4 旧怨组：主代理/助手E近条密集互抛 → 强烈倾向主代理兜，避免针锋相对
+            grp = {
+                "main": ["main", "主代理"],
+                "agent_e": ["agent_e", "助手E"],
+            }
+            recent_agents = [r["agent"] for r in presence.recent]
+            for g1, g2 in [("main", "agent_e")]:
+                c1 = sum(1 for a in recent_agents if a in grp[g1])
+                c2 = sum(1 for a in recent_agents if a in grp[g2])
+                if c1 >= 2 and c2 >= 2:
+                    return True  # 旧怨组互抛 → 主代理兜住，避免针锋相对
+            return True
+        # 其余默认让子代理按现有规则走
+        return False
+
+    # ── 路径 B · LLM 工具侧收敛（段二填逻辑，空壳原样放行 calls） ──
+    def _arbitrate_tool(self, event: AstrMessageEvent, calls: list) -> list:
+        """LLM 工具（parallel_handoff / call_subagent）调用前的收敛建议。
+
+        返回：原 calls（段二也只做「温和收敛建议 + pending_batch 记录」，绝不砍 calls）。
+        """
+        if not self._read_air_enabled():
+            return calls
+        # 记录本批 candidate 供路径 A 下轮「读空气」参考
+        try:
+            p = self._presence_get(event)
+            p.pending_batch = [
+                c.get("agent_name") for c in calls if isinstance(c, dict) and c.get("agent_name")
+            ]
+        except Exception as e:
+            _logger.warning("[read_air] pending_batch update failed (non-fatal): %s", e)
+        # ── 段二在此实现温和收敛建议（日志提示，不强制过滤） ──
+        return calls

@@ -25,6 +25,39 @@ from collections import deque
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
+try:
+    from astrbot.core.star.filter.custom_filter import CustomFilter
+except ImportError:  # pragma: no cover - 单测 mock 环境
+    CustomFilter = None
+try:
+    from astrbot.core.pipeline.process_stage.follow_up import _ACTIVE_AGENT_RUNNERS
+except ImportError:  # pragma: no cover - 单测 mock 环境
+    _ACTIVE_AGENT_RUNNERS = None
+
+if CustomFilter is not None:  # pragma: no cover - 线上分支
+    _BusyFilterBase = CustomFilter
+else:  # pragma: no cover - 单测 mock 环境
+    class _BusyFilterBase:
+        """mock 环境的空基类：仅保证类可定义、可实例化，filter 逻辑不变"""
+
+        def __init__(self, raise_error: bool = True, **kwargs) -> None:
+            self.raise_error = raise_error
+
+
+class BusyRunnerFilter(_BusyFilterBase):
+    """[Busy Bypass 2026-08-31] 忙碌旁路过滤器：仅当主代理有活跃 agent runner
+    （正在干活/工具链执行中）时接管该消息的检查。
+
+    在 waking_check 阶段评估（消息入口最早一站）。通过 → handler 被收集进
+    activated_handlers → 在 star_request_sub_stage（先于 follow-up 捕获）执行。
+    未通过 → handler 完全不激活，消息路径零变化。
+    """
+
+    def filter(self, event, cfg) -> bool:
+        if _ACTIVE_AGENT_RUNNERS is None:
+            return False
+        return event.unified_msg_origin in _ACTIVE_AGENT_RUNNERS
+
 
 class RouterMixin:
     """三层路由实现（装饰器 @filter.on_waiting_llm_request 保留在 main.py 壳方法上）"""
@@ -83,7 +116,27 @@ class RouterMixin:
         "agent_f": ["演出", "应援", "偶像", "演唱会", "听歌", "唱歌"],
         "agent_d": ["深海"],
         "agent_a": ["撒娇", "贴贴"],
+        "m3": ["M3", "猫猫", "小猫", "助手", "听诊器", "医疗顾问"],
+        "agent_e": ["助手E", "思衡托", "医师", "医疗部", "问诊"],
     }
+    # 爱称别名（2026-08-30 顾主指定）：直呼爱称 → 对应子代理 T1 命中
+    T1_ALIASES = {
+        "agent_b": ["奸商"],
+        "agent_d": ["蒂蒂", "虎鲸"],
+        "agent_c": ["小特", "小特老师", "小特妈妈"],
+        "xi": ["夕宝"],
+        "ling": ["令姐"],
+        "shu": ["黍姐", "黍妈妈"],
+        "agent_a": ["助手A", "助手A", "助手A", "助手A"],
+        "nian": ["年姐"],
+        "agent_f": ["小偶像"],
+        "m3": ["小M3", "猫猫", "小娇娇", "猫娘", "黑猫", "助手贝", "小猫娘"],
+        "agent_e": ["老女人", "医生", "凯喵", "思衡托", "凯姐", "白毛医生", "凯大夫"],
+    }
+    # 最高优先级令牌（2026-09-03 顾主指定）：只要消息含连续「主代理」四字，
+    # 无论 T1 点名 / T1.5 续接 / T2 小模型判定结果如何，一律放行主代理（主代理）。
+    # 放在路由链最前，任何子代理都不允许接管主代理。
+    _MAIN_TOKEN_RE = re.compile(r"主代理")
     # T2 判向时给模型看的子代理职责简介（简写，不涉及人格机密）
     T2_AGENT_BRIEF = {
         "agent_a": "助手A：温柔陪伴、撒娇、日常闲聊",
@@ -95,6 +148,8 @@ class RouterMixin:
         "nian": "年：火锅、看电影、锻造手艺",
         "shu": "黍：做饭、药膳、种田、家常",
         "agent_f": "助手F：偶像演出、应援、唱歌",
+        "m3": "M3：医疗学识、小猫贴贴、撒娇",
+        "agent_e": "助手E：医疗、政务、战略、正事",
     }
 
     # ── 配置读取（全走 _cfg 兜底，未配置项全部返回安全默认） ──
@@ -134,12 +189,16 @@ class RouterMixin:
         r"stderr|stdout|报错|异常|超时|timeout|not\s+found|import\s+error|"
         r"module\s|missing\s|undefined|(?:file|line)\s+\d+|```|`[^`]*`)", re.I)
     # 叙述尾：名字后面直接紧跟这些 → 是"提及"，不是"呼叫"
+    # 2026-08-30："又"收紧为必须后接叙述动词（"奸商又在坑我钱"是抱怨非叙述，"黍又做饭了"才是）；
+    # 疑问句（吗/么/呢/吧/？）不视为叙述（"夕宝在画室吗"是询问非转述）
     _T1_NARR_TAIL_RE = re.compile(
         r"^(?:的|了|过|说|说过|说道|提到|提起|曾经|上次|之前|昨天|刚才|"
-        r"和他|和她|和他们|和她们|跟|与|同|也|还|又|在|去|来|过|离开|走了|"
+        r"和他|和她|和他们|和她们|跟|与|同|也|还|在|去|来|过|离开|走了|"
         r"不在|回来|她说|他说|他俩|以前|我记得|好像|确实|她|他|她们|他们|"
+        r"又(?=(?:说|聊|讲|做|来|走|去|提|问|约|找|给|学|看|听|读|写|唱|画|吃|喝|玩|买|卖|拿|送|教|带|陪|叫|喊|唤|让|请|劝|骂|夸|记|忘))|"
         r"聊(?:了|过|起|到|的)|谈(?:了|过|起|到|的)|讲(?:了|过|起|到|的)|"
         r"说(?:得|道|的|了)|讲到|提起)", )
+    _T1_QUESTION_RE = re.compile(r"[吗么呢吧？?]")
     # 呼叫尾：名字后跟 称呼语/逗号 + 语气词簇（那/再/想/要/还…）+ 拜请动词 → 强点名
     # 语气词簇吞掉"那再亲亲"里拦路的"那再"，让"可可爱爱XX，那再亲亲好不好"这类
     # 委婉祈使也命中；纯称呼（"想我了吗"）依然被动词表拒绝，安全
@@ -173,6 +232,10 @@ class RouterMixin:
         for aid, cn in disp_map.items():
             candidates[cn] = aid
             candidates[aid] = aid
+        # 爱称别名（2026-08-30 顾主指定）：T1 直呼爱称同样命中对应子代理
+        for aid, aliases in self.T1_ALIASES.items():
+            for al in aliases:
+                candidates[al] = aid
         sorted_names = sorted(
             {n for n in candidates if n and len(str(n)) > 0}, key=lambda s: len(str(s)), reverse=True
         )
@@ -226,8 +289,8 @@ class RouterMixin:
                 if self._T1_CALL_PREFIX_RE.search(pre[-8:]) or self._T1_CALL_TAIL_RE.match(post):
                     call_hits.add(aid)
                     continue
-                # 2) 叙述尾：名字后紧跟叙述结构 → 提及，非呼叫
-                if self._T1_NARR_TAIL_RE.match(post):
+                # 2) 叙述尾：名字后紧跟叙述结构 → 提及，非呼叫（疑问句除外："夕宝在画室吗"是询问）
+                if self._T1_NARR_TAIL_RE.match(post) and not self._T1_QUESTION_RE.search(post):
                     narr_context = True
                     continue
                 # 3) 弱点名：名字为消息头，或整条消息极短（"夕"、"助手A"）→ 认
@@ -239,11 +302,11 @@ class RouterMixin:
         # ── 技术文本拦截（报错/日志）→ 有强呼叫才放行，否则让 main 处理 ──
         if self._T1_ERR_RE.search(stripped) and not call_hits:
             return None
-        # ── 单点名路由 ──
-        if len(call_hits) == 1:
-            return next(iter(call_hits))
-        if len(weak_hits) == 1 and not narr_context:
-            return next(iter(weak_hits))
+        # ── 单点名路由（2026-08-30 放宽：名字出现即路由，位置无关）──
+        # 原来要求名字在句首/有呼叫动词才命中，导致"帮我看一下助手D""最近怎么样，蒂蒂"
+        # 这类名字在句中/句尾的消息落 T2。现放宽为：单点名 + 非叙述语境 → 直接路由。
+        if len(appeared) == 1 and not narr_context:
+            return next(iter(appeared))
         # ── 领域词降级：存在叙述语境不收，报错文本不收 ──
         if not (narr_context or self._T1_ERR_RE.search(stripped)):
             for aid, words in self.T1_KEYWORDS.items():
@@ -437,6 +500,107 @@ class RouterMixin:
         return route, conf
 
     # ── 主入口（main.py 壳方法 super() 转发到此处） ────────
+    def _mode_shortcut_decision(self, event, message: str, route: str) -> bool:
+        """[模式兼容 2026-08-31] T1/T2 命中后的模式裁决：是否允许短路直发。
+
+        返回 True = 保持短路直发（原行为，call_subagent + stop_event）
+        返回 False = 放行主代理（不 stop，让 directive 注入 + parallel_handoff 模式调度）
+
+        冲突背景：T1/T2 命中直接 call_subagent 直发，绕过 tech_mode_config /
+        affection_mode_config 模式调度——技术干活任务被单发直连，顾主配置形同虚设；
+        短路后主代理 LLM 不调用，directive 强制路由指令根本没机会注入。
+
+        裁决规则（顾主配置永远优先）：
+        - 任务分类 tech（技术特征）→ 放行主代理走 tech 模式统帅收卷（relay+parallel）
+        - 任务分类 affection → 按 affection_mode_config.route_mode：
+            direct → 短路直发（贴贴快速直达）；relay → 放行主代理（回复返回主代理汇总）
+        - 无法分类（None，纯点名无特征）→ 保持短路（原行为兜底）
+        """
+        try:
+            task_kind = self._classify_directive_task(event)
+        except Exception:
+            return True
+        if task_kind == "tech":
+            return False
+        if task_kind == "affection":
+            mcfg = self._get_mode_config("affection")
+            rmode = str(mcfg.get("route_mode", "direct")).strip().lower()
+            return rmode == "direct"
+        return True
+
+    # ── 判向目标传递（2026-08-31）────────────────────────
+    # T1/T2 命中但模式裁决放行主代理时（tech 统帅收卷 / affection-relay），
+    # 把 T1/T2 判定的路由目标暂存，directive 注入时附加给主代理，
+    # 避免"裁决放行 → 判向目标丢失 → 主代理调错人/不调子代理"的断链。
+    def _record_route_suggestion(self, agent: str):
+        """记录 T1/T2 判向目标（供 directive 注入附加），30s 有效期。"""
+        self._route_suggestion = (agent, time.time())
+
+    def _pop_route_suggestion(self) -> str | None:
+        """读取未过期的判向目标建议（≤30s），过期清除。"""
+        sug = getattr(self, "_route_suggestion", None)
+        if not sug:
+            return None
+        agent, ts = sug
+        if time.time() - ts > 30:
+            self._route_suggestion = None
+            return None
+        return agent
+
+    async def _busy_bypass_check(self, event: AstrMessageEvent) -> bool:
+        """[Busy Bypass 2026-08-31] 消息入口旁路：主代理正在干活（活跃 runner）时，
+        点名子代理的消息直接直发子代理，绕过 follow-up 捕获。
+
+        背景：主代理工具链执行中（agent run 活跃）时，顾主发来的新消息会被
+        internal.py:194 的 try_capture_follow_up 吞进当前 run 的 follow-up ticket，
+        OnWaitingLLMRequestEvent（T1/T2 路由唯一入口）根本不触发，消息混入主代理
+        上下文，主代理只能边干活边手动调子代理。
+
+        本方法挂在 @filter.custom_filter(BusyRunnerFilter) 的 AdapterMessageEvent
+        handler 上（消息入口最早一站，waking_check 收集 → star_request_sub_stage
+        执行，先于 agent_sub_stage 的 follow-up 捕获）：
+        - filter 通过（该 UMO 有活跃 runner）→ 本 handler 执行
+        - T1 点名命中 → call_subagent 直发 + stop_event()，
+          stop_event 自动 set_result(MessageEventResult().stop_event())，
+          ProcessStage 后半段 `(get_result and not is_stopped) or not get_result`
+          判 False → agent_sub_stage 不再进入，follow-up 捕获被完整绕过
+        - 未命中 → 不 stop，原样放行（消息照常进 follow-up 给主代理）
+        """
+        if not self._router_enabled():
+            return False
+        message = (event.get_message_str() or "").strip()
+        if not message:
+            return False
+        # 再次确认活跃 runner（filter 通过后可能已结束，兜底）
+        if _ACTIVE_AGENT_RUNNERS is None or event.unified_msg_origin not in _ACTIVE_AGENT_RUNNERS:
+            return False
+        route = self._t1_route(message)
+        if not route:
+            return False
+        # [模式兼容 2026-08-31] 忙碌旁路同样按顾主模式配置裁决：技术干活/relay 放行主代理
+        if not self._mode_shortcut_decision(event, message, route):
+            logger.info(
+                f"[parallel_handoff] BusyBypass: T1 route -> {route} "
+                f"但模式配置要求放行主代理，跳过旁路直发"
+            )
+            # [判向传递 2026-08-31] 放行时把 T1 判向目标暂存，供 directive 注入附加
+            self._record_route_suggestion(route)
+            return False
+        self._record_route_hit(event, route)
+        logger.info(
+            f"[parallel_handoff] BusyBypass: T1 route -> {route} "
+            f"(runner active, skip follow-up capture)"
+        )
+        try:
+            await self.call_subagent(event, agent_name=route, input=message)
+        except Exception as e:
+            logger.error(
+                f"[parallel_handoff] BusyBypass direct call failed: {e}; release to main"
+            )
+            return False
+        event.stop_event()
+        return True
+
     async def _smart_router_check(self, event: AstrMessageEvent) -> bool:
         """on_waiting_llm_request 钩子实现。命中返回 True 并已 stop_event。
 
@@ -468,6 +632,17 @@ class RouterMixin:
         if not message:
             return False
         self._record_user_msg(event, message)
+        # [最高优先级 2026-09-03 顾主指定] 含连续「主代理」四字 → 无条件放行主代理（=主代理）。
+        # 跳过 T1/T1.5/T2 全部判向，任何子代理都不得接管。返回 False 表示不短路、不 stop_event，
+        # 消息自然落回主代理路径。登记路由历史防止 T1.5 后续承接接到子代理。
+        if self._MAIN_TOKEN_RE.search(message):
+            logger.info(
+                f"[parallel_handoff] SmartRouter: 消息含「主代理」→ 最高优先级放行主代理（不路由子代理）"
+            )
+            # 清掉该会话的续接记忆，避免后续承接句被 T1.5 续给错误子代理
+            last, _ = self._route_mem()
+            last.pop(event.unified_msg_origin, None)
+            return False
         t0 = time.perf_counter()
         # T1 点名 / 领域词
         route = self._t1_route(message)
@@ -484,7 +659,27 @@ class RouterMixin:
             source = "T2"
         if not route or conf < self._router_threshold():
             return False
+        # [模式兼容 2026-08-31] T1/T2 命中后按顾主模式配置裁决：
+        # 技术干活任务（tech 特征）→ 放行主代理走 tech 模式统帅收卷（relay+parallel），
+        # 避免 T1/T2 短路把任务变成 direct 单发、绕过顾主模式配置；
+        # 贴贴任务 → 按 affection_mode_config.route_mode：direct 短路直发，relay 放行主代理。
+        if not self._mode_shortcut_decision(event, message, route):
+            logger.info(
+                f"[parallel_handoff] SmartRouter: {source} route -> {route} "
+                f"但模式配置要求放行主代理（统帅收卷/relay），不短路"
+            )
+            # [判向传递 2026-08-31] 放行时把 T1/T2 判向目标暂存，供 directive 注入附加
+            self._record_route_suggestion(route)
+            return False
         self._record_route_hit(event, route)
+        # [读空气·段二·低侵入 2026-09-03] 自动路由要短路抢派子代理前，请读空气看一眼
+        # 是否倾向"主代理自然接住"（宁静权）。段二仅输出观察日志，绝不实际拦截路由；
+        # 等三期随机性日常补齐后再实验性开启真实克制。总开关默认关，此调用零开销。
+        try:
+            if hasattr(self, "_arbitrate_directive") and self._read_air_enabled():
+                self._arbitrate_directive(event, message, route, True)
+        except Exception as _arb_e:
+            logger.warning(f"[read_air] arbitrate observe skipped (non-fatal): {_arb_e}")
         logger.info(
             f"[parallel_handoff] SmartRouter: {source} route -> {route} "
             f"(conf={conf:.2f}, thr={self._router_threshold()}, "
