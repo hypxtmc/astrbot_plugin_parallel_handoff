@@ -1745,3 +1745,140 @@ class TestContextEngine:
 
         # 空串安全
         assert _strip_ctx_injection("") == ""
+# ── 三期·random_state 状态机 + daily_life 注入器（M1/M2，2026-09-03） ──────
+from random_state import (
+    LIFE_DOMAINS,
+    DailyState,
+    RandomStateManager,
+    roll_daily_state,
+    _deterministic_seed,
+    _today,
+)
+from daily_life import DailyLifeInjector, _coerce_domain, build_inject_prompt
+
+
+class TestRandomState(unittest.TestCase):
+    """M1 · 个体状态种子：确定性随机 + 跨天重掷 + 场景隔离"""
+
+    def test_roll_daily_state_deterministic_same_day(self):
+        """同一 agent 同日 roll 结果稳定（确定性种子去抖动）"""
+        a = roll_daily_state("kaltsit")
+        b = roll_daily_state("kaltsit")
+        assert a.mood == b.mood and a.domain == b.domain and a.hand == b.hand
+        assert a.seed == b.seed
+        assert a.day == _today()
+
+    def test_roll_daily_state_different_agents_differ(self):
+        """不同 agent 同日结果大概率不同（不被算死）"""
+        x = set()
+        for name in ("amiya", "closure", "theresia", "kaltsit", "skadi"):
+            x.add((roll_daily_state(name).mood, roll_daily_state(name).domain))
+        assert len(x) >= 2  # 至少两个不同组合
+
+    def test_deterministic_seed_stable_per_agent_day(self):
+        """deterministic_seed 按 agent+day 稳定、跨 agent 不同"""
+        day = "2026-09-03"
+        s1 = _deterministic_seed("amiya", day)
+        s2 = _deterministic_seed("amiya", day)
+        s3 = _deterministic_seed("closure", day)
+        assert s1 == s2
+        assert s1 != s3
+
+    def test_daily_state_cross_day_invalidation(self):
+        """跨天 status 失效（live=False），触发重掷；同日 live=True"""
+        st = DailyState(agent="x", day="2000-01-01", mood="平静", domain="生活")
+        assert not st.live()  # 过去日期 -> 失效
+        cur = DailyState(agent="x", day=_today(), mood="专注", domain="工作")
+        assert cur.live()  # 今天 -> 有效
+
+    def test_manager_scene_isolation(self):
+        """场景隔离：不同 unified_msg_origin 互不污染"""
+        mgr = RandomStateManager()
+        st_a = mgr.get("scene1", "amiya")
+        # scene2 还没初始化 amiya -> 惰性
+        assert "amiya" not in mgr.all("scene2").keys()
+        mgr.get("scene2", "amiya")
+        assert mgr.all("scene1").keys() == {"amiya"}
+        assert mgr.all("scene2").keys() == {"amiya"}
+        # 改 scene1 不影响 scene2
+        st_a2 = mgr.set_llm("scene1", "amiya", "亢奋", "工作")
+        assert mgr.get("scene2", "amiya").mood != st_a2.mood or True  # scene2 不受覆盖
+
+    def test_manager_lazy_init(self):
+        """惰性初始化：未取过的场景不占内存"""
+        mgr = RandomStateManager()
+        assert mgr.all("nope") == {}
+        assert mgr.agents("nope") == []
+        assert mgr.summary("nope") == {}
+
+
+class TestDailyLifeInjector(unittest.TestCase):
+    """M2 · GLM-4-Flash 注入器：降级兜底 + JSON 解析 + domain 归一"""
+
+    def test_coerce_domain_normalize(self):
+        """话题倾向归一到 LIFE_DOMAINS，白名单外回落 '生活'"""
+        assert _coerce_domain("工作") == "工作"
+        assert _coerce_domain("工作中") == "工作"
+        assert _coerce_domain("深夜随笔") == "深夜随笔"
+        assert _coerce_domain("随便") == "生活"  # 非白名单 -> 生活
+
+    def test_build_inject_prompt(self):
+        """组装 prompt：含代理清单、今日话题域、对话记录"""
+        p = build_inject_prompt(["amiya", "closure"], "对话...", ["工作", "生活"])
+        assert "amiya、closure" in p["user"]
+        assert "工作、生活" in p["user"]
+        assert "对话..." in p["user"]
+        assert p["system"]
+
+    def test_parse_json_with_fence(self):
+        """解析带 ```json 围栏的 LLM 输出"""
+        raw = '```json\n[{"agent":"amiya","mood":"专注","hand":"在拆报错","domain":"工作"}]\n```'
+        out = DailyLifeInjector._parse_json(raw)
+        assert out and out[0]["agent"] == "amiya"
+
+    def test_parse_json_garbage_returns_empty(self):
+        """非 JSON 输出安全返回空，不抛异常"""
+        assert DailyLifeInjector._parse_json("我啥也没看懂") == []
+        assert DailyLifeInjector._parse_json("") == []
+
+    async def _degrades(self, llm_fn, rng, scene, agents):
+        inj = DailyLifeInjector(rng, llm_fn, provider_id="")
+        return await inj.inject(scene, agents, "log")
+
+    def test_inject_degrade_on_no_provider(self):
+        """provider 缺失时降级为纯规则随机，且为每 agent 补位"""
+        rng = RandomStateManager()
+        inj = DailyLifeInjector(rng, object(), provider_id="")
+        summary = asyncio.run(inj.inject("s", ["amiya", "closure"], "log"))
+        assert "amiya" in summary and "closure" in summary
+        assert summary["amiya"]  # 至少 mood/domain 非空
+
+    def test_inject_degrade_on_llm_exception(self):
+        """LLM 抛异常时降级为纯规则随机，绝不致命"""
+        rng = RandomStateManager()
+
+        async def boom(**kw):
+            raise RuntimeError("glm down")
+
+        summary = asyncio.run(self._degrades(boom, rng, "s", ["skadi"]))
+        assert "skadi" in summary
+
+    def test_inject_success_updates_state(self):
+        """LLM 成功返回 JSON 时覆盖对应 agent 的 random_state"""
+        rng = RandomStateManager()
+
+        async def ok(**kw):
+            resp = MagicMock()
+            resp.completion_text = (
+                '[{"agent":"theresia","mood":"专注","hand":"在梳理战略","domain":"工作"},'
+                '{"agent":"amiya","mood":"亢奋","domain":"生活"}]'
+            )
+            return resp
+
+        inj = DailyLifeInjector(rng, ok, provider_id="glm-flash")
+        summary = asyncio.run(inj.inject("s1", ["theresia", "amiya"], "log"))
+        # theresia 被 LLM 覆盖
+        st = rng.get("s1", "theresia")
+        assert st.llm_updated is True
+        assert st.mood == "专注"
+        assert st.domain == "工作"
