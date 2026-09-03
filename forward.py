@@ -43,10 +43,50 @@ class ForwardMixin:
         try:
             prefix = ""
             content = text
+            # [2026-08-30 主代理] 子代理转发走 send_message 直发，
+            # 不经过 on_decorating_result（那里只覆盖主代理回复），
+            # 表格分隔行居中必须在此兜底，否则子代理表格全部左对齐。
+            content = self._force_table_center(content)
             prefix_match = re.match(r"^(【[^】]+】)\n", text)
             if prefix_match:
                 prefix = prefix_match.group(1)
                 content = text[prefix_match.end():]
+            # [2026-08-30 主代理 v2] 代码块完整性（冻结-恢复）：分段前把 ``` 代码块
+            # 冻结为哨兵 token，分段后还原——纯文本保持原叙述分段节奏（括号/空行/换行），
+            # 代码块整块不被切断。
+            _fences = []
+
+            def _freeze_fence(t):
+                def _rep(m):
+                    _fences.append(m.group(0))
+                    return f"\x00CB{len(_fences) - 1}\x00"
+                # 1) 代码块整体冻结
+                t = re.sub(r"```.*?```", _rep, t, flags=re.S)
+                # 2) 表格块（连续 | 行）整体冻结，防叙述分段按行切碎表格
+                _lines = t.split("\n")
+                _out = []
+                _i = 0
+                while _i < len(_lines):
+                    if _lines[_i].strip().startswith("|"):
+                        _blk = [_lines[_i]]
+                        _j = _i + 1
+                        while _j < len(_lines) and _lines[_j].strip().startswith("|"):
+                            _blk.append(_lines[_j])
+                            _j += 1
+                        _fences.append("\n".join(_blk))
+                        _out.append(f"\x00CB{len(_fences) - 1}\x00")
+                        _i = _j
+                    else:
+                        _out.append(_lines[_i])
+                        _i += 1
+                return "\n".join(_out)
+
+            def _thaw_fence(t):
+                for _i, _f in enumerate(_fences):
+                    t = t.replace(f"\x00CB{_i}\x00", _f)
+                return t
+
+            content = _freeze_fence(content)
             if "（" in content:
                 raw_segments = re.split(r"(（[^）]*）)", content)
                 raw_segments = [s.strip() for s in raw_segments if s.strip()]
@@ -76,6 +116,7 @@ class ForwardMixin:
                 if len(segments) == 1:
                     segments = content.split("\n")
                 segments = [s.strip() for s in segments if s.strip()]
+            segments = [_thaw_fence(s) for s in segments]
             for idx, seg_text in enumerate(segments):
                 if idx == 0 and prefix:
                     msg = f"{prefix}\n{seg_text}"
@@ -105,6 +146,111 @@ class ForwardMixin:
                     full_text += text
         return full_text.strip()
 
+    def _zh_fullwidth_sentinel(self, text: str) -> str:
+        """[2026-08-27 标点哨兵] 中文叙述半角标点→全角兜底。
+
+        把叙述文本中的半角标点（, . ? ! ; : ( )）转为全角。
+        豁免区：代码块、行内代码、LaTeX 公式（$ $$ \( \) \begin{}）、
+        URL、Windows/Linux 路径、数字串（保留小数点与千分位）。
+        采用区间法：一次收集所有保护区间的起止，只转换区间外的叙述文本，
+        避免“token 再被后续 pattern 污染”的嵌套问题。幂等。
+        """
+        if not text:
+            return text
+
+        # ── 保护区pattern（与分类逻辑同源,覆盖面一致） ──
+        guards = [
+            re.compile(r"```[\s\S]*?```"),                      # 代码块
+            re.compile(r"`[^`\n]+`"),                            # 行内代码
+            re.compile(r"\$\$[\s\S]*?\$\$"),                     # $$ 公式
+            re.compile(r"(?<!\$)\$[^$\n]+\$(?!\$)"),            # $ 公式
+            re.compile(r"\\\([\s\S]*?\\\)"),                     # \( \) 公式
+            re.compile(r"\\begin\{[a-zA-Z]+\}[\s\S]*?\\end\{[a-zA-Z]+\}"),  # 环境
+            re.compile(r"https?://[^\s<>\"'）\]]+"),            # URL
+            re.compile(r"[A-Za-z]:\\[^\s\"'<>]+"),              # Win 路径
+            re.compile(r"(?:/[\w\-.,/]+|~/[\w\-.,/]+|[\w\-.]+\.(?:py|js|ts|json|md|txt|sh|yaml|yml|ini|toml|xml|log|db|so|whl|zip|docx?|pptx?|xlsx?|pdf))"),  # 类路径
+            re.compile(r"\d[\d.,]*"),                           # 数字串
+        ]
+        spans = []
+        for pat in guards:
+            for m in pat.finditer(text):
+                spans.append((m.start(), m.end()))
+        if spans:
+            spans.sort()
+            merged = []
+            for s, e in spans:
+                if merged and s <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+                else:
+                    merged.append((s, e))
+        else:
+            merged = []
+
+        # ── 对保护区外分段做转换 ──
+        trans = str.maketrans({
+            ",": "，", "?": "？", "!": "！", ";": "；",
+            "(": "（", ")": "）",
+        })
+        out = []
+        pos = 0
+        for s, e in merged:
+            if s > pos:
+                out.append(self._convert_punct_segment(text[pos:s], trans))
+            out.append(text[s:e])
+            pos = e
+        if pos < len(text):
+            out.append(self._convert_punct_segment(text[pos:], trans))
+        return "".join(out)
+
+    @staticmethod
+    def _convert_punct_segment(seg: str, trans: dict) -> str:
+        """对一段不含保护区的纯叙述文本做全角化。静态方法,便于测试。"""
+        seg = seg.translate(trans)
+        # 冒号仅在(隔空白后)后面跟中文/中文引号时转(避开 a:b、时间 12:30、协议头)
+        seg = re.sub(r":(?=\s*[\u4e00-\u9fff\u201c\u300c\u300e\uff08\u0028])", "：", seg)
+        # 句点仅前后均非字母数字时转(避开版本号 1.2.3、扩展名)
+        seg = re.sub(r"(?<![A-Za-z0-9])\.(?![A-Za-z0-9])", "。", seg)
+        # 全角标点后紧邻半角空格清理(中文标点后不留空格)
+        seg = re.sub(r"([，。！？；：）]) +", r"\1", seg)
+        return seg
+
+    @staticmethod
+    def _force_table_center(text: str) -> str:
+        """[2026-08-29] 表格分隔行统一居中：| --- | 变体 → |:---:|
+
+        挂在 on_decorating_result 出口对链文本全量生效(非流式),不依赖模型记忆。
+        幂等:重建后的分隔行再次经过本函数结果不变。
+        只处理含管道符的分隔行(GFM 表格);单行裸 --- 是分割线,不碰;
+``` 围栏代码块与该行含反引号的行内代码不碰。
+        """
+        # [2026-08-30 修正] 兼容 2 横线分隔行（|--|、|:--:|），模型常见写法
+        if "|" not in text or "--" not in text:
+            return text
+        # GFM 表格分隔行：每格为 :?-{3,}:?，至少两格，整行无其他正文
+        # [2026-08-29 修正] 格内前后允许空白，兼容 "| :---: | :---: |" 与混合对齐写法
+        # tail 的 \s* 须在 :? 之前（与 cell 一致），否则 " :---" 空格+冒号开头无法匹配
+        # [2026-08-30 修正] -{3,} → -{2,}：兼容 |:--|、|--| 等 2 横线分隔行
+        sep = re.compile(
+            r"^\s*\|?\s*(?:\s*:?\s*-{2,}\s*:?\s*\|)+\s*:?\s*-{2,}\s*:?\s*\|?\s*$"
+        )
+        out_lines = []
+        in_fence = False
+        for line in text.split("\n"):
+            s = line.strip()
+            if s.startswith("```"):
+                in_fence = not in_fence
+                out_lines.append(line)
+                continue
+            if in_fence or "`" in line:
+                out_lines.append(line)
+                continue
+            if sep.match(line):
+                cells_n = max(1, len([c for c in line.split("|") if c.strip()]))
+                out_lines.append("|" + "|".join([":---:"] * cells_n) + "|")
+            else:
+                out_lines.append(line)
+        return "\n".join(out_lines)
+
     def _looks_like_markdown(self, text: str) -> bool:
         """[方案B 2026-08-19] 检测文本是否含 markdown 语法特征。
 
@@ -132,9 +278,8 @@ class ForwardMixin:
             # 代码块围栏
             if s.startswith("```"):
                 return True
-        # 行内特征：加粗 / 斜体 / 行内代码 / 链接 / 图片
-        if re.search(r"\*\*[^*]+\*\*", text) or re.search(r"__[^_]+__", text):
-            return True
+        # 行内特征：行内代码 / 链接 / 图片
+        # 注意：**加粗** 和 __斜体__ 不触发 md 渲染路径，避免闲聊/色情误判
         if re.search(r"`[^`\n]+`", text):
             return True
         if re.search(r"!?\[[^\]]*\]\([^)\s]+\)", text):
@@ -199,24 +344,377 @@ class ForwardMixin:
         prev_type = None
         for seg_type, seg in merged:
             if prev_type is not None:
-                if seg_type != prev_type:
-                    # 块类型转换处：formula/latex 边界用重等号线 ═×21，其余用粗线 ━×21
-                    if seg_type in ("formula", "latex") or prev_type in ("formula", "latex"):
-                        new_parts.append("---")
-                    else:
-                        new_parts.append("---")
-                elif seg_type in ("formula", "latex") and prev_type in ("formula", "latex"):
-                    # [2026-08-19] 连续不同公式之间用普通水平线 --- 分割（说明+公式内部保持一体不分割）
-                    new_parts.append("---")
-            # ◆ 公式 标签：只在独立公式（无说明文字跟随）时加，避免重复繁杂
-            if seg_type == "latex":
-                new_parts.append("◆ 公式")
+                # [2026-08-29 顾主定规] markdown 渲染消息内每个分段之间无条件插分割线,
+                # 不再限定类型变化处;同类型相邻段也插,看消息更整齐。纯文本消息不走本函数。
+                new_parts.append("---")
             new_parts.append(seg)
             prev_type = seg_type
         new_content = "\n\n".join(new_parts)
         if new_content != full_text:
             # 注意：result.chain 是组件列表（list），不是 MessageChain 对象
             result.chain = [Plain(new_content)]
+
+    _BLOCK_RE = re.compile(
+        r"(?P<code>```[^\n]*\n[\s\S]*?```(?:\n|$))"
+        r"|(?P<latexenv>\\begin\{[a-zA-Z]+\}[\s\S]*?\\end\{[a-zA-Z]+\}(?:\n|$))"
+        r"|(?P<ddot>\$\$[\s\S]*?\$\$(?:\n|$))"
+    )
+
+    def _split_by_block_type(self, full_text: str) -> list:
+        """[2026-08-27 类型拆条] 按块级代码/公式/叙述切分消息。
+
+        返回 [(type, text)]：
+          type ∈ {"text","code","latexenv","ddot"}
+          text  = 叙述段(纯文本，可能含行内 md 但无块级)
+          code  = ``` fenced 代码块整体
+          latexenv = \begin{}...\end{} 块级公式
+          ddot  = $$...$$ 块级公式
+        相邻 text 自动合并，保证叙述是一个整体。
+        """
+        blocks = []
+        pos = 0
+        for m in self._BLOCK_RE.finditer(full_text):
+            if m.start() > pos:
+                blocks.append(("text", full_text[pos:m.start()].strip()))
+            kind = next(k for k in ("code", "latexenv", "ddot") if m.group(k) is not None)
+            blocks.append((kind, m.group(0).strip()))
+            pos = m.end()
+        if pos < len(full_text):
+            blocks.append(("text", full_text[pos:].strip()))
+        merged = []
+        for k, v in blocks:
+            if v and k == "text" and merged and merged[-1][0] == "text":
+                merged[-1] = ("text", merged[-1][1] + "\n\n" + v)
+            elif v:
+                merged.append((k, v))
+        return merged
+
+    def _is_document_style(self, full_text: str) -> bool:
+        """[2026-08-28 主代理] 完整文档型消息判定。
+
+        类型拆条的本意是"叙述+独立代码块"的闲聊式回复（像人发消息）；
+        但结构化文档（多级标题/标题+表格+代码块）是排版整体，拆成
+        碎条后纯文本段落失渲染、标题层级全毁——应走整条渲染。
+        命中返回 True → _send_split_by_type 让位交回老路径。
+        """
+        try:
+            if not full_text:
+                return False
+            lines = full_text.splitlines()
+            headings = [ln for ln in lines if re.match(r"^#{1,6}\s+\S", ln.strip())]
+            if len(headings) >= 2:
+                return True
+            if headings and "```" in full_text and "|" in full_text:
+                return True
+            return False
+        except Exception:
+            return False
+
+    async def _send_split_by_type(self, result, event, full_text) -> bool:
+        """[2026-08-27 类型拆条] 叙述/代码/公式各发各的，别揉成一条大 md 消息。
+
+        触发条件:消息里同时存在块级代码/公式( code/latexenv/ddot )与叙述(text)，
+        即"混排"。此时:
+          - text 段 → 含 md 语法的走 markdown 渲染单条，纯叙述走纯文本单条
+            （都像人正常发消息，不再是半屏卡片夹在长文里）
+          - code/ddot/latexenv → 各自独立一条走 markdown 渲染
+        不适用(纯叙述/纯块/仅表格)时返回 False，交回 _send_md_split_sections 等旧逻辑。
+        """
+        try:
+            # [2026-08-28 主代理] 完整文档型消息豁免类型拆条：
+            # 多级标题/标题+表格+代码块的结构化文档走整条渲染，避免碎条失渲染
+            if self._is_document_style(full_text):
+                return False
+            blocks = self._split_by_block_type(full_text)
+            if not blocks:
+                return False
+            codeish = [b for b in blocks if b[0] != "text"]
+            textish = [b for b in blocks if b[0] == "text"]
+            # 必须"混排":没有强块(代码/latex环境)或没有叙述,不拆(老路径整条渲染)。
+            # 2026-08-27 收紧:单独的 $$ 块公式算"轻块"——数学题解常见
+            # "短句+$$公式"交错,拆开反断裂,应整条渲染;代码/强公式环境才拆条。
+            strong = [b for b in blocks if b[0] in ("code", "latexenv")]
+            textish = [b for b in blocks if b[0] == "text"]
+            if not strong or not textish:
+                return False
+
+            sent_any = False
+            fixed_iv = self.config.get("fragment_interval", None)
+            for idx, (btype, btext) in enumerate(blocks):
+                try:
+                    if btype == "text":
+                        if self._looks_like_markdown(btext) or self._looks_like_latex(btext):
+                            chain = MessageChain([Plain(btext)])
+                            chain.use_markdown_ = True
+                            await event.send(chain)
+                        else:
+                            await self.context.send_message(
+                                event.unified_msg_origin,
+                                MessageChain([Plain(btext)]),
+                            )
+                    else:
+                        chain = MessageChain([Plain(btext)])
+                        chain.use_markdown_ = True
+                        await event.send(chain)
+                    sent_any = True
+                except Exception as e:
+                    logger.error(f"[inject_mainagent_prefix][type-split] 块{idx}发送失败，跳过: {e}")
+                    continue
+                if fixed_iv is not None:
+                    iv = float(fixed_iv)
+                elif idx == 0:
+                    iv = 0.1
+                else:
+                    iv = min(0.12 + len(btext) * 0.005, 0.72)
+                await asyncio.sleep(iv)
+            if not sent_any:
+                return False
+            result.chain.clear()
+            return True
+        except Exception as e:
+            logger.error(f"[inject_mainagent_prefix][type-split] 异常，回退旧逻辑: {e}")
+            return False
+
+    def _split_long_segment(self, seg_text: str, soft: int = 80, hard: int = 900) -> list:
+        """[2026-08-27 03:08 优化①③] 段内句子级拆分+超长兜底。
+
+        段无横线且超过 soft 字时按句末标点拆成语块（一句一消息）；
+        单个语块再超 hard 字时硬切，防止顶到 QQ 富文本单条上限。
+        含横线段保持原样——它走被动 markdown 渲染，拆开会毁水平线。
+        """
+        _hr_local = re.compile(r"^(-{1,}|\*{1,}|_{1,})$")
+        for line in seg_text.split("\n"):
+            if _hr_local.match(line.strip()):
+                return [seg_text]
+        if len(seg_text) <= soft:
+            return [seg_text]
+        parts = re.split(r"([。！？!?；;…]+)", seg_text)
+        pieces, buf = [], ""
+        for i in range(0, len(parts) - 1, 2):
+            buf += parts[i] + (parts[i + 1] if i + 1 < len(parts) else "")
+            if len(buf) >= soft:
+                pieces.append(buf.strip())
+                buf = ""
+        if buf.strip():
+            pieces.append(buf.strip())
+        elif parts and parts[-1].strip():
+            pieces.append(parts[-1].strip())
+        if not pieces:
+            pieces = [seg_text]
+        out = []
+        for piece in pieces:
+            if len(piece) <= hard:
+                out.append(piece)
+            else:
+                for i in range(0, len(piece), hard):
+                    out.append(piece[i:i + hard])
+        return [p for p in out if p.strip()]
+
+    def _md_split_segments(self, full_text: str, budget: int) -> list:
+        """[2026-08-27 03:1x 优化④] markdown 结构边界拆段。
+
+        只在安全断点切：块级空行、ATX 标题、围栏代码块闭合/开启处、
+        公式区($$ / \\(...\\) / $...$)、表格整块；
+        列表/引用连续合并为一条，中间不拆。样式保证：单条内结构完整，
+        代码块/表格/公式绝不被拦腰剁开，超预算时整块放行（渲染优先于切分）。
+        """
+        lines = full_text.split("\n")
+        blocks = []          # 结构原子块
+        cur = []             # 当前累积行
+        cur_kind = None      # text / heading / list / quote / table / fence
+        fence_active = False
+
+        def flush():
+            nonlocal cur, cur_kind
+            if cur:
+                blocks.append("\n".join(cur).rstrip())
+                cur, cur_kind = [], None
+
+        def is_fence(line):
+            s = line.strip()
+            return s.startswith("```") or s.startswith("~~~")
+
+        def is_heading(line):
+            return bool(re.match(r"^#{1,6}\s+", line.strip()))
+
+        def is_table_line(line):
+            # 表格要求含 | 且首行有分隔行（---）跟随——保守起见：连续含 | 行成块
+            return "|" in line
+
+        def is_list(line):
+            return bool(re.match(r"^\s*(?:[-*+]|\d+[.、])\s+\S", line.strip()))
+
+        def is_quote(line):
+            return re.match(r"^>\s?", line.strip()) is not None
+
+        def is_latex_fence(line):
+            s = line.strip()
+            return s.startswith("$$") or s.startswith("\\(") or s.startswith("\\[")
+
+        i = 0
+        n = len(lines)
+        while i < n:
+            line = lines[i]
+            s = line.strip()
+            if fence_active:
+                cur.append(line)
+                if is_fence(line):
+                    fence_active = False
+                    flush()   # 代码块整体一条，闭合即落盘
+                i += 1
+                continue
+            if not s:
+                flush()  # 块级空行 = 安全断点
+                i += 1
+                continue
+            if is_fence(line):
+                flush()
+                cur.append(line)
+                cur_kind = "fence"
+                fence_active = True
+                i += 1
+                continue
+            if is_latex_fence(line):
+                cur.append(line)
+                cur_kind = cur_kind or "latex"
+                # 块级公式整体吞行直到闭块（$$ 配对或 \)）
+                j = i + 1
+                while j < n:
+                    cur.append(lines[j])
+                    ls = lines[j].strip()
+                    if s.startswith("$$") and ls.endswith("$$") and j > i:
+                        break
+                    if s.startswith("\\(") and ls.endswith("\\)"):
+                        break
+                    if s.startswith("\\[") and ls.endswith("\\]"):
+                        break
+                    j += 1
+                flush()
+                i = j + 1
+                continue
+            if is_heading(line):
+                flush()
+                cur.append(line)
+                cur_kind = "heading"
+                # 标题吞并后续同段文本直到空行/下一结构边界（标题=新条起点）
+                k = i + 1
+                while k < n and lines[k].strip():
+                    nxt = lines[k].strip()
+                    if is_fence(lines[k]) or is_heading(lines[k]) or is_latex_fence(lines[k]) or is_table_line(lines[k]):
+                        break
+                    if is_list(nxt) or is_quote(nxt):
+                        break
+                    cur.append(lines[k])
+                    k += 1
+                flush()
+                i = k
+                continue
+            if is_table_line(line):
+                if cur_kind != "table":
+                    flush()
+                    cur_kind = "table"
+                cur.append(line)
+                # 连续含 | 行归并为一张表，遇空行/下一结构 flush
+                k = i + 1
+                while k < n and is_table_line(lines[k]) and lines[k].strip():
+                    cur.append(lines[k])
+                    k += 1
+                flush()
+                i = k
+                continue
+            # 列表/引用：连续同类合并
+            if is_list(line) or is_quote(line):
+                kind = "list" if is_list(line) else "quote"
+                if cur_kind != kind:
+                    flush()
+                    cur_kind = kind
+                cur.append(line)
+                k = i + 1
+                while k < n:
+                    nxt = lines[k].strip()
+                    if not nxt:
+                        break
+                    if kind == "list" and (is_list(nxt) or nxt.startswith("  ") or nxt.startswith("\t")):
+                        cur.append(lines[k]); k += 1; continue
+                    if kind == "quote" and is_quote(lines[k]):
+                        cur.append(lines[k]); k += 1; continue
+                    break
+                flush()
+                i = k
+                continue
+            # 普通文本
+            if cur_kind is None:
+                cur_kind = "text"
+            cur.append(line)
+            i += 1
+        flush()
+
+        # 按预算打包：块不拆开，装不下就整块另起一条（代码块/表格/公式渲染优先）
+        messages, buf = [], ""
+        for blk in blocks:
+            if buf and len(buf) + 1 + len(blk) <= budget:
+                buf += "\n\n" + blk
+            else:
+                if buf:
+                    messages.append(buf)
+                buf = blk
+        if buf:
+            messages.append(buf)
+        # 拆不出（整体<=预算）返回空表,由调用方走 prefK 整条渲染
+        return messages if len(messages) > 1 else []
+
+    async def _send_md_split_sections(self, result, event, full_text) -> bool:
+        """[2026-08-27 03:1x 优化④] markdown 长消息按结构边界分段直发。
+
+        依赖配置：mainagent_md_split_max_chars（默认 900）、
+        mainagent_disable_md_split（默认 False,True 则永远走 prefK 整条渲染）。
+        发送：全部走被动 markdown 路径（event.send + use_markdown_），
+        与 prefK 验证过的渲染通道一致；第 2 条起加 ▍续 N/M 进度前缀。
+        返回 True=已拆分发送并清链；False=不宜拆分（未开启/太短/未用 markdown），
+        由调用方回退到 _inject_section_dividers 整条渲染。
+        """
+        try:
+            if self.config.get("mainagent_disable_md_split", False):
+                return False
+            budget = int(self.config.get("mainagent_md_split_max_chars", 900))
+            if budget <= 0:
+                return False
+            if not (self._looks_like_markdown(full_text) or self._looks_like_latex(full_text)):
+                return False
+            messages = self._md_split_segments(full_text, budget)
+            if not messages:
+                return False
+            total = len(messages)
+            # 进度前缀（2026-08-27 起默认关）：顾主嫌 ▍续 N/M 打头傻。
+            # 配置 mainagent_md_split_progress=True 可恢复旧行为。
+            if self.config.get("mainagent_md_split_progress", False):
+                for i in range(1, total):
+                    messages[i] = f"\n▍续 {i + 1}/{total}\n\n" + messages[i]
+            sent_any = False
+            fixed_iv = self.config.get("fragment_interval", None)
+            for idx, msg in enumerate(messages):
+                try:
+                    chain = MessageChain([Plain(msg)])
+                    chain.use_markdown_ = True
+                    await event.send(chain)
+                    sent_any = True
+                except Exception as e:
+                    logger.error(f"[inject_mainagent_prefix][md] 第{idx + 1}条发送失败，跳过: {e}")
+                    continue
+                if fixed_iv is not None:
+                    iv = float(fixed_iv)
+                elif idx == 0:
+                    iv = 0.1
+                else:
+                    iv = min(0.15 + len(msg) * 0.006, 0.85)
+                await asyncio.sleep(iv)
+            if not sent_any:
+                return False
+            result.chain.clear()
+        except Exception as e:
+            logger.error(f"[inject_mainagent_prefix][md] 拆分异常，回退整条渲染: {e}")
+            return False
+        return True
 
     async def _send_mainagent_segmented(self, result, event) -> bool:
         """主代理回复分段发送：按空行拆分，段落数>1时逐条直发。
@@ -242,9 +740,21 @@ class ForwardMixin:
         if normalized != full_text:
             full_text = normalized
             result.chain = [Plain(full_text)]  # 同步链，保证 return False 路径也生效
-        # [方案D 2026-08-19] 含 markdown/latex 时：一条消息内插入区域分割线（---），
-        # 区分纯文本/markdown/latex 区域，交给正常管线整条发送渲染
+        # [方案D 2026-08-19 + 优化④ 2026-08-27 + 类型拆条 2026-08-27]
+        # 含 markdown/latex 时:
+        #   1) 先试"按块类型拆条"(叙述/代码/公式各发一条,像人发消息);
+        #   2) 不适合时回退结构边界分段直发(_send_md_split_sections,拆出>=2条才走);
+        #   3) 再不行回退 _inject_section_dividers 整条渲染,保持旧行为。
         if self._looks_like_markdown(full_text) or self._looks_like_latex(full_text):
+            # [2026-08-28 主代理] 文档型消息（多级标题/标题+表格+代码块）——
+            # 完整排版整体，不参与任何拆条，直接整条渲染（类型拆条/900字分段都不碰）
+            if self._is_document_style(full_text):
+                self._inject_section_dividers(result, full_text)
+                return False
+            if await self._send_split_by_type(result, event, full_text):
+                return True
+            if await self._send_md_split_sections(result, event, full_text):
+                return True
             self._inject_section_dividers(result, full_text)
             return False
         # [2026-08-20 01:46 重写] 分段规则（顾主定稿）：按行扫描，横线行即分段信号——
@@ -303,6 +813,9 @@ class ForwardMixin:
             segments = [s for s in segments if s.strip()]
         else:
             segments = [s.strip() for s in full_text.split("\n\n") if s.strip()]
+        # [2026-08-27 03:08 优化①③] 句子级拆分包：超长无横线段按句标点二次拆，
+        # 单块超 900 字硬切——拆到最后真正的"段"再判数量
+        segments = [p for seg in segments for p in self._split_long_segment(seg)]
         if len(segments) <= 1:
             return False
         try:
@@ -310,31 +823,48 @@ class ForwardMixin:
             prefix_str = ""
             if add_prefix:
                 prefix_str = f"【{self._cfg('main_agent_name', '主代理')}】\n"
+            sent_any = False
+            fixed_iv = self.config.get("fragment_interval", None)
             for idx, seg_text in enumerate(segments):
                 msg = seg_text
                 if idx == 0 and prefix_str and not msg.startswith("【"):
                     msg = f"{prefix_str}{seg_text}"
                 has_hr = any(_hr_line.match(l.strip()) for l in msg.split("\n") if l.strip())
-                if has_hr:
-                    # [2026-08-20 preK] 含横线段的段走被动 markdown 路径（event.send）：
-                    # 主动 markdown 通道（send_markdown_content）不渲染 ---，
-                    # 被动回复通道（_send_text_reply use_markdown=True）渲染为真水平线（方案 D 验证过）
-                    chain = MessageChain([Plain(msg)])
-                    chain.use_markdown_ = True
-                    await event.send(chain)
+                try:
+                    if has_hr:
+                        # [2026-08-20 preK] 含横线段的段走被动 markdown 路径（event.send）：
+                        # 主动 markdown 通道（send_markdown_content）不渲染 ---，
+                        # 被动回复通道（_send_text_reply use_markdown=True）渲染为真水平线（方案 D 验证过）
+                        chain = MessageChain([Plain(msg)])
+                        chain.use_markdown_ = True
+                        await event.send(chain)
+                    else:
+                        await self.context.send_message(
+                            event.unified_msg_origin,
+                            MessageChain([Plain(msg)]),
+                        )
+                    sent_any = True
+                except Exception as e:
+                    # [2026-08-27 03:08 优化⑤] 段级容错：单段失败只 log 跳过，
+                    # 不中断后续段；所有段都发不出（sent_any=False）才交还链兜底
+                    logger.error(f"[inject_mainagent_prefix] 段{idx}发送失败，跳过: {e}")
+                    continue
+                # [2026-08-27 03:08 优化②] 动态步长：未显式配置 fragment_interval 时
+                # 按字数算——短句快、长句慢，像真人打字；首段固定 0.1s 抢首屏
+                if fixed_iv is not None:
+                    iv = float(fixed_iv)
+                elif idx == 0:
+                    iv = 0.1
                 else:
-                    await self.context.send_message(
-                        event.unified_msg_origin,
-                        MessageChain([Plain(msg)]),
-                    )
-                await asyncio.sleep(self.config.get("fragment_interval", 0.3))
+                    iv = min(0.15 + len(msg) * 0.006, 0.85)
+                await asyncio.sleep(iv)
         except Exception as e:
             logger.error(f"[inject_mainagent_prefix] 分段发送失败: {e}")
             # [修复 2026-08-16] 分段已发出部分段时禁止 return False——那会触发
             # 框架兜底重发整条，造成重复（NapCat sendMsg 超时 retcode 1200 场景
             # 消息可能实际已送达）。仅当一段都未发出（异常发生在循环前）才保留链
             # 交给调用方整条兜底，此时重发无重复风险。
-            if "idx" not in locals():
+            if not sent_any:
                 return False
             result.chain.clear()
             return True
@@ -442,6 +972,18 @@ class ForwardMixin:
                     pass
             self._suppress_mainagent_prefix = False
             return
+
+        # [标点哨兵 2026-08-27] 主代理出口兜底:流式终态已让位,此处拦下所有剩余链,
+        # 全角化后再走分段/整条/前缀注入,保证 2026-08-27 标点铁律落地。
+        result = event.get_result()
+        if result is not None and hasattr(result, "chain") and result.chain:
+            for comp in result.chain:
+                text = getattr(comp, "text", None)
+                if isinstance(text, str) and text.strip():
+                    text = self._zh_fullwidth_sentinel(text)
+                    # [2026-08-29] 表格分隔行强制居中(不依赖模型记忆)
+                    text = self._force_table_center(text)
+                    comp.text = text
 
         if getattr(self, "_suppress_mainagent_prefix", False):
             # 分段转发已直发子代理回复。主代理若有实质台词则加前缀放行，否则静默。

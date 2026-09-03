@@ -50,6 +50,69 @@ class ConfigMixin:
         if isinstance(raw, dict):
             return raw
         return {}
+
+    # ── 双模式调度配置（技术干活 / 后宫贴贴，2026-08-31 顾主指定） ──
+    MODE_CONFIG_DEFAULTS = {
+        # 技术干活：子代理回复返回主代理，主代理当统帅并行收卷
+        "tech": {"route_mode": "relay", "call_mode": "parallel", "timeout": 120},
+        # 后宫贴贴：子代理回复直接分段转发用户端，主代理隐身
+        "affection": {"route_mode": "direct", "call_mode": "chained", "timeout": 120},
+    }
+
+    def _get_mode_config(self, mode: str) -> dict:
+        """读取双模式调度配置块（tech/affection），兼容 JSON 字符串和 dict 两种格式。
+
+        顾主可在 WebUI 填写 `tech_mode_config` / `affection_mode_config`（JSON 字符串），
+        自行决定每个模式的调度方式：
+        {
+          "route_mode": "relay|direct",   # 路由模式：relay=回复返回主代理，direct=直接分段转发
+          "call_mode": "parallel|chained",# 调用模式：parallel=并行调度，chained=接龙串行
+          "timeout": 120                  # 单子代理超时秒数
+        }
+        配置缺失/解析失败时回退内置默认（tech=relay+parallel，affection=direct+chained）。
+        """
+        key = f"{mode}_mode_config"
+        raw = self._cfg(key, {})
+        data = {}
+        if isinstance(raw, str):
+            raw = raw.strip()
+            if raw:
+                try:
+                    data = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    data = {}
+        elif isinstance(raw, dict):
+            data = raw
+        if not isinstance(data, dict):
+            data = {}
+        defaults = self.MODE_CONFIG_DEFAULTS.get(mode, {})
+        merged = dict(defaults)
+        for k in ("route_mode", "call_mode", "timeout"):
+            v = data.get(k)
+            if v is not None and v != "":
+                merged[k] = v
+        return merged
+
+    def resolve_mode_params(self, mode, route_mode, call_mode, timeout):
+        """顾主配置永远优先（2026-08-31 顾主指定）：
+
+        mode 命中 tech/affection 时，模式配置（tech_mode_config /
+        affection_mode_config）无条件覆盖 LLM 显式传参——不再有
+        "timeout==120 才让步"之类的默认哨兵逻辑，顾主在 WebUI 填什么
+        就是什么。
+
+        mode 未命中时原样返回，交给全局 route_mode/call_mode 兜底。
+        """
+        if mode and str(mode).strip().lower() in ("tech", "affection"):
+            m = str(mode).strip().lower()
+            mcfg = self._get_mode_config(m)
+            route_mode = str(mcfg.get("route_mode", "relay" if m == "tech" else "direct"))
+            call_mode = str(mcfg.get("call_mode", "parallel" if m == "tech" else "chained"))
+            try:
+                timeout = int(mcfg.get("timeout", 120))
+            except (TypeError, ValueError):
+                timeout = 120
+        return route_mode, call_mode, timeout
     # ── 配置持久化 ─────────────────────────────────────────
     def _save_config(self, overrides: dict):
         """将 name_prefix_overrides 写入配置文件并同步内存"""

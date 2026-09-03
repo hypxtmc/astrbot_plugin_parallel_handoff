@@ -36,6 +36,18 @@ MOOD_POOL: List[str] = [
     "专注", "亢奋", "平静", "慵懒", "急躁", "愉悦", "低落", "好奇",
 ]
 
+# 生活域→领域关键词：供 M3 今日状态契合度（_daily_affinity）做纯关键词匹配。
+# 命中即给该 agent 今日状态加分——谁今日话题契合当前消息，谁更自然接上。
+DOMAIN_KEYWORDS: Dict[str, List[str]] = {
+    "工作":     ["项目", "任务", "开会", "报告", "代码", "问题", "怎么弄", "怎么改", "搞定", "进度", "交活"],
+    "生活":     ["吃", "饭", "睡", "累", "饿", "收拾", "回家", "出门", "买菜", "天气"],
+    "兴趣":     ["歌", "画", "音乐", "电影", "书", "游戏", "乐器", "展览", "好看", "听了"],
+    "吐槽":     ["烦", "受不了", "气死", "糟心", "无语", "唉", "坑", "讨厌", "累死", "烦人"],
+    "深夜随笔": ["想", "旧", "回忆", "过去", "以前", "如果", "发呆", "梦", "夜", "感"],
+    "出差/外勤":["出门", "外勤", "跑", "路上", "回来", "去趟", "出差", "赶车", "返程", "见过"],
+    "八卦/事":  ["听说", "听说没", "你知道吗", "传言", "吃瓜", "新鲜事", "消息", "啥事", "谁", "咋"],
+}
+
 # 手头事池（配合生活域，给出今日在忙的具体事）
 HAND_FLAVOR: Dict[str, List[str]] = {
     "工作":     ["在拆一个难缠的报错", "在赶一份清单", "刚开完会", "在查资料"],
@@ -159,6 +171,53 @@ class RandomStateManager:
     # ── 查询 ────────────────────────────────
     def all(self, scene: str) -> Dict[str, DailyState]:
         return dict(self._states.get(scene, {}))
+
+    # ── M3 · 今日状态契合度（纯关键词，零 LLM） ──────────
+    def daily_affinity(
+        self,
+        scene: str,
+        agent: str,
+        message: str,
+        now: Optional[float] = None,
+    ) -> int:
+        """计算 agent 今日状态对当前消息的契合得分。
+
+        思路：命中的今日话题域关键词越多，越说明「他今天正处在这个话题上」，
+        越自然接这话。同一个人不会天天稳坐接话位——明天换 domain 契合度就变了。
+
+        返回 0..len(命中词) 的计数；错误归零（绝不因状态缺失炸调用方）。
+        """
+        try:
+            st = self.get(scene, agent, now=now)
+        except Exception:
+            return 0
+        if not st:
+            return 0
+        kws = DOMAIN_KEYWORDS.get(st.domain, [])
+        if not kws:
+            return 0
+        low = (message or "").lower()
+        return sum(1 for k in kws if k.lower() in low)
+
+    def best_affinity(
+        self,
+        scene: str,
+        candidates: List[str],
+        message: str,
+        now: Optional[float] = None,
+    ) -> str | None:
+        """在候选接话人里挑今日状态最契合消息的一个。
+
+        平手时返回最先出现的；都 0 分返回 None（今天谁都不特别契合，交主代理自然接）。
+        """
+        best = None
+        best_score = 0
+        for a in candidates:
+            s = self.daily_affinity(scene, a, message, now)
+            if s > best_score:
+                best = a
+                best_score = s
+        return best
 
     def agents(self, scene: str) -> List[str]:
         return list(self._states.get(scene, {}).keys())

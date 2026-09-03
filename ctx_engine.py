@@ -50,14 +50,10 @@ class ContextEngine:
         if ctx_turns <= self.max_turns:
             ctx_text = self._format(history)
         else:
-            try:
-                ctx_text = await self._compress(
-                    history, prov_id, handoff, timeout
-                )
-            except Exception as e:
-                logger.warning(f"[parallel_handoff][ctx] 压缩失败，截断降级: {e}")
-                max_msgs = self.max_turns * 2
-                ctx_text = self._format(history[-max_msgs:])
+            # 2026-08-23 顾主拍板：子代理对齐主代理 truncate_by_turns，走纯截断
+            # （不再 LLM 摘要压缩——动态摘要文本吃缓存与其他计费）
+            max_msgs = self.max_turns * 2
+            ctx_text = self._format(history[-max_msgs:])
         return f"--- 对话历史 ---\n{ctx_text}\n--- 新的输入 ---\n{final_input}"
 
     # ── 存储：追加一轮对话（user + assistant） ──
