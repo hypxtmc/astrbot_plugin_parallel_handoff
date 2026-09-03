@@ -14,7 +14,11 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Dict, List, Optional
 
-from random_state import LIFE_DOMAINS, RandomStateManager
+# random_state 双分支导入：astrbot 包加载→相对；顶层/测试→绝对
+try:
+    from .random_state import LIFE_DOMAINS, RandomStateManager
+except ImportError:
+    from random_state import LIFE_DOMAINS, RandomStateManager
 
 if TYPE_CHECKING:
     pass

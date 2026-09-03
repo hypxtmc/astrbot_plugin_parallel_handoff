@@ -17,6 +17,12 @@ from collections import deque
 
 from astrbot.api.event import AstrMessageEvent
 
+# random_state 双分支导入：astrbot 包加载→相对；顶层/测试→绝对（对齐 main.py try/except 哲学）
+try:
+    from .random_state import RandomStateManager
+except ImportError:
+    from random_state import RandomStateManager
+
 _logger = logging.getLogger("parallel_handoff.arbitrate")
 
 # 发言窗口默认宽度（记录最近 N 条发言，供下轮「读空气」参考）
@@ -84,6 +90,10 @@ class ArbitrationMixin:
     # 每个会话的在场状态缓存：{unified_msg_origin -> ConversationPresence}
     _presences: dict = {}
 
+    # 三期·每会话的今日随机状态管理（M3 接话权重叠加的数据源）
+    # 单例复用（同一 mixin 实例内所有会话共享 RandomStateManager，按 scene 隔离）
+    _daily_states: "RandomStateManager | None" = None
+
     # ── 开关路由 ─────────────────────────────────────────────
     def _read_air_enabled(self) -> bool:
         """读空气仲裁总开关（默认 False）。开启前零行为变化。"""
@@ -105,6 +115,26 @@ class ArbitrationMixin:
             p = ConversationPresence(window=self._presence_window())
             self._presences[key] = p
         return p
+
+    # ── 三期·今日随机状态（M3 接话权重叠加） ────────────
+    def _daily_states_get(self) -> "RandomStateManager":
+        """惰性初始化今日状态管理器（复用单例）。"""
+        if self._daily_states is None:
+            self._daily_states = RandomStateManager()
+        return self._daily_states
+
+    def _daily_affinity_for(self, event: AstrMessageEvent, agent: str, message: str) -> int:
+        """M3 今日状态契合度封装：agent 今日话题域对当前消息的命中数。
+
+        纯关键词、零 LLM；状态/异常一律归零，绝不因数据缺失炸调用方。
+        供观察日志 + 未来接话权重叠加使用（真实拦截仍待博士验收后开启）。
+        """
+        try:
+            scene = getattr(event, "unified_msg_origin", None) or "default"
+            return self._daily_states_get().daily_affinity(scene, agent, message)
+        except Exception as e:
+            _logger.warning("[read_air][daily] affinity failed (non-fatal): %s", e)
+            return 0
 
     # ── 状态更新 ─────────────────────────────────────────────
     def _presence_update(
@@ -164,20 +194,25 @@ class ArbitrationMixin:
             # 无候选或 mode 已放行主代理 → 读空气无克制建议（本来就不短路）
             return None
 
-        # ── 段二低侵入：仅日志观察「读空气想不想克制」，不实际拦截 ──
+        # ── 段二/三期低侵入：仅日志观察「读空气想不想克制」+「今日状态契合度」，不实际拦截 ──
         try:
             p = self._presence_get(event)
             quiet = self._read_air_wants_quiet(message, p)
+            # 三期 M3：叠加今日状态契合度观察（谁今日话题最契合当前消息）
+            affinity = self._daily_affinity_for(event, route, message)
             if quiet:
                 _logger.info(
                     "[read_air][observe] 自动路由将短路 %s，但读空气倾向克制落主代理（宁静权）。"
-                    "段二观察模式：不实际拦截，待三期后实验性开启。",
+                    "段二观察模式：不实际拦截，待三期后实验性开启。daily_affinity=%d",
                     route,
+                    affinity,
                 )
             else:
-                _logger.debug(
-                    "[read_air][observe] 自动路由短路 %s，读空气判断无需克制。",
+                _logger.info(
+                    "[read_air][observe] 自动路由短路 %s，读空气判断无需克制。"
+                    "今日状态契合度 daily_affinity=%d。",
                     route,
+                    affinity,
                 )
         except Exception as e:
             _logger.warning("[read_air] arbitrate observe failed (non-fatal): %s", e)

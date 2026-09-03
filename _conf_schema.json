@@ -120,13 +120,13 @@
     "hint": "对话历史超过此轮数后会触发压缩（LLM 摘要 + 保留最近 N 轮完整对话）。每轮 = 一对 user+assistant 消息。"
   },
   "subagent_context_keep_recent": {
-    "description": "压缩时保留的最近完整轮数",
+    "description": "已弃用(2026-08-23 纯截断对齐): 原为LLM压缩保留轮数,现策略不走压缩,参数0",
     "type": "int",
     "default": 5,
     "hint": "历史超限时，保留最近 N 轮完整对话原文，其余部分用 LLM 压缩为摘要。"
   },
   "subagent_context_compress_ratio": {
-    "description": "压缩后保留比例（%）",
+    "description": "已弃用(2026-08-23 纯截断对齐): 原为LLM压缩比例,现策略不走压缩,参数0",
     "type": "int",
     "default": 15,
     "hint": "LLM 压缩历史时，摘要长度约为原文的百分比。值越小摘要越短。"
@@ -185,6 +185,12 @@
     "default": true,
     "hint": "开启后插件在每次主代理 LLM 请求时，按 route_mode/call_mode/direct_delivery_agents 自动生成路由路径规范注入 extra_user_content_parts，主代理必须照走；工具全保留不摘除。关闭则纯靠主代理自觉。"
   },
+  "directive_inject_mode": {
+    "description": "路由指令注入模式",
+    "type": "string",
+    "default": "smart",
+    "hint": "smart=智能按需（默认）：仅当消息疑似路由意图（点名子代理/领域词/会话承接）才注入完整指令，日常闲聊与技术任务零注入，省 token 不污染上下文；always=每轮都注入（旧行为）。"
+  },
   "enable_smart_router": {
     "description": "小模型路由层总开关",
     "type": "bool",
@@ -208,5 +214,29 @@
     "type": "float",
     "default": 5,
     "hint": "小模型判向超时直接放行主代理，不影响体验。"
+  },
+  "tech_mode_config": {
+    "description": "技术干活模式调度配置（JSON）",
+    "type": "string",
+    "default": "{\"route_mode\": \"relay\", \"call_mode\": \"parallel\", \"timeout\": 120}",
+    "hint": "博士自定义技术模式调度方式，JSON格式：{\"route_mode\": \"relay|direct\", \"call_mode\": \"parallel|chained\", \"timeout\": 秒数}。route_mode=relay 子代理回复返回主代理汇总（统帅收卷），direct 直接发用户端；call_mode=parallel 并行调度，chained 接龙串行。博士配置永远优先（2026-08-31 博士指定）：mode命中时此配置无条件覆盖模型显式传参。改动即时生效。"
+  },
+  "affection_mode_config": {
+    "description": "后宫贴贴模式调度配置（JSON）",
+    "type": "string",
+    "default": "{\"route_mode\": \"direct\", \"call_mode\": \"chained\", \"timeout\": 120}",
+    "hint": "博士自定义后宫贴贴模式调度方式，JSON格式：{\"route_mode\": \"relay|direct\", \"call_mode\": \"parallel|chained\", \"timeout\": 秒数}。route_mode=direct 子代理回复直接分段转发用户端（主代理隐身），relay 返回主代理；call_mode=chained 接龙串行，parallel 并行。博士配置永远优先（2026-08-31 博士指定）：mode命中时此配置无条件覆盖模型显式传参。改动即时生效。"
+  },
+  "enable_read_air_arbitrate": {
+    "description": "读空气仲裁总开关",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后在自动路由犹豫点做「宁静权」克制（群聊杂谈/弱路由时让主代理自然接住，而非逢消息就抢派子代理）。默认关=零行为变化。绝不拦博士明确点名的人（点名神圣不可侵）。"
+  },
+  "read_air_presence_window": {
+    "description": "读空气在场发言窗口（条）",
+    "type": "int",
+    "default": 6,
+    "hint": "记录每个会话最近 N 条发言，供仲裁判断「刚说到哪、该谁接」。越大越能感知长对话气口，越小越省内存。"
   }
 }

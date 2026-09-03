@@ -36,6 +36,7 @@ try:
     from . import forward as _forward_mod
     from . import ctx_engine as _ctx_engine_mod
     from . import router as _router_mod
+    from . import arbitrate as _arbitrate_mod
 except ImportError:
     import config as _config_mod
     import directive as _directive_mod
@@ -45,6 +46,7 @@ except ImportError:
     import forward as _forward_mod
     import ctx_engine as _ctx_engine_mod
     import router as _router_mod
+    import arbitrate as _arbitrate_mod
 
 
 @register(
@@ -61,6 +63,7 @@ class ParallelHandoffPlugin(
     _directive_mod.DirectiveMixin,
     _config_mod.ConfigMixin,
     _router_mod.RouterMixin,
+    _arbitrate_mod.ArbitrationMixin,
     Star,
 ):
     """并行子代理调用插件"""
@@ -78,6 +81,8 @@ class ParallelHandoffPlugin(
         "nian": "年",
         "ling": "令",
         "liino": "梨诺",
+        "m3": "M3",
+        "kaltsit": "凯尔希",
     }
     # 中文显示名 -> agent_name 反向映射
     AGENT_NAME_REVERSE = {v: k for k, v in AGENT_DISPLAY_NAME.items()}
@@ -139,6 +144,19 @@ class ParallelHandoffPlugin(
         """
         return await super()._smart_router_check(event)
 
+    # ── 事件注册：忙碌旁路（主代理干活时 T1 点名直达，实现见 router.py RouterMixin） ──
+    @filter.custom_filter(_router_mod.BusyRunnerFilter)
+    async def _busy_direct_bypass(self, event: AstrMessageEvent):
+        """[Busy Bypass 2026-08-31] 消息入口旁路：主代理正在干活（活跃 runner）时，
+        点名子代理的消息直接直发子代理，绕过 follow-up 捕获。
+
+        filter 仅在该 UMO 有活跃 agent runner 时通过（主代理工具链执行中），
+        通过后本 handler 在 star_request_sub_stage 执行（先于 agent_sub_stage 的
+        follow-up 捕获）→ T1 命中 → call_subagent 直发 + stop_event；
+        未命中放行（消息照常进 follow-up 给主代理）。
+        """
+        return await super()._busy_bypass_check(event)
+
 
     # ── 热重载（插件入口命令，完整实现保留本模块） ────────────
     @filter.regex(r"^(热重载一下并行子代理调用插件|热重载并行插件|重载插件|reload_parallel)$")
@@ -191,6 +209,9 @@ class ParallelHandoffPlugin(
         calls: list[dict] = None,
         timeout: int = 120,
         message: str = None,
+        route_mode: str = None,
+        call_mode: str = None,
+        mode: str = None,
     ) -> str:
         """并行调用多个子代理（如阿米娅、可露希尔、特蕾西娅、夕、令等）,
 同时获取它们的回复并汇总。
@@ -205,8 +226,11 @@ Args:
         - order(integer, 可选): 输出时的排序序号,越小越靠前
     timeout(number): 单个子代理的超时秒数,默认120秒（博士设定，永久生效）。超过此时间未返回则跳过该子代理。
     message(string): 当开启消息消歧且不传calls时,传入原始消息文本,工具会自动路由到最近对话的子代理。
+    mode(string): 模式可选设置，'tech'或'affection'。传 'tech' 用技术干活模式配置（tech_mode_config，默认 relay+parallel 主代理统帅收卷）；传 'affection' 用后宫贴贴模式配置（affection_mode_config，默认 direct+chained 直发）。不传则回落全局 route_mode/call_mode 配置。博士配置永远优先（2026-08-31 博士指定）：mode 命中时以模式配置为准，显式传参不覆盖。
+    route_mode(string): 路由模式覆盖，'direct'或'relay'；不传用模式/配置默认。技术干活任务传"relay"使子代理回复返回主代理汇总；日常贴贴不传走默认直发。
+    call_mode(string): 调用模式覆盖，'parallel'或'chained'；不传用模式/配置默认。技术干活传"parallel"并行调度；流水线任务传"chained"接龙。
 """
-        return await super().parallel_handoff(event, calls, timeout, message)
+        return await super().parallel_handoff(event, calls, timeout, message, route_mode, call_mode, mode)
 
     # ── LLM 工具注册：call_subagent（实现见 dispatch.py DispatchMixin） ──
     @llm_tool(name="call_subagent")

@@ -1882,3 +1882,55 @@ class TestDailyLifeInjector(unittest.TestCase):
         assert st.llm_updated is True
         assert st.mood == "专注"
         assert st.domain == "工作"
+# ── 三期·M3 今日状态契合度（_daily_affinity / best_affinity，2026-09-03） ──────
+class TestDailyAffinity(unittest.TestCase):
+    """M3 · 接话权重叠加的数据支撑：今日话题域契合度"""
+
+    def _state_domain(self, mgr, scene, agent, domain):
+        """强制把 agent 今日话题域设为指定值，便于确定性断言"""
+        mgr.set_llm(scene, agent, "专注", domain, "测试")
+
+    def test_affinity_hit_domain_keyword(self):
+        """命中今日话题域关键词 -> 正分"""
+        mgr = RandomStateManager()
+        self._state_domain(mgr, "s", "kaltsit", "工作")
+        # "在开会吗" 含工作域关键词"开会" -> fav
+        assert mgr.daily_affinity("s", "kaltsit", "在开会吗？") >= 1
+
+    def test_affinity_miss_other_domain(self):
+        """话题与今日话题域不符 -> 0 分（今天不契合，可由别人接）"""
+        mgr = RandomStateManager()
+        self._state_domain(mgr, "s", "kaltsit", "深夜随笔")
+        # 工作话题 vs 深夜随笔域 -> 0
+        assert mgr.daily_affinity("s", "kaltsit", "代码跑出 bug 了") == 0
+
+    def test_best_affinity_picks_most_fitting(self):
+        """今天最契合消息话题的 agent 被挑中（不被算死）"""
+        mgr = RandomStateManager()
+        self._state_domain(mgr, "s", "amiya", "生活")      # 今天聊生活的
+        self._state_domain(mgr, "s", "closure", "工作")    # 今天聊工作的
+        # 消息是工作向 -> closure(工作) 契合 > amiya(生活) 契合
+        best = mgr.best_affinity("s", ["amiya", "closure"], "这个项目怎么跑通")
+        assert best == "closure"
+
+    def test_best_affinity_none_when_all_zero(self):
+        """今天谁都不契合 -> 返回 None（交主代理自然接）"""
+        mgr = RandomStateManager()
+        self._state_domain(mgr, "s", "amiya", "深夜随笔")
+        self._state_domain(mgr, "s", "skadi", "兴趣")
+        assert mgr.best_affinity("s", ["amiya", "skadi"], "预算不够了") is None
+
+    def test_affinity_missing_state_returns_zero(self):
+        """状态缺失/未初始化 -> 0 分，绝不炸"""
+        mgr = RandomStateManager()
+        assert mgr.daily_affinity("noscene", "ghost", "任何消息") == 0
+
+    def test_daily_affinity_for_mixin_degrades(self):
+        """Mixin 封装 _daily_affinity_for 异常/状态缺失一律归零"""
+        from arbitrate import ArbitrationMixin
+
+        ev = MagicMock()
+        ev.unified_msg_origin = "sx"
+        # 空 mixin 实例 + 空 state -> 归零
+        m = ArbitrationMixin.__new__(ArbitrationMixin)
+        assert m._daily_affinity_for(ev, "amiya", "随便说点") == 0

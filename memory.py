@@ -29,12 +29,32 @@ def _strip_chain_injection(text: str) -> str:
     return text[:idx] + tail.lstrip("\n")
 
 
+def _strip_ctx_injection(text: str) -> str:
+    """剥离 ContextEngine 注入的跨轮历史块，只保留本轮新输入。
+
+    ctx_engine.inject 会把历史拼成
+    "--- 对话历史 ---\\n{历史}\\n--- 新的输入 ---\\n{本轮输入}"
+    注入 final_input。若原样存入 livingmemory，历史块会随轮次越滚越大
+    （召回时被 inject_with_recent_context 拼进查询文本，导致 token 膨胀）。
+    本函数只保留 "--- 新的输入 ---" 之后的本轮输入。
+    """
+    marker = "--- 新的输入 ---"
+    if marker not in text:
+        return text
+    idx = text.find(marker)
+    return text[idx + len(marker):].lstrip("\n")
+
+
 class MemoryMixin:
     """长期记忆集成：接龙注入剥离 / livingmemory 查找 / 召回 / 存储 / 工具过滤"""
 
     def _strip_chain_injection(self, text: str) -> str:
         """实例方法包装：接龙注入前文块剥离（供 dispatch 通过 self 调用）"""
         return _strip_chain_injection(text)
+
+    def _strip_ctx_injection(self, text: str) -> str:
+        """实例方法包装：跨轮历史块剥离（供 dispatch 通过 self 调用）"""
+        return _strip_ctx_injection(text)
 
     # ── 长期记忆插件查找 ─────────────────────────────────
     def _find_livingmemory_plugin(self):
@@ -163,8 +183,14 @@ class MemoryMixin:
                     livingmemory_plugin
                     .event_handler._memory_recall.conversation_manager
                 )
+                # 2026-08-31 修复：存储前剥离 ctx_engine 跨轮历史块，只存本轮干净输入
+                # （此前注入的 "--- 对话历史 ---..." 整块随轮次越滚越大，
+                #  召回时被 inject_with_recent_context 拼进查询文本导致 token 膨胀）
+                clean_input = self._strip_chain_injection(
+                    self._strip_ctx_injection(final_input)
+                )
                 await conv_mgr.add_message_from_event(
-                    event, role="user", content=self._strip_chain_injection(final_input)
+                    event, role="user", content=clean_input
                 )
                 await conv_mgr.add_message_from_event(
                     event, role="assistant", content=raw_response
