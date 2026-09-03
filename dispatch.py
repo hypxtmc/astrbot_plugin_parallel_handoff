@@ -884,9 +884,9 @@ Args:
             # 只返回 pending_text 会把回复吞成 "✓"——有完整回复时必须返回摘要 JSON。
             if pending_text:
                 return pending_text
-            if return_agent_results:
-                return json.dumps(summary, ensure_ascii=False)
-            return "✓"
+            # 全失败时也必须返回摘要 JSON——以前返回 "✓" 会让主代理对失败完全无感知
+            # （2026-09-03 实测：deepseek-v4-flash 端点挂起双双超时，主代理只见 "✓"）
+            return json.dumps(summary, ensure_ascii=False)
 
         # ── 默认：合并返回 ───────────────────────────────────
         return json.dumps(
