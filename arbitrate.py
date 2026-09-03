@@ -218,21 +218,47 @@ class ArbitrationMixin:
         # 其余默认让子代理按现有规则走
         return False
 
-    # ── 路径 B · LLM 工具侧收敛（段二填逻辑，空壳原样放行 calls） ──
+    # ── 路径 B · LLM 工具侧收敛（段三：温和收敛建议，绝不砍 calls） ──
     def _arbitrate_tool(self, event: AstrMessageEvent, calls: list) -> list:
         """LLM 工具（parallel_handoff / call_subagent）调用前的收敛建议。
 
-        返回：原 calls（段二也只做「温和收敛建议 + pending_batch 记录」，绝不砍 calls）。
+        返回：原 calls（绝不过滤；「不砍 calls」是 V2 关键约束，多人并行是主代理显式意图。
+        段三只做两件事，均不改变路由结果：
+            1. 更新 pending_batch，记录本批 candidate，供路径 A 下轮「读空气」参考。
+            2. 温和收敛建议：当顾主 UI 只点名一人、但本批 calls 却误带多人时，
+               打日志提示主代理「本批是否只需某人」——仅建议，绝不强制。
         """
         if not self._read_air_enabled():
             return calls
-        # 记录本批 candidate 供路径 A 下轮「读空气」参考
+        canonical_calls = [c for c in calls if isinstance(c, dict) and c.get("agent_name")]
+        # 1) 更新 pending_batch（本批候选名单，供路径 A 读空气参考）
         try:
             p = self._presence_get(event)
-            p.pending_batch = [
-                c.get("agent_name") for c in calls if isinstance(c, dict) and c.get("agent_name")
-            ]
+            p.pending_batch = [c["agent_name"] for c in canonical_calls]
         except Exception as e:
             _logger.warning("[read_air] pending_batch update failed (non-fatal): %s", e)
-        # ── 段二在此实现温和收敛建议（日志提示，不强制过滤） ──
+
+        # 2) 温和收敛建议：顾主只点名一人、但 calls 误带多人 → 日志提示是否只需某人
+        # （复用 RouterMixin._t1_mentions，零重复造轮子；仅提示不砍 calls）
+        try:
+            if len(canonical_calls) > 1 and hasattr(self, "_t1_mentions"):
+                raw = event.get_message_str() if hasattr(event, "get_message_str") else ""
+                mentions = set(self._t1_mentions(raw or ""))
+                if len(mentions) == 1:
+                    named = next(iter(mentions))
+                    _logger.info(
+                        "[read_air][converge] 顾主本轮只点名 %s，但 parallel_handoff 本批 calls 带了 %d 人"
+                        "（%s）。是否只需 %s ？建议核对，不强制过滤。",
+                        named,
+                        len(canonical_calls),
+                        "、".join(c["agent_name"] for c in canonical_calls),
+                        named,
+                    )
+                elif len(mentions) == 0:
+                    _logger.debug(
+                        "[read_air][converge] 本批 calls=%d 人，消息未见点名，多人并行属主代理显式意图，不提示。",
+                        len(canonical_calls),
+                    )
+        except Exception as e:
+            _logger.warning("[read_air] converge observe failed (non-fatal): %s", e)
         return calls

@@ -131,6 +131,9 @@ class ArbitrationMixin:
 > 开关 `enable_read_air_arbitrate` 默认 False，开启也仅观察不拦截。5 个读取记测试全过 + 全量 122/0 绿。
 
 **段三·工具侧收敛**：`_arbitrate_tool` 接入路径 B + pending_batch 更新。验收：parallel_handoff 调用时日志给出收敛建议，不砍 calls。
+> 🔧 段三已落地（2026-09-03 13:5x）：`_arbitrate_tool` 已实现并在 dispatch.py parallel_handoff 真正调度前接入。
+> 1) 更新 pending_batch（本批候选名单，供路径 A 读空气参考）；2) 温和收敛建议——顾主只点名一人(call_t1_mentions 复用 RouterMixin)
+> 却误带多人时打日志提示「本批是否只需某人」，绝不砍 calls（V2 关键约束）。4 个收敛测试全过 + 全量 126/0 绿。
 
 **段四·回归+部署**：全量 test_arbitrate.py + test_plugin.py 过，`py_compile` 三查，`hot_reload_plugin` 上线。顾主验收四类场景：点名、群聊杂谈、承接句、多人并行。
 
