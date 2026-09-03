@@ -16,6 +16,7 @@ import time
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
+from astrbot.core.agent.message import TextPart
 
 
 class DispatchMixin:
@@ -92,8 +93,22 @@ class DispatchMixin:
         self._tool_call_seen[dedup_key] = (now_ts, None)
         return None
 
+    def _is_direct_delivery(self, agent_name: str, direct_agents: set, route_mode: str) -> bool:
+        """判定某子代理本次调用是否直发用户端。
+
+        route_mode=relay 时全员走 relay（回复返回主代理汇总）；
+        route_mode=direct/auto 时按直发名单判定。
+        """
+        if route_mode == "relay":
+            return False
+        return (agent_name or "").lower() in direct_agents
+
     def _maybe_prefix(self, agent_name: str, text: str, enable_name_prefix: bool) -> str:
         """子代理回复姓名前缀（render 块方法化）：先查覆盖表，再走全局开关"""
+        # 2026-08-30 修复：模型走工具调用/空文本分支时 completion_text 可为 None，
+        # 直接 startswith 会炸（'NoneType' object has no attribute 'startswith'）
+        if text is None:
+            text = ""
         overrides = self._get_name_prefix_overrides()
         if isinstance(overrides, dict) and agent_name in overrides:
             should_prefix = overrides[agent_name]
@@ -105,6 +120,103 @@ class DispatchMixin:
             if not text.startswith(prefix_str):
                 text = prefix_str + text
         return text
+
+    def _relationship_inject(self, agent_name: str, input_text: str) -> str:
+        """从 relationships.json 读取该子代理的关系网，组装成她眼中的家庭关系片段。
+
+        动态过滤：只取与被调 agent 直接相关的边（她↔某成员 + 某成员↔她），
+        每边取 type 类型 + 该 agent 一方的基调，拼装成第二人称叙述。
+        命中关系状态（亲密度/最近互动）则带上，让子代理对话更有家人日常感。
+        文件读失败或缺资料时返回空串，由调用方静默跳过（不影响主流程）。
+        """
+        try:
+            # 关系文件：插件在 data/plugins/astrbot_plugin_parallel_handoff/，向上两级到 data/
+            _rel_path = "/root/AstrBot/data/relationships/relationships.json"
+            with open(_rel_path, encoding="utf-8") as _f:
+                rel = json.load(_f)
+        except Exception as _e:
+            logger.warning(f"[relationship_inject] 读取关系文件失败: {_e}")
+            return ""
+
+        _edges = rel.get("relationship_edges", {})
+        _states = rel.get("relationship_state", {})
+        _roles = rel.get("family_roles", {})
+
+        # 该 agent 自己的家庭角色定位
+        _role_desc = ""
+        _role = _roles.get(agent_name)
+        if isinstance(_role, dict):
+            _role_desc = str(_role.get("定位", "") or "")
+            _role_rc = _role.get("角色", "") or ""
+
+        # 过滤与该 agent 关联的所有关系边（注意 key 形如 "A<->B"，两侧都可能含 agent_name）
+        _pieces = []
+        _seen_others = set()  # 去重保护：按"对方是谁"去重，防文件里存在反向重复边
+        for _pair, _info in _edges.items():
+            _parts = _pair.split("<->")
+            if agent_name not in _parts:
+                continue
+            _other = _parts[0] if _parts[1] == agent_name else _parts[1]
+            if not isinstance(_info, dict):
+                continue
+            if _other in _seen_others:
+                continue
+            _seen_others.add(_other)
+            _type = _info.get("type", "")
+            _dual = _info.get("双向", "")
+            # 从双向描述里提取"agent 这一方"的表述（按 名字: 前缀切分，取含 agent_name 的半句）
+            _me_part = ""
+            if _dual:
+                # 双向字段用分号/顿号分隔，挑含 agent_name 的那一段
+                for _seg in _dual.split("; "):
+                    if agent_name in _seg:
+                        _me_part = _seg.strip()
+                        break
+                if not _me_part:
+                    # 兜底：整段太长就截前半
+                    _me_part = _dual
+            _piece = f"· 与 {_other}（{_type}）"
+            if _me_part:
+                _piece += f"：{_me_part[:120]}"
+            _pieces.append(_piece)
+
+        # 命中关系状态（亲密度/最近互动），作为"最近家里的样子"补充
+        _state_lines = []
+        _seen_states = set()  # 去重保护：A<->B 与 B<->A 视为同一关系
+        for _pair, _st in _states.items():
+            if _pair.startswith(f"{agent_name}<->") or _pair.endswith(f"<->{agent_name}"):
+                if not isinstance(_st, dict):
+                    continue
+                _s = sorted(_pair.split("<->"))
+                _skey = "<->".join(_s)
+                if _skey in _seen_states:
+                    continue
+                _seen_states.add(_skey)
+                _stxt = ""
+                if _st.get("亲密度") is not None:
+                    _stxt += f"{_st.get('亲密度')}"
+                if _st.get("基调"):
+                    _stxt += f"（{_st.get('基调')}）"
+                if _st.get("最近互动"):
+                    _stxt += f"。{_st.get('最近互动')}"
+                if _stxt:
+                    _state_lines.append(f"· {_pair} 最近：{_stxt[:100]}")
+        # 注意 _state_lines 用的是原始 pair（可能带别的名字），但没关系，是家庭状态快照
+
+        if not _pieces:
+            return ""
+
+        _role_head = ""
+        if _role_desc:
+            _role_head = f"你是这个家的{_role_rc}——{_role_desc[:80]}。\n"
+        _body = "\n".join(_pieces)
+        _state_blk = ("\n【家里的近况】\n" + "\n".join(_state_lines)) if _state_lines else ""
+        return (
+            f"【家庭关系】\n{_role_head}"
+            f"在你眼中，这个家里和你最亲近的人是这样的：\n{_body}"
+            f"{_state_blk}\n"
+            "（这是你记得的家里人的关系与近况，自然地带进对话，不必刻意提）"
+        )
 
     async def _call_one(
         self,
@@ -174,6 +286,19 @@ class DispatchMixin:
         # 场景/基线前缀消费点：由 _apply_scene_prefix 决定（基线独立于场景开关）
         final_input = self._apply_scene_prefix(input_text, scene_prefix)
 
+        # ── 用户身份注入（修复 2026-08-30） ──
+        # 此前调用链从不传当前用户身份，子代理把博士当陌生人触发安全拦截（调情被拦）。
+        # 将发送者 user_id/会话附在输入前，子代理对照 persona 白名单即可识别博士；
+        # 非白名单用户由子代理按自身安全规则正常拦截。注入失败不影响转发。
+        try:
+            _id_note = (
+                f"[用户身份] 当前对话用户 user_id={event.get_sender_id()} "
+                f"会话={event.unified_msg_origin}"
+            )
+            final_input = f"{_id_note}\n{final_input}"
+        except Exception as e:
+            logger.warning(f"[parallel_handoff] 用户身份注入失败: {e}")
+
         # ── 记忆召回：注入长期记忆（memory.py） ──
         # 接龙注入的前文是临时上下文：记忆链路（召回/存储）统一剥离，
         # 避免上一个子代理的输出污染本子代理的长期记忆。
@@ -182,16 +307,79 @@ class DispatchMixin:
             event, agent_name, clean_input, livingmemory_plugin
         )
 
+        # ── 时间感知注入：子代理 unaware 时间（walkaround on_llm_request 钩子只拦主代理），
+        #    与主代理 LLMPerception 的感知信息同位，注入 extra_user_content 头部 ──
+        #    对齐主代理格式，走 Asia/Shanghai 时区（普瑞赛斯 2026-09-02 按博士指示）
+        #    注意：extra_user_content_parts 必须是 ContentPart 对象（非裸 str），
+        #    mark_as_temp() 防止时间戳被持久化进历史上下文
+        #    时段规则（博士 2026-09-02 01:11 定稿）：1-6凌晨 | 6-10早上 | 10-13中午 | 13-18下午 | 18-20傍晚 | 其他深夜
+        try:
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+            _now = datetime.now(ZoneInfo("Asia/Shanghai"))
+            _week = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][_now.weekday()]
+            _hour = _now.hour
+            if 1 <= _hour < 6:
+                _period = "凌晨"
+            elif 6 <= _hour < 10:
+                _period = "早上"
+            elif 10 <= _hour < 13:
+                _period = "中午"
+            elif 13 <= _hour < 18:
+                _period = "下午"
+            elif 18 <= _hour < 20:
+                _period = "傍晚"
+            else:
+                _period = "深夜"
+            _ts = _now.strftime("%Y-%m-%d %H:%M")
+            _time_sense = f"[感知信息] 发送时间: {_now.strftime('%Y-%m-%d')} {_week} {_period} {_now.strftime('%H:%M')}。"
+            _time_sense_part = TextPart(text=_time_sense).mark_as_temp()
+            memory_extra_parts = [_time_sense_part] + (memory_extra_parts or [])
+            # 日志落盘：每次注入内容打印出来，方便博士看日志查问题
+            logger.info(f"[parallel_handoff] 子代理时间感知注入 OK: {_time_sense}")
+        except Exception as _e:
+            logger.warning(f"[parallel_handoff] 时间感知注入失败: {_e}")
+
+        # ── 关系网注入：让子代理"懂得自家事"（一期·关系网，2026-09-02 普瑞赛斯）
+        #    从 data/relationships/relationships.json 读取该子代理的关系边，
+        #    组装成她眼中的家庭关系片段，注入 extra_user_content 头部。
+        #    与时间感知注入同位（mark_as_temp 防持久化），只在本轮生效。
+        #    作用：调夕时她知道自己"黍是四姐但拿我当小孩、年总想用鞭炮炸我"，
+        #    可露希尔知道"凯尔希回来就比什么都强"——让子代理间的对话有家人日常感。
+        try:
+            _rel_sense = self._relationship_inject(agent_name, input_text)
+            if _rel_sense:
+                _rel_part = TextPart(text=_rel_sense).mark_as_temp()
+                memory_extra_parts = [_rel_part] + (memory_extra_parts or [])
+                logger.info(f"[parallel_handoff] 子代理关系网注入 OK [{agent_name}]: {len(_rel_sense)} chars")
+        except Exception as _e:
+            logger.warning(f"[parallel_handoff] 关系网注入失败 [{agent_name}]: {_e}")
+
         # ── 构建子代理工具集（memory.py 记忆工具过滤） ──
         subagent_tools = self._build_memory_tools(agent_name)
 
         t0 = time.perf_counter()
         try:
             umo = event.unified_msg_origin
-            prov_id = (
-                handoff.provider_id
-                or await self.context.get_current_chat_provider_id(umo)
-            )
+            session_prov = await self.context.get_current_chat_provider_id(umo)
+            prov_id = handoff.provider_id or session_prov
+            # PROV_DEBUG 打点（2026-08-26 排查：子代理烧 session provider 而非配置 provider）
+            try:
+                _prov = await self.context.provider_manager.get_provider_by_id(prov_id)
+                if _prov is not None:
+                    _src = getattr(_prov, "provider_source_id", None)
+                    logger.info(
+                        f"[PROV_DEBUG] agent={agent_name} handoff={handoff.provider_id} "
+                        f"session={session_prov} final={prov_id} "
+                        f"instance=OK id={getattr(_prov, 'id', None)} source={_src}"
+                    )
+                else:
+                    logger.info(
+                        f"[PROV_DEBUG] agent={agent_name} handoff={handoff.provider_id} "
+                        f"session={session_prov} final={prov_id} instance=MISSING"
+                    )
+            except Exception as e:
+                logger.info(f"[PROV_DEBUG] agent={agent_name} final={prov_id} err={e}")
 
             # ── 上下文注入：跨轮对话历史（ContextEngine 独立引擎） ──
             final_input = await self._ctx_engine.inject(
@@ -213,7 +401,7 @@ class DispatchMixin:
                 timeout=llm_timeout,
             )
             latency_ms = int((time.perf_counter() - t0) * 1000)
-            raw_response = llm_resp.completion_text
+            raw_response = llm_resp.completion_text or ""
 
             # ── 记忆存储：存入长期记忆（memory.py） ──
             await self._memory_store(
@@ -229,6 +417,15 @@ class DispatchMixin:
 
             # 自动转发已由 parallel_handoff 的分段转发负责,此处不再重复推送
             raw_response = self._maybe_prefix(agent_name, raw_response, enable_name_prefix)
+
+            # ── 读空气仲裁:记录实际发言者到场状态（段一,仅记录不介入,安全优先） ──
+            try:
+                if hasattr(self, "_presence_update") and self._read_air_enabled():
+                    self._presence_update(
+                        event, agent_name, "forward", raw_response if isinstance(raw_response, str) else ""
+                    )
+            except Exception as _arb_e:
+                logger.warning(f"[read_air] _presence_update skipped (non-fatal): {_arb_e}")
 
             return {
                 "agent_name": agent_name,
@@ -277,6 +474,9 @@ class DispatchMixin:
         calls: list[dict] = None,
         timeout: int = 120,
         message: str = None,
+        route_mode: str = None,
+        call_mode: str = None,
+        mode: str = None,
     ) -> str:
         """并行调用多个子代理（如阿米娅、可露希尔、特蕾西娅、夕、令等）,
 同时获取它们的回复并汇总。
@@ -291,6 +491,9 @@ Args:
         - order(integer, 可选): 输出时的排序序号,越小越靠前
     timeout(number): 单个子代理的超时秒数,默认120秒（博士设定，永久生效）。超过此时间未返回则跳过该子代理。
     message(string): 当开启消息消歧且不传calls时,传入原始消息文本,工具会自动路由到最近对话的子代理。
+    mode(string): 模式可选设置，'tech'或'affection'。传 'tech' 用技术干活模式配置（tech_mode_config，默认 relay+parallel 主代理统帅收卷）；传 'affection' 用后宫贴贴模式配置（affection_mode_config，默认 direct+chained 直发）。不传则回落全局 route_mode/call_mode 配置。博士配置永远优先（2026-08-31 博士指定）：mode 命中时以模式配置为准，显式传参不覆盖。
+    route_mode(string): 路由模式覆盖，'direct'或'relay'；不传用模式/配置默认。技术干活任务传"relay"使子代理回复返回主代理汇总；日常贴贴不传走默认直发。
+    call_mode(string): 调用模式覆盖，'parallel'或'chained'；不传用模式/配置默认。技术干活传"parallel"并行调度；流水线任务传"chained"接龙。
 """
         # ── LLM 同回合重复调用防重：同一消息对同一批子代理的重复路由短路 ──
         # 防重 key 含本次路由目标子代理名单，串行调不同子代理可各自放行
@@ -312,6 +515,14 @@ Args:
         handoff_map: dict = {}
         for h in orchestrator.handoffs:
             handoff_map[h.agent.name] = h
+
+        # ── 模式可选设置解析（2026-08-31 博士指定） ───────────
+        # mode="tech" → 用 tech_mode_config（默认 relay+parallel 统帅收卷）
+        # mode="affection" → 用 affection_mode_config（默认 direct+chained 直发）
+        # 博士配置永远优先：mode 命中时模式配置无条件覆盖显式传参
+        route_mode, call_mode, timeout = self.resolve_mode_params(
+            mode, route_mode, call_mode, timeout
+        )
 
         # ── 读取配置开关 ─────────────────────────────────────
         enable_disambiguation = self._cfg("enable_disambiguation", True)
@@ -360,7 +571,8 @@ Args:
                 ensure_ascii=False,
             )
 
-        call_mode = self._cfg("call_mode", "parallel")
+        call_mode = (call_mode or self._cfg("call_mode", "parallel")).strip().lower()
+        route_mode = (route_mode or self._cfg("route_mode", "direct")).strip().lower()
 
         # ── 读取直接发送名单（提前定义，供接龙流式转发使用） ────
         direct_agents_str = self._cfg("direct_delivery_agents", "amiya,closure,theresia")
@@ -375,6 +587,15 @@ Args:
         logger.info(
             f"[parallel_handoff] Dispatching {len(calls)} subagent calls (mode={call_mode})"
         )
+        # [读空气·段三·工具侧收敛 2026-09-03] parallel_handoff 真正调度前咨询读空气：
+        # 更新 pending_batch + 在"博士只点名一人却误带多人"时给温和收敛建议。
+        # 段三仅日志提示/记录在场，绝不砍 calls、绝不改变路由结果（V2 关键约束）。
+        # 总开关默认关，此调用零开销；异常非致命。
+        try:
+            if hasattr(self, "_arbitrate_tool") and self._read_air_enabled():
+                self._arbitrate_tool(event, calls)
+        except Exception as _arb_tool_e:
+            logger.warning(f"[read_air] arbitrate_tool observe skipped (non-fatal): {_arb_tool_e}")
         t_total = time.perf_counter()
         if call_mode == "chained":
             # ── 接龙模式：串行调用，前一个子代理的回复注入下一个的输入 ──
@@ -433,7 +654,7 @@ Args:
                 results.append(r)
                 # ── 流式转发：本条立刻发出，不等整条链 ──
                 if enable_segmented_forward:
-                    if r.get("success") and r.get("agent_name", "").lower() in direct_agents:
+                    if r.get("success") and self._is_direct_delivery(r.get("agent_name", ""), direct_agents, route_mode):
                         # direct 代理：已流式转发，统一转发阶段跳过
                         r["_sent"] = True
                         await self._forward_segmented(r.get("response", ""), event)
@@ -475,7 +696,7 @@ Args:
             for r in results:
                 if r.get("success") and r.get("agent_name"):
                     self._last_agent[session_id] = r["agent_name"]
-                    if r.get("agent_name", "").lower() in direct_agents:
+                    if self._is_direct_delivery(r.get("agent_name", ""), direct_agents, route_mode):
                         # 直发成功的回复尾部记入路由记忆（T2 剧情参照用）
                         self._record_direct_reply(session_id, r["agent_name"], r.get("response", "") or "")
 
@@ -496,7 +717,7 @@ Args:
             pending_text = ""
             for r in results:
                 agent_name = r.get("agent_name", "")
-                is_direct = agent_name.lower() in direct_agents
+                is_direct = self._is_direct_delivery(agent_name, direct_agents, route_mode)
 
                 # 接龙模式下该条已流式发送/通知，跳过避免重复
                 if r.get("_sent"):

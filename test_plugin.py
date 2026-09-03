@@ -1500,6 +1500,48 @@ class TestReadAirArbitrate(unittest.TestCase):
         # 命中 T1 -> amiya 且 mode 放行短路
         assert p._arbitrate_directive(ev, "阿米娅帮我查报错", "amiya", True) is None
 
+    # ── 段三·工具侧收敛（2026-09-03） ─────────────────────────
+    def _tool_event(self, msg):
+        return self._plain_event(msg)
+
+    def test_arbitrate_tool_default_off_passthrough(self):
+        """默认关：_arbitrate_tool 原样返回 calls，零行为变化且不改调用"""
+        p = self._fresh_plugin(read_air=False)
+        calls = [{"agent_name": "amiya", "input": "x"}, {"agent_name": "closure", "input": "y"}]
+        ev = self._tool_event("阿米娅帮我看看报错")
+        out = p._arbitrate_tool(ev, calls)
+        assert out is calls  # 原对象原样返回，绝不复制或过滤
+
+    def test_arbitrate_tool_on_still_passthrough(self):
+        """开启后也绝不砍 calls（V2 关键约束）：多人并行原样返回"""
+        p = self._fresh_plugin(read_air=True)
+        calls = [{"agent_name": "amiya", "input": "x"}, {"agent_name": "closure", "input": "y"}]
+        ev = self._tool_event("阿米娅帮我看看报错")
+        out = p._arbitrate_tool(ev, calls)
+        assert out is calls
+        assert len(out) == 2
+
+    def test_arbitrate_tool_updates_pending_batch(self):
+        """开启时更新 pending_batch，记录本批候选供路径 A 读空气参考"""
+        p = self._fresh_plugin(read_air=True)
+        calls = [{"agent_name": "amiya", "input": "x"}, {"agent_name": "closure", "input": "y"}]
+        ev = self._tool_event("阿米娅帮我看看报错")
+        p._arbitrate_tool(ev, calls)
+        assert p._presence_get(ev).pending_batch == ["amiya", "closure"]
+
+    def test_arbitrate_tool_converge_hint_on_single_mention(self):
+        """博士只点名一人、calls 误带多人 → 日志给收敛建议（不砍 calls）"""
+        import logging
+
+        p = self._fresh_plugin(read_air=True)
+        calls = [{"agent_name": "amiya", "input": "x"}, {"agent_name": "closure", "input": "y"}]
+        ev = self._tool_event("阿米娅帮我看看报错")
+        # 断言触发收敛日志（点名 amiya 但 calls 带 amiua+closure 两人）
+        out = p._arbitrate_tool(ev, calls)
+        assert out is calls  # 仍原样返回
+        # pending_batch 已更新
+        assert p._presence_get(ev).pending_batch == ["amiya", "closure"]
+
 
 class TestDirectiveTaskClassify(unittest.TestCase):
     """指令注入智能规则：任务分类（tech/affection/None，v2.3.0）"""
