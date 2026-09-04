@@ -244,5 +244,53 @@
     "type": "int",
     "default": 6,
     "hint": "记录每个会话最近 N 条发言，供仲裁判断「刚说到哪、该谁接」。越大越能感知长对话气口，越小越省内存。"
+  },
+  "enable_side_pulse": {
+    "description": "旁路模块（她们之间的小日子）",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后：每小时一次心跳让常驻池里 2 人按今日状态闲聊两句（内部转，不打扰顾主），每晚推送一条「家里动静」摘要到顾主私聊。关闭=零注册零行为。"
+  },
+  "side_pulse_members": {
+    "description": "旁路模块常驻池（JSON 数组，已扩至全家）",
+    "type": "string",
+    "default": "[\"agent_a\",\"shu\",\"agent_b\",\"xi\",\"agent_c\",\"agent_d\",\"ling\",\"nian\",\"agent_f\",\"m3\",\"agent_e\"]",
+    "hint": "全家 11 人常驻（2026-09-04 扩至所有子代理）：助手A/黍/助手B/夕/助手C/助手D/令/年/助手F/M3/助手E。JSON 数组格式，非法值回退默认。"
+  },
+  "side_pulse_cron": {
+    "description": "旁路模块心跳 cron",
+    "type": "string",
+    "default": "17 * * * *",
+    "hint": "每小时第 17 分一次心跳（错开整点高峰）。作息式调频可改此表达式：活跃时段加密、深夜放疏。"
+  },
+  "side_pulse_digest_cron": {
+    "description": "家里动静摘要推送 cron",
+    "type": "string",
+    "default": "50 21 * * *",
+    "hint": "每晚 21:50 把当天旁轨对话原样汇成一条推给顾主。无日志不发送。"
+  },
+  "side_pulse_provider_id": {
+    "description": "旁路模块 LLM Provider ID",
+    "type": "string",
+    "default": "dmxapi/glm-4-flash",
+    "hint": "闲聊生成用的便宜模型（同 daily_life GLM-4-Flash）。LLM 挂了心跳静默跳过，绝不致命。"
+  },
+  "side_pulse_digest_umo": {
+    "description": "摘要推送目标会话 UMO",
+    "type": "string",
+    "default": "default_1000000000:FriendMessage:TESTUSER00000000000000000000000000",
+    "hint": "顾主私聊（与 biliread 晚报同目标）。留空则不推送。"
+  },
+  "side_pulse_interlope_chance": {
+    "description": "自由插话概率（路线B，顾主 2026-09-04 拍板）",
+    "type": "float",
+    "default": 0.45,
+    "hint": "围坐主链之外，未入座的人每轮冒话的概率 0~1。0=关掉插话（纯围坐）；调高=爱接话的人更多。"
+  },
+  "side_pulse_interlope_max": {
+    "description": "一场最多插话次数",
+    "type": "int",
+    "default": 2,
+    "hint": "一场心跳最多让旁观者插几次话，防止插话刷屏盖过主链。"
   }
 }

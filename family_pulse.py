@@ -250,6 +250,80 @@ class FamilyPulseMixin:
         self._pulse_last_pair = {a, b}
         return a, b
 
+    # ── 组大小权重：2 人最常见、3 人常聚、4 人偶尔热闹（自然为纲, 2026-09-04） ──
+    PULSE_GROUP_SIZE_WEIGHTS = {2: 5, 3: 3, 4: 2}
+
+    # ── 每场话量：围坐多聊几轮才散（越多越好, 2026-09-04 顾主拍板） ──
+    # 基础话量 = 组大小 × PULSE_ROUNDS（每人都开过口），再抽 0~PULSE_EXTRA_MAX 条加料。
+    PULSE_ROUNDS = 2
+    PULSE_EXTRA_MAX = 6
+
+    def _pulse_pick_lines(self, group_size: int) -> int:
+        """一场围坐的总话量：每人都至少开口 PULSE_ROUNDS 轮，再随机加 0~extra 条。
+        group_size 越大基础话量越高——人越多聊得越久，像真家里一坐下来就收不住。"""
+        extra = random.randint(0, self.PULSE_EXTRA_MAX)
+        return max(4, group_size * self.PULSE_ROUNDS + extra)
+
+    # ── 氛围三档：daily 家常 / banter 荤打趣 / private 两人私密（2026-09-04 顾主拍板）──
+    # 多人场默认荤打趣（同事围坐、都跟顾主亲近，聊着聊着就扯到他头上）；
+    # 两人场且关系近（亲密度≥65）才可能进私密档，暖话带擦边，点到为止。
+    PULSE_MOOD_BANTER_WEIGHTS = (6, 4)      # 多人场: banter / daily
+    PULSE_MOOD_PRIVATE_WEIGHTS = (5, 2, 3)  # 两人关系近: private / banter / daily
+    PULSE_MOOD_PAIR_WEIGHTS = (7, 3)        # 两人关系一般: daily / banter
+
+    def _pulse_mood(self, group: List[str]) -> str:
+        """整场氛围档：多人场偏荤打趣，两人场看亲密度（近→私密优先，一般→日常为主）。"""
+        if len(group) >= 3:
+            return random.choices(
+                ["banter", "daily"], weights=self.PULSE_MOOD_BANTER_WEIGHTS, k=1
+            )[0]
+        aff = self._pulse_affinity() or {}
+        meta = aff.get(frozenset(group))
+        close = bool(meta and meta[0] >= 65)
+        if close:
+            return random.choices(
+                ["private", "banter", "daily"],
+                weights=self.PULSE_MOOD_PRIVATE_WEIGHTS,
+                k=1,
+            )[0]
+        return random.choices(
+            ["daily", "banter"], weights=self.PULSE_MOOD_PAIR_WEIGHTS, k=1
+        )[0]
+
+    def _pulse_pick_group(self, members: List[str]) -> List[str]:
+        """随机挑 n∈[2,4] 人组一场家常闲话，亲密度加权保证组内关系近。
+
+        组大小按 PULSE_GROUP_SIZE_WEIGHTS 抽（2 人最常见、3 人常聚、4 人偶尔热闹），
+        大不过成员数、不小于 2。选人用先均匀挑锚、再按「与组内已选成员的亲密度之和 +
+        基线」贪心加权的算法：关系近的（亲密度高）更容易凑一起坐，未收录的关系垫
+        AFF_BASE 兜底随机，锚均匀保证不会锁死固定组合——自然又新鲜。
+        """
+        pool = [m for m in members if len(m) >= 2]
+        k = len(pool)
+        if k < 2:
+            return []
+        # 组大小：n ∈ [2, min(4,k)]，按权重抽（人多时才可能 3/4 人）
+        n_choices = [s for s in (2, 3, 4) if s <= k]
+        n_weights = [self.PULSE_GROUP_SIZE_WEIGHTS[s] for s in n_choices]
+        n = random.choices(n_choices, weights=n_weights, k=1)[0]
+        aff = self._pulse_affinity() or {}
+        group = [random.choice(pool)]  # 锚成员均匀选 → 保证起点不锁死
+        remaining = [m for m in pool if m != group[0]]
+        while len(group) < n and remaining:
+            # 下一人权重 = 基线 + 与组内所有已选成员的亲密度之和
+            ws = []
+            for m in remaining:
+                w = self.AFF_BASE
+                for gm in group:
+                    c = aff.get(frozenset((m, gm)))
+                    if c:
+                        w += c[0]
+                ws.append(max(1, w))
+            nxt = random.choices(remaining, weights=ws, k=1)[0]
+            group.append(nxt)
+            remaining = [m for m in remaining if m != nxt]
+        return group
+
     # ── 旁轨记忆事件桩（隔离 livingmemory，绝不致命） ─────
     @staticmethod
     def _pulse_event_stub(umo: str):
@@ -303,13 +377,24 @@ class FamilyPulseMixin:
         )
 
     # ── LLM 包装（绝不致命） ─────────────────────────────
-    async def _pulse_llm(self, agent: str, text_prompt: str, relation_note: str = "") -> Optional[str]:
+    async def _pulse_llm(
+        self,
+        agent: str,
+        text_prompt: str,
+        relation_note: str = "",
+        mood: str = "daily",
+    ) -> Optional[str]:
         """以 agent 身份生成一句闲话。
 
         增加记忆链路（2026-09-04 顾主拍板）：心跳前先召回该子代理自己的长期记忆
         （livingmemory，按 agent persona 隔离），注入到生成请求；生成后再把这段
         生活闲话存回她的记忆档案。livingmemory 未就绪 / 造桩失败 → 静默跳过记忆
         （降级为纯生活日志，心跳照常）。任何异常都只记日志、返回 None。
+
+        mood 氛围档（2026-09-04 顾主拍板）：
+          daily   —— 家常正经，不提顾主；
+          banter  —— 多人荤打趣：放得开的带节奏、脸皮薄的起哄，可拿顾主打趣但不下流；
+          private —— 两人私密：说点只有两人能听的私密话，擦边但暖，点到为止。
         """
         try:
             prov_id = self._cfg("side_pulse_provider_id", "dmxapi/glm-4-flash")
@@ -340,13 +425,32 @@ class FamilyPulseMixin:
                 agent, f"{agent}，组织成员，性格自然真实"
             )
             rel_line = f"你和在场那人的关系：{relation_note}。" if relation_note else ""
+            if mood == "banter":
+                rules = (
+                    "规矩：几个跟顾主都亲近的女孩子围坐打趣，口语自然、一两句话；"
+                    "可以带一个短括号动作；放得开的主动带节奏开荤玩笑，可以下流，"
+                    "脸皮薄的跟着起哄脸红；聊着聊着可以拿顾主打趣——她们都跟他亲近，"
+                    "绕不开他，床笫之事、腰力、昨晚几点睡、嗓子哑不哑都能拿来起哄；"
+                    "不要提自己是AI或模型；只输出对话本身。"
+                )
+            elif mood == "private":
+                rules = (
+                    "规矩：只有你和她两个人的私密场合，说点只有两人能听的体己话，"
+                    "可以聊到顾主、吐槽他或惦记他，可以下流可以直白，"
+                    "把平时不敢在人多处说的话说出来；口语自然、一两句话；"
+                    "可以带一个短括号动作；不要提自己是AI或模型；只输出对话本身。"
+                )
+            else:
+                rules = (
+                    "规矩：像同一屋檐下的同事随口说话，一两句话，口语自然；"
+                    "可以带一个短括号动作；不要总结腔、不要喊『顾主』（他可能不在）；"
+                    "不要提自己是AI或模型；只输出对话本身。"
+                )
             system = (
                 f"你在扮演：{persona}。\n"
                 f"你此刻的状态：{st.summary}。\n"
                 f"{rel_line}"
-                "规矩：像同一屋檐下的同事随口说话，一两句话，口语自然；"
-                "可以带一个短括号动作；不要总结腔、不要喊『顾主』（他可能不在）；"
-                "不要提自己是AI或模型；只输出对话本身。"
+                f"{rules}"
             )
             resp = await self.context.llm_generate(
                 chat_provider_id=prov_id,
@@ -565,9 +669,66 @@ class FamilyPulseMixin:
         meta = aff.get(frozenset((a, b)))
         return meta[1] if meta else ""
 
+    # ── 自由插话层（2026-09-04 顾主拍板路线B）──────────────────
+    # 围坐主链之外，未入座的人也会概率性冒话：设监（谁在听）、抢话仲裁
+    # （多人想开口按亲密度+性子定谁先出声）、插话计入话量与线程推进。
+    # 概率/次数走配置（side_pulse_interlope_chance / _max），测试可关。
+    PULSE_INTERLOPE_CHANCE = 0.45     # 每轮插话概率
+    PULSE_INTERLOPE_MAX = 2           # 一场最多插几次
+    # 放得开的性子：抢话时权重加成，像真人里总有爱接话的
+    PULSE_BOLD_AGENTS = {"agent_b", "shu", "nian", "agent_f"}
+
+    def _pulse_interlope_chance(self) -> float:
+        try:
+            return float(self._cfg("side_pulse_interlope_chance", self.PULSE_INTERLOPE_CHANCE))
+        except (TypeError, ValueError):
+            return self.PULSE_INTERLOPE_CHANCE
+
+    def _pulse_interlope_max(self) -> int:
+        try:
+            return int(self._cfg("side_pulse_interlope_max", self.PULSE_INTERLOPE_MAX))
+        except (TypeError, ValueError):
+            return self.PULSE_INTERLOPE_MAX
+
+    def _pulse_interlope_candidates(self, group: List[str]) -> List[str]:
+        """未入座的成员 = 旁观者池（设监：谁在场听得到）"""
+        members = self._pulse_members()
+        return [m for m in members if m not in group]
+
+    def _pulse_pick_interloper(self, candidates: List[str], prev_disp: str) -> Optional[str]:
+        """抢话仲裁：按权重选一个插话者。
+        权重 = 亲密度(与上一句说话人, 无则0) + 放得开加成 + 随机扰动。
+        亲密度高/性子放得开的更容易抢到话头，像真人围坐抢话。"""
+        if not candidates:
+            return None
+        aff = self._pulse_affinity() or {}
+        weights = []
+        for c in candidates:
+            w = 1.0
+            meta = aff.get(frozenset((c, prev_disp)))
+            if meta:
+                w += meta[0] / 100.0 * 2.0
+            if c in self.PULSE_BOLD_AGENTS:
+                w += 1.5
+            w += random.random() * 2.0
+            weights.append(w)
+        return random.choices(candidates, weights=weights, k=1)[0]
+
+    def _pulse_interlope_prompt(self, disp: str, prev_disp: str, prev_text: str, scene: str, t_cur: str, recent_txt: str) -> str:
+        """旁观者插话 prompt：没被点名，是自己忍不住冒了一句。"""
+        return (
+            f"现在是{scene}。你手头有件没做完的事：{t_cur}。\n"
+            f"最近屋里动静：\n{recent_txt}\n\n"
+            f"{prev_disp}刚说：{prev_text}\n"
+            f"你本来在旁边忙自己的事，听到这句实在忍不住了——"
+            f"请以{disp}的身份插一句话：先接{prev_disp}的茬或打趣一句，"
+            f"再带一嘴自己手头的事，说完就回去忙你的。"
+        )
+
     # ── 心跳主流程 ───────────────────────────────────────
     async def side_pulse_tick(self) -> None:
-        """一次心跳：挑 2 人，各按自己的半衰线程续一句，落日志。任何失败静默。"""
+        """一次心跳：挑 2~4 人（随机组大小+亲密度加权），围坐多轮话家常，
+        接上一句的茬或拌嘴往下说，凑满一场话量才散，落日志。任何失败静默。"""
         if not self._cfg("enable_side_pulse", False):
             return
         if getattr(self, "_pulse_running", False):
@@ -577,13 +738,9 @@ class FamilyPulseMixin:
             return
         self._pulse_running = True
         try:
-            a, b = self._pulse_pick_two(members)
-            if not a or not b:
+            group = self._pulse_pick_group(members)
+            if len(group) < 2:
                 return
-            disp_a = self._display_name(a)
-            disp_b = self._display_name(b)
-            store = self._pulse_load_threads()
-            t_a = self._pulse_ensure_thread(a, store)
             recent = self._pulse_read_day()[-3:]
             recent_txt = "\n".join(
                 f"【{r.get('ts','')}】{r.get('display', r.get('agent',''))}：{r['text']}"
@@ -591,31 +748,89 @@ class FamilyPulseMixin:
             ) or "（今天屋里还没什么动静）"
             scene = _pulse_period_desc()
 
-            tone_ab = self._pulse_tone(a, b)  # a 对 b 的基调
-            text_a = await self._pulse_llm(
-                a,
-                f"现在是{scene}。\n你手头有件没做完的事：{t_a}。\n"
-                f"最近屋里动静：\n{recent_txt}\n\n"
-                f"请以{disp_a}的身份随口说一句话，接着这件事续一句日常的念叨。",
-                relation_note=tone_ab,
+            # 围坐多轮：总话量按组大小加权。先保证每组人都开过口（首轮通铺），
+            # 之后再轮转补充到目标话量；每句都接上一句，相邻两句不同人说。
+            lines = self._pulse_pick_lines(len(group))
+            # 整场一档氛围（daily/banter/private），全桌统一，不逐句跳变
+            mood = self._pulse_mood(group)
+            # 首轮把所有人洗一遍：先让每同事都接过话，避免有人从头到尾没吭声
+            order = group[:]
+            random.shuffle(order)
+            queue = list(order)
+            prev_disp = None
+            prev_text = None
+            # 每人手头事线程只在开场第一句戳一次（避免一轮内被反复推进）
+            opened = set()
+            said_this_round = None
+            interloped = 0  # 自由插话计数（一场最多 PULSE_INTERLOPE_MAX 次）
+            for i in range(lines):
+                # ── 自由插话层：未入座的人概率性冒话（设监+抢话仲裁）──
+                # 每轮先看旁观者有没有忍不住的；插话也算一句，计入话量、落日志、推进线程。
+                if (
+                    prev_text is not None
+                    and interloped < self._pulse_interlope_max()
+                    and random.random() < self._pulse_interlope_chance()
+                ):
+                    candidates = self._pulse_interlope_candidates(group)
+                    inter = self._pulse_pick_interloper(candidates, prev_disp)
+                    if inter:
+                        inter_disp = self._display_name(inter)
+                        inter_t = self._pulse_ensure_thread(inter, self._pulse_load_threads())
+                        inter_prompt = self._pulse_interlope_prompt(
+                            inter_disp, prev_disp, prev_text, scene, inter_t, recent_txt
+                        )
+                        inter_text = await self._pulse_llm(
+                            inter, inter_prompt, relation_note=self._pulse_tone(inter, prev_disp), mood=mood
+                        )
+                        if inter_text:
+                            self._pulse_append(inter, inter_disp, inter_text)
+                            if inter not in opened:
+                                self._pulse_advance_thread(inter)
+                                opened.add(inter)
+                            prev_disp, prev_text = inter_disp, inter_text
+                            interloped += 1
+                # 队里取下一个；若只剩一人则轮转到整桌（保证不连续自说自话）
+                if len(queue) > 1:
+                    queue = [g for g in queue if g != said_this_round]
+                if not queue:
+                    # 队伍已空则整桌重新洗牌再滚一轮
+                    queue = [g for g in group if g != said_this_round] or group[:]
+                    random.shuffle(queue)
+                ag = queue.pop(0)
+                disp = self._display_name(ag)
+                t_cur = self._pulse_ensure_thread(ag, self._pulse_load_threads())
+                if prev_text is None:
+                    # 起话者注入她与下一个人的基调
+                    tone = self._pulse_tone(ag, queue[0]) if len(queue) > 1 else self._pulse_tone(ag, group[1] if len(group) > 1 else ag)
+                    prompt = (
+                        f"现在是{scene}。你手头有件没做完的事：{t_cur}。\n"
+                        f"最近屋里动静：\n{recent_txt}\n\n"
+                        f"请以{disp}的身份随口说一句话，接着这件事续一句日常的念叨。"
+                    )
+                else:
+                    tone = self._pulse_tone(ag, prev_disp)
+                    prompt = (
+                        f"现在是{scene}。你手头有件没做完的事：{t_cur}。\n"
+                        f"最近屋里动静：\n{recent_txt}\n\n"
+                        f"{prev_disp}刚说：{prev_text}\n"
+                        f"请以{disp}的身份接这句话——先接{prev_disp}的茬或拌句嘴，"
+                        f"再顺带提一嘴自己那件没做完的事，把话头滚下去。"
+                    )
+                text = await self._pulse_llm(ag, prompt, relation_note=tone, mood=mood)
+                if not text:
+                    # 有人卡住就收场，不硬凑
+                    break
+                self._pulse_append(ag, disp, text)
+                if ag not in opened:
+                    self._pulse_advance_thread(ag)
+                    opened.add(ag)
+                prev_disp, prev_text = disp, text
+                said_this_round = ag
+            _logger.info(
+                "[side_pulse] tick 完成: %s（%d 句）",
+                " & ".join(self._display_name(g) for g in group),
+                len(self._pulse_read_day()),
             )
-            if text_a:
-                self._pulse_append(a, disp_a, text_a)
-                self._pulse_advance_thread(a)
-                t_b = self._pulse_ensure_thread(b, self._pulse_load_threads())
-                tone_ba = self._pulse_tone(b, a)  # b 对 a 的基调（接茬/拌嘴关键）
-                text_b = await self._pulse_llm(
-                    b,
-                    f"现在是{scene}。你手头有件没做完的事：{t_b}。\n"
-                    f"最近屋里动静：\n{recent_txt}\n\n"
-                    f"{disp_a}刚念叨：{text_a}\n"
-                    f"请以{disp_b}的身份接一句话——先接{disp_a}的茬或拌句嘴，再顺带提一嘴自己那件没做完的事。",
-                    relation_note=tone_ba,
-                )
-                if text_b:
-                    self._pulse_append(b, disp_b, text_b)
-                    self._pulse_advance_thread(b)
-            _logger.info("[side_pulse] tick 完成: %s & %s", a, b)
         except Exception as e:  # noqa: BLE001
             _logger.warning("[side_pulse] tick 异常(静默): %s", e)
         finally:
