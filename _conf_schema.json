@@ -292,5 +292,17 @@
     "type": "int",
     "default": 2,
     "hint": "一场心跳最多让旁观者插几次话，防止插话刷屏盖过主链。"
+  },
+  "side_pulse_host_chance": {
+    "description": "主代理（主代理）参与旁轨插话概率",
+    "type": "float",
+    "default": 0.3,
+    "hint": "围坐闲聊时主代理以自己身份插话的概率 0~1。0=主代理不参与（默认纯子代理围坐）；调高=女主人更常冒话。顾主 2026-09-04 拍板要参与。"
+  },
+  "side_pulse_host_max": {
+    "description": "主代理一场最多插话次数",
+    "type": "int",
+    "default": 2,
+    "hint": "一场心跳里主代理最多插几次话，防止喧宾夺主。"
   }
 }

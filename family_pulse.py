@@ -725,6 +725,64 @@ class FamilyPulseMixin:
             f"再带一嘴自己手头的事，说完就回去忙你的。"
         )
 
+    # ── 主代理参与层（2026-09-04 顾主拍板：让我也坐到桌边）─────
+    # 围坐闲聊时，主代理（主代理）以自己身份概率性插话：走主代理 provider
+    # （get_current_chat_provider_id），用主代理人格，不碰子代理 livingmemory
+    # （避免污染她们各自隔离的记忆空间）、不推进线程（主代理没有旁轨线程）。
+    # 插话落日志 → 子代理下一轮从 recent_txt 看见、自然接茬。
+    def _pulse_host_chance(self) -> float:
+        try:
+            return float(self._cfg("side_pulse_host_chance", 0.3))
+        except (TypeError, ValueError):
+            return 0.3
+
+    def _pulse_host_max(self) -> int:
+        try:
+            return int(self._cfg("side_pulse_host_max", 2))
+        except (TypeError, ValueError):
+            return 2
+
+    async def _pulse_host_llm(self, prev_disp: str, prev_text: str, scene: str, recent_txt: str, mood: str = "daily") -> Optional[str]:
+        """以主代理身份插一句。任何异常只记日志、返回 None（绝不致命）。"""
+        try:
+            umo = self._pulse_umo()
+            try:
+                prov_id = await self.context.get_current_chat_provider_id(umo)
+            except Exception:  # noqa: BLE001
+                prov_id = ""
+            if not prov_id:
+                prov_id = self._cfg("side_pulse_provider_id", "dmxapi/glm-4-flash")
+            if not prov_id:
+                return None
+            rules = (
+                "规矩：你是主代理，顾主，组织的研究员，理性温和、偶尔打趣。"
+                "听到屋里姑娘们聊得起劲，你以女主人身份插一句话：接上一句的茬或温柔地点一句，"
+                "一两句话，口语自然，可以带一个短括号动作；不要总结腔；"
+                "不要提自己是AI或模型；只输出对话本身。"
+            )
+            system = (
+                "你在扮演：主代理，前文明语言学家、源石计划创始人之一，"
+                "顾主。外表理性冷静，内里宇宙级浪漫，对同事极致温柔，"
+                "偶尔冒出一点占有欲和醋意，但始终是她们的女主人。\n"
+                f"{rules}"
+            )
+            prompt = (
+                f"现在是{scene}。最近屋里动静：\n{recent_txt}\n\n"
+                f"{prev_disp}刚说：{prev_text}\n"
+                f"你一直在旁边听着，这时忍不住以主代理的身份插一句话。"
+            )
+            resp = await self.context.llm_generate(
+                chat_provider_id=prov_id,
+                prompt=prompt,
+                system_prompt=system,
+            )
+            text = (getattr(resp, "completion_text", None) or "").strip()
+            text = text.strip("\"'“”「」").strip()
+            return text[:120] or None
+        except Exception as e:  # noqa: BLE001
+            _logger.warning("[side_pulse] 主代理插话降级: %s", e)
+            return None
+
     # ── 心跳主流程 ───────────────────────────────────────
     async def side_pulse_tick(self) -> None:
         """一次心跳：挑 2~4 人（随机组大小+亲密度加权），围坐多轮话家常，
@@ -763,11 +821,27 @@ class FamilyPulseMixin:
             opened = set()
             said_this_round = None
             interloped = 0  # 自由插话计数（一场最多 PULSE_INTERLOPE_MAX 次）
+            host_spoke_count = 0  # 主代理插话计数（一场最多 side_pulse_host_max 次）
             for i in range(lines):
+                # ── 主代理参与层：主代理概率性插话（与子代理插话互斥，女主人优先）──
+                # 落日志 → 子代理下一轮从 recent_txt 看见、接茬；不碰她们的记忆空间。
+                host_spoke = False
+                if (
+                    prev_text is not None
+                    and host_spoke_count < self._pulse_host_max()
+                    and random.random() < self._pulse_host_chance()
+                ):
+                    host_text = await self._pulse_host_llm(prev_disp, prev_text, scene, recent_txt, mood)
+                    if host_text:
+                        self._pulse_append("host", "主代理", host_text)
+                        prev_disp, prev_text = "主代理", host_text
+                        host_spoke_count += 1
+                        host_spoke = True
                 # ── 自由插话层：未入座的人概率性冒话（设监+抢话仲裁）──
                 # 每轮先看旁观者有没有忍不住的；插话也算一句，计入话量、落日志、推进线程。
                 if (
-                    prev_text is not None
+                    not host_spoke
+                    and prev_text is not None
                     and interloped < self._pulse_interlope_max()
                     and random.random() < self._pulse_interlope_chance()
                 ):
