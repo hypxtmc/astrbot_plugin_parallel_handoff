@@ -134,6 +134,12 @@ class ParallelHandoffPlugin(
         故不破坏 DeepSeek 前缀缓存命中率；mark_as_temp 置 _no_save，不写入对话历史。
         已含标记则跳过，避免 agent 循环多轮重复注入。
         """
+        # [2026-09-04 博士拍板] 拉博士接回旁路：主代理链路零侵入检测博士私聊回复，
+        # 命中则注入旁轨日志 + 异步触发接茬（不 stop_event、不拦截，主代理照常回复博士）。
+        try:
+            self._pulse_draft_reply_check(event)
+        except Exception:  # noqa: BLE001
+            pass
         return await super()._route_directive_inject(event, req)
 
     # ── 事件注册：小模型路由层（T1规则/T2小模型/T3兜底，实现见 router.py RouterMixin） ──

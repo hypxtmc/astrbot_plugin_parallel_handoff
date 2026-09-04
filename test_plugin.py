@@ -2144,6 +2144,7 @@ class TestFamilyPulse(unittest.TestCase):
             "family_pulse_interlope_max": 0,
             "family_pulse_host_chance": 0,
             "family_pulse_host_max": 0,
+            "family_pulse_draft_enable": False,
         }
         if config:
             base.update(config)
@@ -2177,7 +2178,7 @@ class TestFamilyPulse(unittest.TestCase):
         self.assertEqual(p._pulse_members(), ["amiya", "shu", "closure"])
 
     def test_schema_has_pulse_keys(self):
-        """schema 必须包含家庭旁轨 10 个配置项且开关默认 False"""
+        """schema 必须包含家庭旁轨 16 个配置项且开关默认 False"""
         schema_path = os.path.join(PLUGIN_DIR, "_conf_schema.json")
         schema = json.load(open(schema_path, encoding="utf-8"))
         for key in (
@@ -2191,6 +2192,11 @@ class TestFamilyPulse(unittest.TestCase):
             "family_pulse_interlope_max",
             "family_pulse_host_chance",
             "family_pulse_host_max",
+            "family_pulse_draft_enable",
+            "family_pulse_draft_chance_workday",
+            "family_pulse_draft_chance_holiday",
+            "family_pulse_draft_quota_workday",
+            "family_pulse_draft_quota_holiday",
         ):
             self.assertIn(key, schema)
         self.assertIs(schema["enable_family_pulse"]["default"], False)
@@ -2719,6 +2725,108 @@ class TestFamilyPulse(unittest.TestCase):
         asyncio.run(p.family_pulse_tick())
         logs = p._pulse_read_day()
         self.assertTrue(any(r["agent"] == "host" for r in logs), "主代理应出现在日志里")
+
+    # ── 拉博士（2026-09-04 博士拍板：围坐聊到兴头把博士拉进来） ──
+    def test_draft_chance_workday_vs_holiday(self):
+        """工作日概率低、节假日（含双休）概率高，总开关关闭返回 0"""
+        p = self._make({"family_pulse_draft_enable": False})
+        self.assertEqual(p._pulse_draft_chance(), 0.0)
+        p2 = self._make({"family_pulse_draft_enable": True, "family_pulse_draft_chance_workday": 0.1, "family_pulse_draft_chance_holiday": 0.3})
+        import datetime
+        from zoneinfo import ZoneInfo
+
+        wd = datetime.datetime.now(ZoneInfo("Asia/Shanghai")).weekday()
+        expected = 0.3 if wd >= 5 else 0.1
+        self.assertAlmostEqual(p2._pulse_draft_chance(), expected)
+
+    def test_draft_quota_workday_vs_holiday(self):
+        """配额：工作日 2 次、节假日 5 次，双休算节假日"""
+        p = self._make({"family_pulse_draft_quota_workday": 2, "family_pulse_draft_quota_holiday": 5})
+        import datetime
+        from zoneinfo import ZoneInfo
+
+        wd = datetime.datetime.now(ZoneInfo("Asia/Shanghai")).weekday()
+        expected = 5 if wd >= 5 else 2
+        self.assertEqual(p._pulse_draft_quota(), expected)
+
+    def test_draft_ready_gates(self):
+        """拉人门禁：总开关关→False；等待中→False；超配额→False；冷却内→False"""
+        p = self._make({"family_pulse_draft_enable": False})
+        self.assertFalse(p._pulse_draft_ready())
+        p2 = self._make({"family_pulse_draft_enable": True, "family_pulse_draft_quota_workday": 2})
+        import datetime
+        from zoneinfo import ZoneInfo
+
+        today = datetime.datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
+        p2._pulse_draft_save({"date": today, "count": 99, "awaiting": False, "last_ts": None})
+        self.assertFalse(p2._pulse_draft_ready(), "超配额应拒绝")
+
+    def test_draft_pick_drafter_returns_valid(self):
+        """发起者二选一：只返回 host 或子代理池成员（不返回陌生人）"""
+        p = self._make({})
+        members = p._pulse_members()
+        for _ in range(50):
+            d = p._pulse_pick_drafter(["amiya", "shu"], "阿米娅")
+            self.assertIn(d, set(members) | {"host"})
+
+    def test_draft_send_pushes_and_sets_state(self):
+        """召唤推送：落日志 + send_message 到博士私聊 + 状态置为等待回复"""
+        p = self._make({
+            "enable_family_pulse": True,
+            "family_pulse_draft_enable": True,
+            "family_pulse_digest_umo": "test:FriendMessage:TESTUSER00000000000000000000000000",
+        })
+        p.context.send_message = AsyncMock()
+        p.context.get_current_chat_provider_id = AsyncMock(return_value="test-provider")
+        p.context.llm_generate = AsyncMock(return_value=self._resp("博士！你快来评评理"))
+        ok = asyncio.run(p._pulse_send_draft("amiya", "黍", "今天的汤是不是咸了", "晚上", "屋里很热闹"))
+        self.assertTrue(ok)
+        logs = p._pulse_read_day()
+        self.assertTrue(any(r["agent"] == "amiya" for r in logs), "召唤语应落旁轨日志")
+        p.context.send_message.assert_awaited()
+        st = p._pulse_draft_load()
+        self.assertTrue(st.get("awaiting"), "应置为等待博士回复")
+        self.assertGreater(st.get("count", 0), 0)
+
+    def test_draft_reply_check_injects_doctor(self):
+        """博士私聊回复：注入旁轨日志(agent=doctor) + 触发接茬 + 清除等待"""
+        p = self._make({
+            "enable_family_pulse": True,
+            "family_pulse_draft_enable": True,
+        })
+        p._pulse_draft_save({
+            "date": "2099-01-01", "count": 1, "awaiting": True,
+            "await_until": "2099-01-02T00:00:00+08:00", "draft_by": "amiya",
+        })
+        event = MagicMock()
+        event.get_message_str.return_value = "我来啦，汤咸了？我尝尝"
+        event.get_message_type.return_value = "FriendMessage"
+        event.get_sender_id.return_value = "TESTUSER00000000000000000000000000"
+        p.context.llm_generate = AsyncMock(return_value=self._resp("博士你终于来了"))
+
+        async def _run():
+            return p._pulse_draft_reply_check(event)
+
+        ok = asyncio.run(_run())
+        self.assertTrue(ok)
+        logs = p._pulse_read_day()
+        self.assertTrue(any(r["agent"] == "doctor" for r in logs), "博士的话应注入旁轨")
+        self.assertFalse(p._pulse_draft_load().get("awaiting"), "接回后应清除等待")
+
+    def test_draft_reply_check_ignores_others(self):
+        """非博士私聊消息：不注入、不触发（等回复状态保留）"""
+        p = self._make({"enable_family_pulse": True, "family_pulse_draft_enable": True})
+        p._pulse_draft_save({
+            "date": "2099-01-01", "count": 1, "awaiting": True,
+            "await_until": "2099-01-02T00:00:00+08:00", "draft_by": "amiya",
+        })
+        event = MagicMock()
+        event.get_message_str.return_value = "有人吗"
+        event.get_message_type.return_value = "GroupMessage"
+        event.get_sender_id.return_value = "other_user"
+        ok = p._pulse_draft_reply_check(event)
+        self.assertFalse(ok)
+        self.assertTrue(p._pulse_draft_load().get("awaiting"), "非博士消息不应消费等待状态")
 
     # ── 摘要 ──
     def test_digest_no_logs_no_send(self):
