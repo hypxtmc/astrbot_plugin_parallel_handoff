@@ -2142,6 +2142,8 @@ class TestFamilyPulse(unittest.TestCase):
         base = {
             "family_pulse_interlope_chance": 0,
             "family_pulse_interlope_max": 0,
+            "family_pulse_host_chance": 0,
+            "family_pulse_host_max": 0,
         }
         if config:
             base.update(config)
@@ -2175,7 +2177,7 @@ class TestFamilyPulse(unittest.TestCase):
         self.assertEqual(p._pulse_members(), ["amiya", "shu", "closure"])
 
     def test_schema_has_pulse_keys(self):
-        """schema 必须包含家庭旁轨 8 个配置项且开关默认 False"""
+        """schema 必须包含家庭旁轨 10 个配置项且开关默认 False"""
         schema_path = os.path.join(PLUGIN_DIR, "_conf_schema.json")
         schema = json.load(open(schema_path, encoding="utf-8"))
         for key in (
@@ -2187,6 +2189,8 @@ class TestFamilyPulse(unittest.TestCase):
             "family_pulse_digest_umo",
             "family_pulse_interlope_chance",
             "family_pulse_interlope_max",
+            "family_pulse_host_chance",
+            "family_pulse_host_max",
         ):
             self.assertIn(key, schema)
         self.assertIs(schema["enable_family_pulse"]["default"], False)
@@ -2672,6 +2676,49 @@ class TestFamilyPulse(unittest.TestCase):
         logs = p._pulse_read_day()
         self.assertEqual(len(logs), 2)
         self.assertEqual({r["agent"] for r in logs}, {"amiya", "shu"})
+
+    # ── 主代理参与（博士 2026-09-04 拍板：让普瑞赛斯坐到桌边）──
+    def test_host_chance_defaults(self):
+        """主代理插话概率/次数走配置：显式值生效，_make 默认关（回归保护）"""
+        p = self._make({"family_pulse_host_chance": 0.3, "family_pulse_host_max": 2})
+        self.assertAlmostEqual(p._pulse_host_chance(), 0.3)
+        self.assertEqual(p._pulse_host_max(), 2)
+        p2 = self._make({"family_pulse_host_chance": 0.8, "family_pulse_host_max": 1})
+        self.assertAlmostEqual(p2._pulse_host_chance(), 0.8)
+        self.assertEqual(p2._pulse_host_max(), 1)
+        # 非法值回退默认
+        p3 = self._make({"family_pulse_host_chance": "abc", "family_pulse_host_max": "xyz"})
+        self.assertAlmostEqual(p3._pulse_host_chance(), 0.3)
+        self.assertEqual(p3._pulse_host_max(), 2)
+
+    def test_host_llm_returns_text(self):
+        """主代理插话走主代理 provider + 普瑞赛斯人格，返回一句闲话"""
+        p = self._make({})
+        p.context.get_current_chat_provider_id = AsyncMock(return_value="test-provider")
+        p.context.llm_generate = AsyncMock(return_value=self._resp("都聊到这儿了，加我一个"))
+        text = asyncio.run(p._pulse_host_llm("阿米娅", "今天的活儿干完了", "晚上", "屋里很安静"))
+        self.assertEqual(text, "都聊到这儿了，加我一个")
+        sys_p = p.context.llm_generate.call_args.kwargs["system_prompt"]
+        self.assertIn("普瑞赛斯", sys_p)
+
+    def test_tick_host_injects_log(self):
+        """主代理插话落日志、更新 prev，子代理下一句接她的茬"""
+        p = self._make({
+            "enable_family_pulse": True,
+            "family_pulse_host_chance": 1.0,
+            "family_pulse_host_max": 2,
+        })
+        p._pulse_pick_group = lambda members: ["amiya", "shu"]
+        p._pulse_pick_lines = lambda group_size: 3
+        p.context.get_current_chat_provider_id = AsyncMock(return_value="test-provider")
+
+        async def _fake_llm(**kwargs):
+            return self._resp("都聊到这儿了，加我一个")
+
+        p.context.llm_generate = AsyncMock(side_effect=_fake_llm)
+        asyncio.run(p.family_pulse_tick())
+        logs = p._pulse_read_day()
+        self.assertTrue(any(r["agent"] == "host" for r in logs), "主代理应出现在日志里")
 
     # ── 摘要 ──
     def test_digest_no_logs_no_send(self):
