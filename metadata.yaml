@@ -1,5 +1,5 @@
 name: parallel_handoff
-version: 2.3.0
+version: 2.4.0
 author: hypxtmc
 desc: 并行子代理调用插件 — 支持主代理同时调用多个子代理并汇总回复。支持分段转发、姓名前缀、场景注入、热重载等功能
 repo: https://github.com/hypxtmc/parallel_handoff

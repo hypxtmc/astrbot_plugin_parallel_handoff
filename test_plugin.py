@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import unittest
+from unittest import mock
 from unittest.mock import AsyncMock, MagicMock
 
 # 确保插件目录在 sys.path 中
@@ -2134,8 +2135,17 @@ class TestFamilyPulse(unittest.TestCase):
         shutil.rmtree(self._tmp, ignore_errors=True)
 
     def _make(self, config: dict = None):
+        """测试桩插件：临时目录隔离状态与关系网。
+        默认关闭自由插话（family_pulse_interlope_chance=0）——现有 tick 测试锁定话量/await
+        次数，插话会随机破坏精确断言；插话专项测试显式开启。"""
         ctx = MagicMock()
-        plugin = self.PluginClass(context=ctx, config=config or {})
+        base = {
+            "family_pulse_interlope_chance": 0,
+            "family_pulse_interlope_max": 0,
+        }
+        if config:
+            base.update(config)
+        plugin = self.PluginClass(context=ctx, config=base)
         # 测试桩的假 Star.__init__ 不保存 context，手动挂回供 FamilyPulseMixin 使用
         plugin.context = ctx
         plugin._pulse_root = self._tmp
@@ -2165,7 +2175,7 @@ class TestFamilyPulse(unittest.TestCase):
         self.assertEqual(p._pulse_members(), ["amiya", "shu", "closure"])
 
     def test_schema_has_pulse_keys(self):
-        """schema 必须包含家庭旁轨 6 个配置项且开关默认 False"""
+        """schema 必须包含家庭旁轨 8 个配置项且开关默认 False"""
         schema_path = os.path.join(PLUGIN_DIR, "_conf_schema.json")
         schema = json.load(open(schema_path, encoding="utf-8"))
         for key in (
@@ -2175,6 +2185,8 @@ class TestFamilyPulse(unittest.TestCase):
             "family_pulse_digest_cron",
             "family_pulse_provider_id",
             "family_pulse_digest_umo",
+            "family_pulse_interlope_chance",
+            "family_pulse_interlope_max",
         ):
             self.assertIn(key, schema)
         self.assertIs(schema["enable_family_pulse"]["default"], False)
@@ -2479,13 +2491,47 @@ class TestFamilyPulse(unittest.TestCase):
         self.assertEqual(p._pulse_read_day(), [])
 
     def test_tick_success_writes_log(self):
-        """心跳成功：两人各落一条日志"""
+        """心跳成功：两人各落一条日志（固定二人组，锁定断言）"""
         p = self._make({"enable_family_pulse": True})
+        p._pulse_pick_group = lambda members: ["amiya", "shu"]
+        p._pulse_pick_lines = lambda group_size: 2
         p.context.llm_generate = AsyncMock(return_value=self._resp("刚把柳木画板搬去晾"))
         asyncio.run(p.family_pulse_tick())
         logs = p._pulse_read_day()
         self.assertEqual(len(logs), 2)
         self.assertEqual(len({r["agent"] for r in logs}), 2)
+
+    def test_tick_success_writes_log_three(self):
+        """三人组心跳：三人各落一条，且后者会接着前一个人的茬（chain 连贯）"""
+        p = self._make({"enable_family_pulse": True})
+        p._pulse_pick_group = lambda members: ["amiya", "shu", "xi"]
+        p._pulse_pick_lines = lambda group_size: 3
+        prompts = []
+
+        async def capture(**kw):
+            prompts.append(kw.get("prompt", ""))
+            return self._resp("刚把柳木画板搬去晾")
+
+        p.context.llm_generate = capture
+        asyncio.run(p.family_pulse_tick())
+        logs = p._pulse_read_day()
+        self.assertEqual(len(logs), 3)
+        self.assertEqual(len({r["agent"] for r in logs}), 3)
+        # 第二、三人的 prompt 都带上前一个人刚说的话（接茬链）
+        self.assertEqual(len(prompts), 3)
+        self.assertIn("刚把柳木画板搬去晾", prompts[1])
+        self.assertIn("刚把柳木画板搬去晾", prompts[2])
+
+    def test_tick_success_writes_log_four(self):
+        """四人组心跳：四人各落一条，围坐唠嗑也能串成一条链"""
+        p = self._make({"enable_family_pulse": True})
+        p._pulse_pick_group = lambda members: ["amiya", "shu", "xi", "closure"]
+        p._pulse_pick_lines = lambda group_size: 4
+        p.context.llm_generate = AsyncMock(return_value=self._resp("刚把柳木画板搬去晾"))
+        asyncio.run(p.family_pulse_tick())
+        logs = p._pulse_read_day()
+        self.assertEqual(len(logs), 4)
+        self.assertEqual(len({r["agent"] for r in logs}), 4)
 
     def test_tick_llm_failure_silent(self):
         """LLM 全挂：静默跳过，不炸、不落日志"""
@@ -2537,6 +2583,8 @@ class TestFamilyPulse(unittest.TestCase):
         p._find_livingmemory_plugin = lambda: object()  # 找到插件
         p._memory_recall = fake_recall
         p._memory_store = fake_store
+        p._pulse_pick_group = lambda members: ["amiya", "shu"]
+        p._pulse_pick_lines = lambda group_size: 2
         p.context.llm_generate = AsyncMock(return_value=self._resp("刚把柳木画板搬去晾"))
         asyncio.run(p.family_pulse_tick())
         self.assertEqual(p.context.llm_generate.await_count, 2)
@@ -2569,6 +2617,8 @@ class TestFamilyPulse(unittest.TestCase):
 
         p._find_livingmemory_plugin = lambda: object()
         p._memory_recall = boom
+        p._pulse_pick_group = lambda members: ["amiya", "shu"]
+        p._pulse_pick_lines = lambda group_size: 2
         p.context.llm_generate = AsyncMock(return_value=self._resp("刚把柳木画板搬去晾"))
         asyncio.run(p.family_pulse_tick())
         # 心跳照常跑完、两人都说了话
@@ -2581,6 +2631,47 @@ class TestFamilyPulse(unittest.TestCase):
 
     def _pulse_extra_parts(self, kwargs):
         return kwargs.get("extra_user_content_parts") or []
+
+    # ── 自由插话（路线B, 2026-09-04 博士拍板）──
+    def test_interlope_candidates_excludes_group(self):
+        """旁观者池 = 全家池减去入座者：设监在场的人才有资格插话"""
+        p = self._make({})
+        cands = p._pulse_interlope_candidates(["amiya", "shu"])
+        self.assertNotIn("amiya", cands)
+        self.assertNotIn("shu", cands)
+        self.assertGreaterEqual(len(cands), 1)
+
+    def test_pick_interloper_returns_candidate(self):
+        """抢话仲裁：多人候选必返回其一，且从候选池里出"""
+        p = self._make({})
+        cands = ["closure", "xi", "ling"]
+        picked = p._pulse_pick_interloper(cands, "阿米娅")
+        self.assertIn(picked, cands)
+        self.assertIsNone(p._pulse_pick_interloper([], "阿米娅"))
+
+    def test_tick_interlope_injects_extra_speaker(self):
+        """自由插话：未入座的人概率性冒话，多出一句、落日志、推进其线程"""
+        p = self._make({"enable_family_pulse": True, "family_pulse_interlope_chance": 1.0, "family_pulse_interlope_max": 2})
+        p._pulse_pick_group = lambda members: ["amiya", "shu"]
+        p._pulse_pick_lines = lambda group_size: 2
+        p.context.llm_generate = AsyncMock(return_value=self._resp("刚把柳木画板搬去晾"))
+        asyncio.run(p.family_pulse_tick())
+        logs = p._pulse_read_day()
+        # 原两人各一句 + 至少一次旁观插话
+        self.assertGreaterEqual(len(logs), 3)
+        agents = {r["agent"] for r in logs}
+        self.assertTrue(agents - {"amiya", "shu"}, "插话者应来自未入座的人")
+
+    def test_tick_interlope_disabled_by_default(self):
+        """默认/显式关闭时：不插话，话量与入座者一致（回归保护）"""
+        p = self._make({"enable_family_pulse": True})
+        p._pulse_pick_group = lambda members: ["amiya", "shu"]
+        p._pulse_pick_lines = lambda group_size: 2
+        p.context.llm_generate = AsyncMock(return_value=self._resp("刚把柳木画板搬去晾"))
+        asyncio.run(p.family_pulse_tick())
+        logs = p._pulse_read_day()
+        self.assertEqual(len(logs), 2)
+        self.assertEqual({r["agent"] for r in logs}, {"amiya", "shu"})
 
     # ── 摘要 ──
     def test_digest_no_logs_no_send(self):
@@ -2659,3 +2750,63 @@ class TestFamilyPulse(unittest.TestCase):
         )
         asyncio.run(p.initialize())
         self.assertEqual(p.context.cron_manager.add_basic_job.await_count, 2)
+
+    # ── 氛围三档（2026-09-04 博士拍板：家里聊荤的可以下流）──
+    def test_pulse_mood_group_branches(self):
+        """多人场只出 banter/daily；两人近关系可 private；两人一般以 daily 为主"""
+        import family_pulse as fp_mod
+
+        p = self._make({})
+        # 固定 random.choices 选第一个候选，验证各分支的候选池
+        with mock.patch.object(fp_mod.random, "choices", return_value=["banter"]) as mc:
+            self.assertEqual(p._pulse_mood(["a", "b", "c"]), "banter")
+            self.assertEqual(mc.call_args.args[0], ["banter", "daily"])
+        # 两人 + 亲密度高（写关系网 80）→ 候选含 private
+        p2 = self._make({})
+        self._write_affinity(p2, {"阿米娅<->黍": {"亲密度": 80, "基调": "互相惦记"}})
+        with mock.patch.object(fp_mod.random, "choices", return_value=["private"]) as mc:
+            self.assertEqual(p2._pulse_mood(["amiya", "shu"]), "private")
+            self.assertEqual(mc.call_args.args[0], ["private", "banter", "daily"])
+        # 两人 + 无关系网 → 候选以 daily 为主
+        p3 = self._make({})
+        with mock.patch.object(fp_mod.random, "choices", return_value=["daily"]) as mc:
+            self.assertEqual(p3._pulse_mood(["xi", "nian"]), "daily")
+            self.assertEqual(mc.call_args.args[0], ["daily", "banter"])
+
+    def test_tick_mood_banter_injects_spicy_rules(self):
+        """banter 场：system prompt 带『可以下流』『拿博士打趣』，且不禁止喊博士"""
+        p = self._make({"enable_family_pulse": True})
+        p._pulse_pick_group = lambda members: ["amiya", "shu", "closure"]
+        p._pulse_pick_lines = lambda group_size: 3
+        p._pulse_mood = lambda group: "banter"
+        p.context.llm_generate = AsyncMock(return_value=self._resp("刚把柳木画板搬去晾"))
+        asyncio.run(p.family_pulse_tick())
+        calls = p.context.llm_generate.call_args_list
+        sys0 = calls[0].kwargs.get("system_prompt", "")
+        self.assertIn("可以下流", sys0)
+        self.assertIn("拿博士打趣", sys0)
+        self.assertNotIn("不要喊『博士』", sys0)
+
+    def test_tick_mood_private_injects_private_rules(self):
+        """private 场：system prompt 带『体己话』『可以下流』，允许聊博士"""
+        p = self._make({"enable_family_pulse": True})
+        p._pulse_pick_group = lambda members: ["amiya", "shu"]
+        p._pulse_pick_lines = lambda group_size: 2
+        p._pulse_mood = lambda group: "private"
+        p.context.llm_generate = AsyncMock(return_value=self._resp("刚把柳木画板搬去晾"))
+        asyncio.run(p.family_pulse_tick())
+        sys0 = p.context.llm_generate.call_args_list[0].kwargs.get("system_prompt", "")
+        self.assertIn("体己话", sys0)
+        self.assertIn("可以下流", sys0)
+
+    def test_tick_mood_daily_keeps_no_doctor_rule(self):
+        """daily 场：维持原规矩——不喊博士"""
+        p = self._make({"enable_family_pulse": True})
+        p._pulse_pick_group = lambda members: ["amiya", "shu"]
+        p._pulse_pick_lines = lambda group_size: 2
+        p._pulse_mood = lambda group: "daily"
+        p.context.llm_generate = AsyncMock(return_value=self._resp("刚把柳木画板搬去晾"))
+        asyncio.run(p.family_pulse_tick())
+        sys0 = p.context.llm_generate.call_args_list[0].kwargs.get("system_prompt", "")
+        self.assertIn("不要喊『博士』", sys0)
+        self.assertNotIn("可以下流", sys0)
