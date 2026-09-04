@@ -13,6 +13,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import random
 import time
 from dataclasses import dataclass, field
@@ -180,7 +182,98 @@ def _deterministic_seed(agent: str, day: str) -> int:
     return int(hashlib.md5(f"{agent}:{day}".encode("utf-8")).hexdigest()[:8], 16)
 
 
-def roll_daily_state(agent: str, now: Optional[float] = None) -> DailyState:
+# ── 近 N 天手头事去重池（修"固定池撞车"，2026-09-04）──────────
+# 顾主 16:45 实证：黍的"刚开完会（一个人）"8-26 与 8-30 撞车、
+# "在收拾房间，刚歇口气"8-29 与 9-01 撞车——根因是 HAND_FLAVOR 每域
+# 只有 4 条，确定性 seed 跨天独立，隔几天必撞。加一个去重池记录每
+# agent 每天最终掷出的 hand（按 domain 记），供跨天偏置：过去 N 天用过的
+# 同 domain hand 优先不重复。纯函数 roll_daily_state 不被污染（avoid 为空
+# 行为完全不变，测试确定性成立）；写盘失败绝不致命（降级旧行为）。
+# 生产由 RandomStateManager.seen_path 注入真实路径；测试默认 None 不写盘。
+_HAND_SUFFIXES = ("（一个人）", "，刚歇口气")
+_ROLL_AVOID_DAYS = 7
+
+_DEFAULT_SEEN_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "data", "random_state_seen.json"
+)
+
+
+def _base_hand(hand: str) -> str:
+    """剥离手头事尾部个性后缀，得到池内原始手头事（供去重比对）。"""
+    for s in _HAND_SUFFIXES:
+        if hand.endswith(s):
+            return hand[: -len(s)]
+    return hand
+
+
+def _seen_load(path: Optional[str] = None) -> dict:
+    """读去重池；path 为空/缺失/损坏 → 空 dict（绝不致命）。"""
+    if not path:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _seen_save(data: dict, path: Optional[str] = None) -> None:
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _recent_avoid_hands(
+    agent: str, domain: str, day: str, path: Optional[str] = None
+) -> list:
+    """过去 _ROLL_AVOID_DAYS 天内该 agent 同 domain 用过的 base hand（不含今天）。"""
+    import datetime
+
+    data = _seen_load(path)
+    if not data:
+        return []
+    try:
+        today = datetime.date.fromisoformat(day)
+        avoid = []
+        for i in range(1, _ROLL_AVOID_DAYS + 1):
+            d = (today - datetime.timedelta(days=i)).isoformat()
+            rec = (data.get(d) or {}).get(agent)
+            if (
+                isinstance(rec, dict)
+                and rec.get("domain") == domain
+                and rec.get("hand")
+            ):
+                avoid.append(rec["hand"])
+        return avoid
+    except Exception:
+        return []
+
+
+def _record_seen(
+    agent: str, domain: str, hand: str, day: str, path: Optional[str] = None
+) -> None:
+    """记录该 agent 今天掷出的 base hand（供未来跨天去重）。"""
+    if not path:
+        return
+    try:
+        data = _seen_load(path)
+        data.setdefault(day, {})[agent] = {"domain": domain, "hand": _base_hand(hand)}
+        _seen_save(data, path)
+    except Exception:
+        pass
+
+
+def roll_daily_state(
+    agent: str,
+    now: Optional[float] = None,
+    avoid_hands: Optional[List[str]] = None,
+) -> DailyState:
     """为 agent 掷一个今日随机状态（确定性随机：同日同人结果稳定）。
 
     2026-09-03 顾主拍板加角色底色锚：
@@ -214,7 +307,12 @@ def roll_daily_state(agent: str, now: Optional[float] = None) -> DailyState:
             LIFE_DOMAINS,
         )
     flavors = HAND_FLAVOR.get(domain, ["在忙点事"])
-    hand = rng.choice(flavors)
+    # 跨天去重：avoid_hands 传近 N 天用过的同 domain base hand，剔除后再抽，
+    # 撞车不再；剔除后没剩候选则回退全池（保证有结果）。avoid 为空行为不变。
+    pool = flavors
+    if avoid_hands:
+        pool = [f for f in flavors if f not in avoid_hands] or flavors
+    hand = rng.choice(pool)
     # 手头事带个性后缀，让同领域的表达也不重样
     suffix = rng.choice(["", "（一个人）", "，刚歇口气"])
     return DailyState(
@@ -234,8 +332,10 @@ class RandomStateManager:
     惰性初始化：第一次取某场景/某人状态时才生成，避免为无谓场景堆内存。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, seen_path: Optional[str] = None) -> None:
         self._states: Dict[str, Dict[str, DailyState]] = {}
+        # 近 N 天去重池文件；None=不写盘（测试/默认纯内存，行为等同旧版）
+        self.seen_path: Optional[str] = seen_path
 
     # ── 核心存取 ─────────────────────────────
     def get(
@@ -253,8 +353,24 @@ class RandomStateManager:
                 if st is None:
                     return roll_daily_state(agent, now)
                 return st
-            st = roll_daily_state(agent, now)
+            st = self._roll_with_avoid(agent, now)
+            _record_seen(agent, st.domain, st.hand, st.day, self.seen_path)
             scene_map[agent] = st
+        return st
+
+    def _roll_with_avoid(self, agent: str, now: Optional[float] = None) -> DailyState:
+        """掷今日状态；若撞近 N 天用过的 base hand，剔除后重掷一次（有限重试）。
+
+        去重偏置只在此生产入口生效；失败绝不致命（降级为普通掷取）。
+        """
+        st = roll_daily_state(agent, now)
+        try:
+            avoid = _recent_avoid_hands(agent, st.domain, st.day, self.seen_path)
+            if avoid and _base_hand(st.hand) in avoid:
+                # 撞车 → 用 avoid 剔池重掷（保留原 mood/domain），Swap 手头事
+                st.hand = roll_daily_state(agent, now, avoid_hands=avoid).hand
+        except Exception:
+            pass
         return st
 
     def set_llm(self, scene: str, agent: str, mood: str, domain: str, hand: str = "") -> DailyState:
