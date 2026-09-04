@@ -304,5 +304,35 @@
     "type": "int",
     "default": 2,
     "hint": "一场心跳里主代理最多插几次话，防止喧宾夺主。"
+  },
+  "side_pulse_draft_enable": {
+    "description": "拉顾主进旁轨总开关",
+    "type": "bool",
+    "default": false,
+    "hint": "围坐聊到兴头把顾主拉进来一起聊（2026-09-04 顾主拍板）。默认关，开启后生效。"
+  },
+  "side_pulse_draft_chance_workday": {
+    "description": "工作日拉顾主概率",
+    "type": "float",
+    "default": 0.10,
+    "hint": "工作日聊到兴头把顾主拉进来的概率 0~1，拉得少。"
+  },
+  "side_pulse_draft_chance_holiday": {
+    "description": "节假日（含双休）拉顾主概率",
+    "type": "float",
+    "default": 0.30,
+    "hint": "节假日/双休把顾主拉进来的概率 0~1，拉得多。"
+  },
+  "side_pulse_draft_quota_workday": {
+    "description": "工作日每日拉顾主次数上限",
+    "type": "int",
+    "default": 2,
+    "hint": "工作日一天最多拉顾主几次，防骚扰。"
+  },
+  "side_pulse_draft_quota_holiday": {
+    "description": "节假日每日拉顾主次数上限",
+    "type": "int",
+    "default": 5,
+    "hint": "节假日/双休一天最多拉顾主几次。"
   }
 }

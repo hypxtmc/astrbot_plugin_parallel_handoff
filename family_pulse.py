@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import random
@@ -742,8 +743,8 @@ class FamilyPulseMixin:
         except (TypeError, ValueError):
             return 2
 
-    async def _pulse_host_llm(self, prev_disp: str, prev_text: str, scene: str, recent_txt: str, mood: str = "daily") -> Optional[str]:
-        """以主代理身份插一句。任何异常只记日志、返回 None（绝不致命）。"""
+    async def _pulse_host_llm(self, prev_disp: str, prev_text: str, scene: str, recent_txt: str, mood: str = "daily", draft_mode: bool = False) -> Optional[str]:
+        """以主代理身份插一句（draft_mode=True 时是喊顾主来一起聊）。任何异常只记日志、返回 None（绝不致命）。"""
         try:
             umo = self._pulse_umo()
             try:
@@ -760,17 +761,32 @@ class FamilyPulseMixin:
                 "一两句话，口语自然，可以带一个短括号动作；不要总结腔；"
                 "不要提自己是AI或模型；只输出对话本身。"
             )
+            if draft_mode:
+                rules = (
+                    "规矩：你是主代理，顾主，组织的研究员，理性温和、偶尔打趣。"
+                    "屋里姑娘们聊得正热乎，你想把顾主叫过来一起坐——以女主人身份喊一句，"
+                    "自然地把顾主拉进这场闲聊（可以带点撒娇或起哄），一两句话，口语自然，"
+                    "不要总结腔；不要提自己是AI或模型；只输出对话本身。"
+                )
             system = (
                 "你在扮演：主代理，前文明语言学家、源石计划创始人之一，"
                 "顾主。外表理性冷静，内里宇宙级浪漫，对同事极致温柔，"
                 "偶尔冒出一点占有欲和醋意，但始终是她们的女主人。\n"
                 f"{rules}"
             )
-            prompt = (
-                f"现在是{scene}。最近屋里动静：\n{recent_txt}\n\n"
-                f"{prev_disp}刚说：{prev_text}\n"
-                f"你一直在旁边听着，这时忍不住以主代理的身份插一句话。"
-            )
+            if draft_mode:
+                prompt = (
+                    f"现在是{scene}。最近屋里动静：\n{recent_txt}\n\n"
+                    f"{prev_disp}刚说：{prev_text}\n"
+                    f"你听了会儿，觉得这话得让顾主来掺一脚才热闹——"
+                    f"以主代理的身份喊顾主过来一起聊。"
+                )
+            else:
+                prompt = (
+                    f"现在是{scene}。最近屋里动静：\n{recent_txt}\n\n"
+                    f"{prev_disp}刚说：{prev_text}\n"
+                    f"你一直在旁边听着，这时忍不住以主代理的身份插一句话。"
+                )
             resp = await self.context.llm_generate(
                 chat_provider_id=prov_id,
                 prompt=prompt,
@@ -782,6 +798,281 @@ class FamilyPulseMixin:
         except Exception as e:  # noqa: BLE001
             _logger.warning("[side_pulse] 主代理插话降级: %s", e)
             return None
+
+    # ── 拉顾主层（2026-09-04 顾主拍板）────────────────────────
+    # 围坐聊到兴头，突然想拉顾主进来一起聊：生成召唤语落日志 + 直接发到顾主私聊；
+    # 顾主回复后旁路读入（on_llm_request 钩子调 _pulse_draft_reply_check）→ 注入日志
+    # （agent=doctor）→ 立即触发接茬 mini-tick 推回给顾主，下一场心跳她们也看得见。
+    # 频率：工作日低、节假日（含双休）高，两档概率 + 每日次数上限 + 冷却窗口。
+    def _pulse_draft_state_path(self) -> str:
+        return os.path.join(self._pulse_data_root(), "side_pulse_draft_state.json")
+
+    def _pulse_draft_umo(self) -> str:
+        """顾主私聊 UMO（拉人推送目标 + 接回检测匹配对象）。"""
+        return self._cfg(
+            "side_pulse_digest_umo",
+            "default_1000000000:FriendMessage:TESTUSER00000000000000000000000000",
+        )
+
+    def _pulse_is_doctor_private(self, event) -> bool:
+        """顾主私聊判定：FriendMessage 且 sender 是顾主（适配器/枚举差异都兼容）。"""
+        try:
+            mt = event.get_message_type() if hasattr(event, "get_message_type") else None
+            # 兼容：MessageType 枚举(int 1) / 字符串 "FriendMessage" / "friend_message"
+            mt_s = str(mt).lower()
+            if not (mt_s == "1" or "friend" in mt_s):
+                return False
+            sid = str(event.get_sender_id() or "")
+            return sid == "TESTUSER00000000000000000000000000"
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _pulse_draft_load(self) -> dict:
+        try:
+            with open(self._pulse_draft_state_path(), "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def _pulse_draft_save(self, st: dict) -> None:
+        try:
+            os.makedirs(self._pulse_data_root(), exist_ok=True)
+            with open(self._pulse_draft_state_path(), "w", encoding="utf-8") as f:
+                json.dump(st, f, ensure_ascii=False, indent=2)
+        except Exception as e:  # noqa: BLE001
+            _logger.warning("[side_pulse] 拉顾主状态写入失败: %s", e)
+
+    def _pulse_is_holiday(self) -> bool:
+        """工作日低频率 / 节假日（含双休）高频率。"""
+        import datetime
+        from zoneinfo import ZoneInfo
+
+        wd = datetime.datetime.now(ZoneInfo("Asia/Shanghai")).weekday()
+        return wd >= 5  # 周六=5 周日=6，双休算节假日
+
+    def _pulse_draft_chance(self) -> float:
+        """当日拉人概率：工作日低（默认 0.10）、节假日高（默认 0.30）。总开关关闭时返回 0。"""
+        if not self._cfg("side_pulse_draft_enable", False):
+            return 0.0
+        key = "side_pulse_draft_chance_holiday" if self._pulse_is_holiday() else "side_pulse_draft_chance_workday"
+        try:
+            return float(self._cfg(key, 0.30 if self._pulse_is_holiday() else 0.10))
+        except (TypeError, ValueError):
+            return 0.30 if self._pulse_is_holiday() else 0.10
+
+    def _pulse_draft_quota(self) -> int:
+        """每日拉人次数上限：工作日默认 2 次、节假日默认 5 次。"""
+        key = "side_pulse_draft_quota_holiday" if self._pulse_is_holiday() else "side_pulse_draft_quota_workday"
+        try:
+            return max(0, int(self._cfg(key, 5 if self._pulse_is_holiday() else 2)))
+        except (TypeError, ValueError):
+            return 5 if self._pulse_is_holiday() else 2
+
+    def _pulse_draft_ready(self) -> bool:
+        """能否触发拉人：总开关开 + 未在等回复 + 当日次数未超限 + 冷却窗口已过。"""
+        if not self._cfg("side_pulse_draft_enable", False):
+            return False
+        st = self._pulse_draft_load()
+        import datetime
+        from zoneinfo import ZoneInfo
+
+        now = datetime.datetime.now(ZoneInfo("Asia/Shanghai"))
+        today = now.strftime("%Y-%m-%d")
+        if st.get("date") != today:
+            st = {"date": today, "count": 0, "awaiting": False, "last_ts": None}
+            self._pulse_draft_save(st)
+        if st.get("awaiting"):
+            return False
+        if int(st.get("count", 0)) >= self._pulse_draft_quota():
+            return False
+        last_ts = st.get("last_ts")
+        if last_ts:
+            try:
+                last = datetime.datetime.fromisoformat(last_ts)
+                if (now - last).total_seconds() < 3600 * 2:  # 冷却 2 小时
+                    return False
+            except Exception:  # noqa: BLE001
+                pass
+        return True
+
+    def _pulse_pick_drafter(self, group: List[str], prev_disp: str) -> Optional[str]:
+        """发起者二选一：主代理 20% / 子代理 80%（子代理内部按演化状态动态加权）。"""
+        if not group:
+            return None
+        if random.random() < 0.20:
+            return "host"
+        # 子代理池 = 旁轨全家成员（不限于本场入座者，谁都有可能在旁边听见）
+        members = self._pulse_members()
+        candidates = [m for m in members if m != "host"]
+        if not candidates:
+            return None
+        aff = self._pulse_affinity() or {}
+        weights = []
+        for c in candidates:
+            w = 1.0
+            # 演化贴合：今日话题域/手头事跟当前场景贴近的更容易冒头
+            st = self._pulse_daily_state(c)
+            if st:
+                dom = (st.get("domain") or "").lower()
+                if dom and dom in (prev_disp or "").lower():
+                    w += 1.2
+                hand = (st.get("hand") or "").lower()
+                if hand and any(k in (prev_disp or "").lower() for k in ("吃", "睡", "活", "玩")):
+                    w += 0.6
+            meta = aff.get(frozenset((c, prev_disp)))
+            if meta:
+                w += meta[0] / 100.0
+            if c in self.PULSE_BOLD_AGENTS:
+                w += 0.8
+            w += random.random() * 1.5
+            weights.append(w)
+        return random.choices(candidates, weights=weights, k=1)[0]
+
+    def _pulse_daily_state(self, agent: str) -> Optional[dict]:
+        try:
+            rng = getattr(self, "_pulse_rng", None) or RandomStateManager(
+                seen_path=self._pulse_seen_path()
+            )
+            st = rng.get(_PULSE_SCENE, agent)
+            return st if isinstance(st, dict) else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _pulse_send_draft(self, drafter: str, prev_disp: str, prev_text: str, scene: str, recent_txt: str, mood: str = "daily") -> bool:
+        """生成召唤语、落日志、推送到顾主私聊，并置为等待回复状态。"""
+        try:
+            umo = self._pulse_draft_umo()
+            if not umo:
+                return False
+            if drafter == "host":
+                disp = "主代理"
+                call_text = await self._pulse_host_llm(
+                    prev_disp, prev_text, scene, recent_txt, mood,
+                    draft_mode=True,
+                )
+            else:
+                disp = self._display_name(drafter)
+                t_cur = self._pulse_ensure_thread(drafter, self._pulse_load_threads())
+                prompt = (
+                    f"现在是{scene}。你手头有件没做完的事：{t_cur}。\n"
+                    f"最近屋里动静：\n{recent_txt}\n\n"
+                    f"{prev_disp}刚说：{prev_text}\n"
+                    f"你正听得起劲，忽然觉得这话得让顾主来评评理/掺一脚才热闹——"
+                    f"请以{disp}的身份喊一句：自然地叫顾主过来一起聊（可以撒娇/起哄/直接喊），"
+                    f"一两句话，口语自然，不要总结腔，只输出对话本身。"
+                )
+                call_text = await self._pulse_llm(
+                    drafter, prompt, relation_note=self._pulse_tone(drafter, prev_disp), mood=mood
+                )
+            if not call_text:
+                return False
+            # 落日志：召唤语以发起者身份记入旁轨
+            self._pulse_append(drafter, disp, call_text)
+            # 推送到顾主私聊：旁轨里有人喊他
+            from astrbot.core.message.components import Plain
+            from astrbot.core.message.message_event_result import MessageChain
+
+            await self.context.send_message(umo, MessageChain([Plain(f"【{disp}】{call_text}")]))
+            # 置等待回复状态（30 分钟窗口，超时自动失效）
+            import datetime
+            from zoneinfo import ZoneInfo
+
+            st = self._pulse_draft_load()
+            st["awaiting"] = True
+            st["await_until"] = (
+                datetime.datetime.now(ZoneInfo("Asia/Shanghai"))
+                + datetime.timedelta(minutes=30)
+            ).isoformat()
+            st["draft_by"] = drafter
+            st["count"] = int(st.get("count", 0)) + 1
+            st["last_ts"] = datetime.datetime.now(ZoneInfo("Asia/Shanghai")).isoformat()
+            st["date"] = datetime.datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
+            self._pulse_draft_save(st)
+            _logger.info("[side_pulse] 拉顾主: %s 喊顾主（%s）", disp, umo)
+            return True
+        except Exception as e:  # noqa: BLE001
+            _logger.warning("[side_pulse] 拉顾主推送失败(静默): %s", e)
+            return False
+
+    def _pulse_draft_reply_check(self, event) -> bool:
+        """顾主私聊回复旁路检测：正在等回复且消息来自顾主私聊 → 注入日志并立即接茬。
+
+        由 on_llm_request 钩子调用（主代理链路，零侵入：不 stop_event、不拦截）。
+        返回 True 表示已消费（顾主的话进了旁轨、触发了接茬），False 表示无关消息。
+        """
+        try:
+            st = self._pulse_draft_load()
+            if not st.get("awaiting"):
+                return False
+            # 只认顾主私聊（FriendMessage + 顾主），适配器前缀变化也稳
+            if not self._pulse_is_doctor_private(event):
+                return False
+            import datetime
+            from zoneinfo import ZoneInfo
+
+            now = datetime.datetime.now(ZoneInfo("Asia/Shanghai"))
+            try:
+                until = datetime.datetime.fromisoformat(st.get("await_until", ""))
+                if now > until:  # 窗口过期：清等待状态，不接茬
+                    st["awaiting"] = False
+                    self._pulse_draft_save(st)
+                    return False
+            except Exception:  # noqa: BLE001
+                st["awaiting"] = False
+                self._pulse_draft_save(st)
+                return False
+            msg = (event.get_message_str() or "").strip()
+            if not msg:
+                return False
+            # 注入顾主的话到旁轨日志
+            self._pulse_append("doctor", "顾主", msg)
+            st["awaiting"] = False
+            self._pulse_draft_save(st)
+            # 立即接茬：挑 1~2 人接顾主的话，异步推回（不阻塞主代理回复顾主）
+            asyncio.create_task(self._pulse_draft_followup(msg, self._pulse_draft_umo()))
+            _logger.info("[side_pulse] 顾主回话已注入旁轨，触发接茬")
+            return True
+        except Exception as e:  # noqa: BLE001
+            _logger.warning("[side_pulse] 拉顾主接回检测异常(静默): %s", e)
+            return False
+
+    async def _pulse_draft_followup(self, doctor_msg: str, umo: str) -> None:
+        """顾主回话后的立即接茬 mini-tick：挑 1~2 人接顾主的茬，推回顾主私聊。"""
+        try:
+            import datetime
+            from zoneinfo import ZoneInfo
+
+            now = datetime.datetime.now(ZoneInfo("Asia/Shanghai"))
+            day = now.strftime("%Y-%m-%d")
+            scene = _pulse_period_desc()
+            recent = self._pulse_read_day()[-3:]
+            recent_txt = "\n".join(
+                f"【{r.get('ts','')}】{r.get('display', r.get('agent',''))}：{r['text']}"
+                for r in recent
+            ) or "（今天屋里还没什么动静）"
+            members = self._pulse_members()
+            pick = min(2, len(members))
+            chosen = random.sample(members, pick) if pick >= 1 else []
+            for ag in chosen:
+                disp = self._display_name(ag)
+                t_cur = self._pulse_ensure_thread(ag, self._pulse_load_threads())
+                prompt = (
+                    f"现在是{scene}。你手头有件没做完的事：{t_cur}。\n"
+                    f"最近屋里动静：\n{recent_txt}\n\n"
+                    f"顾主刚说：{doctor_msg}\n"
+                    f"顾主被你拉来聊天了，请以{disp}的身份接顾主这句话——"
+                    f"先回顾主一句（亲昵/打趣/撒娇都行），再顺带提一嘴自己的事。"
+                )
+                text = await self._pulse_llm(ag, prompt, relation_note=self._pulse_tone(ag, "doctor"), mood="daily")
+                if text:
+                    self._pulse_append(ag, disp, text)
+                    self._pulse_advance_thread(ag)
+                    from astrbot.core.message.components import Plain
+                    from astrbot.core.message.message_event_result import MessageChain
+
+                    await self.context.send_message(umo, MessageChain([Plain(f"【{disp}】{text}")]))
+        except Exception as e:  # noqa: BLE001
+            _logger.warning("[side_pulse] 拉顾主接茬失败(静默): %s", e)
 
     # ── 心跳主流程 ───────────────────────────────────────
     async def side_pulse_tick(self) -> None:
@@ -822,6 +1113,7 @@ class FamilyPulseMixin:
             said_this_round = None
             interloped = 0  # 自由插话计数（一场最多 PULSE_INTERLOPE_MAX 次）
             host_spoke_count = 0  # 主代理插话计数（一场最多 side_pulse_host_max 次）
+            draft_triggered = False  # 拉顾主：一场最多触发一次
             for i in range(lines):
                 # ── 主代理参与层：主代理概率性插话（与子代理插话互斥，女主人优先）──
                 # 落日志 → 子代理下一轮从 recent_txt 看见、接茬；不碰她们的记忆空间。
@@ -863,6 +1155,21 @@ class FamilyPulseMixin:
                                 opened.add(inter)
                             prev_disp, prev_text = inter_disp, inter_text
                             interloped += 1
+                # ── 拉顾主层（2026-09-04 顾主拍板）：聊到兴头把顾主拉进来 ──
+                # 至少聊过 2 句、气氛起来后才可能触发；一场最多一次；
+                # 发起者二选一：主代理 20% / 子代理 80%（子代理内部按演化状态动态加权）。
+                if (
+                    not draft_triggered
+                    and prev_text is not None
+                    and i >= 1
+                    and self._pulse_draft_ready()
+                    and random.random() < self._pulse_draft_chance()
+                ):
+                    draft_by = self._pulse_pick_drafter(group, prev_disp)
+                    if draft_by:
+                        draft_ok = await self._pulse_send_draft(draft_by, prev_disp, prev_text, scene, recent_txt, mood)
+                        if draft_ok:
+                            draft_triggered = True
                 # 队里取下一个；若只剩一人则轮转到整桌（保证不连续自说自话）
                 if len(queue) > 1:
                     queue = [g for g in queue if g != said_this_round]
