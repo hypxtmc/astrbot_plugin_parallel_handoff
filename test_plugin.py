@@ -1891,6 +1891,71 @@ class TestRandomState(unittest.TestCase):
         data = _seen_load(seen_file)
         assert data.get(st.day, {}).get("amiya", {}).get("hand") == st.hand
 
+    def test_private_domain_in_pools(self):
+        """私房域入池（2026-09-04 博士拍板 A）：LIFE_DOMAINS/DOMAIN_KEYWORDS/HAND_FLAVOR 三处齐备"""
+        from random_state import LIFE_DOMAINS, DOMAIN_KEYWORDS, HAND_FLAVOR
+        assert "私房" in LIFE_DOMAINS
+        assert "私房" in DOMAIN_KEYWORDS and DOMAIN_KEYWORDS["私房"]
+        assert "私房" in HAND_FLAVOR and HAND_FLAVOR["私房"]
+        # 手头事不能带个性后缀（去重池 base 自检：_base_hand(f) == f）
+        from random_state import _base_hand
+        for f in HAND_FLAVOR["私房"]:
+            assert _base_hand(f) == f, f"私房手头事带后缀: {f}"
+
+    def test_private_domain_weight_tiers(self):
+        """私房域权重分级：放得开的≥2、害羞的≤0.5、凯尔希最低（博士拍板）"""
+        from random_state import PERSONA_DOMAIN_WEIGHTS
+        w = PERSONA_DOMAIN_WEIGHTS
+        for name in ("closure", "nian", "shu", "liino"):
+            assert w[name].get("私房", 0) >= 2, f"{name} 私房权重应放得开"
+        for name in ("amiya", "xi", "kaltsit"):
+            assert w[name].get("私房", 0) <= 0.5, f"{name} 私房权重应极低"
+
+    def test_roll_private_domain_hand_from_pool(self):
+        """掷中私房域时，hand 必须来自私房池（不串其他域）"""
+        from random_state import HAND_FLAVOR, roll_daily_state
+        for _ in range(50):
+            st = roll_daily_state("closure", avoid_hands=[])
+            if st.domain == "私房":
+                assert any(
+                    st.hand == f or st.hand.startswith(f) for f in HAND_FLAVOR["私房"]
+                ), f"私房域 hand 越界: {st.hand}"
+                return
+        # 50 次未中（确定性 seed 可能偏），验证掷取合法即可
+        assert st.domain in ("工作", "吐槽", "深夜随笔", "兴趣", "生活", "私房")
+
+    def test_wild_private_branch_forces_private(self):
+        """B：跳脱命中且 wild_private 命中 → 强制私房域（今天格外想他）"""
+        from random_state import WILD_CHANCE, WILD_PRIVATE_CHANCE
+        assert 0 < WILD_PRIVATE_CHANCE < 1
+        import random
+        import random_state as rs
+        orig_wild = rs.WILD_CHANCE
+        orig_rng = rs.random.Random
+        try:
+            # 强制跳脱：把 WILD_CHANCE 顶到 1
+            rs.WILD_CHANCE = 1.0
+            # 强制 wild_private 命中：mock Random.random 对含 wild_private 的 seed 返回 0
+            real_random = random.Random
+
+            class _FakeRandom(real_random):
+                def __init__(self, seed=None):
+                    super().__init__(seed)
+                    self._seed_str = str(seed) if seed is not None else ""
+
+                def random(self):
+                    if "wild_private" in self._seed_str:
+                        return 0.0  # 必中私房分支
+                    return super().random()
+
+            rs.random.Random = _FakeRandom
+            st = rs.roll_daily_state("closure")
+            assert st.domain == "私房", f"wild_private 未强制私房: {st.domain}"
+            assert st.hand, "私房域必须有手头事"
+        finally:
+            rs.WILD_CHANCE = orig_wild
+            rs.random.Random = orig_rng
+
 
 class TestDailyLifeInjector(unittest.TestCase):
     """M2 · GLM-4-Flash 注入器：降级兜底 + JSON 解析 + domain 归一"""
@@ -2003,6 +2068,9 @@ class TestDailyAffinity(unittest.TestCase):
     def test_affinity_missing_state_returns_zero(self):
         """状态缺失/未初始化 -> 0 分，绝不炸"""
         mgr = RandomStateManager()
+        # 显式设一个与消息不匹配的域（"深夜随笔"关键词不含"任何消息"），
+        # 避免确定性 seed 随 LIFE_DOMAINS 池大小偏移导致"消息"误命中八卦/事域
+        self._state_domain(mgr, "noscene", "ghost", "深夜随笔")
         assert mgr.daily_affinity("noscene", "ghost", "任何消息") == 0
 
     def test_daily_affinity_for_mixin_degrades(self):
