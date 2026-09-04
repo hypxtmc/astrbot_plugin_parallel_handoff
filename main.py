@@ -229,6 +229,16 @@ class ParallelHandoffPlugin(
         """
         return await super().toggle_prefix(event)
 
+    # ── 事件注册：唤即看（顾主私聊回看旁轨日志，实现见 side_pulse.py FamilyPulseMixin） ──
+    @filter.regex(r"^(看看家里|看家里|家里今天|家里动静|看看她们聊了啥|看看大家)")
+    async def pulse_peek(self, event: AstrMessageEvent):
+        """顾主私聊发「看看家里」→ 回看旁轨日志原文（今天/昨天/前天）。
+
+        仅顾主私聊响应：命中 stop_event 并推送日志；其他会话/他人消息
+        内部判定后放行，不影响正常对话流程。
+        """
+        return await super()._pulse_peek(event)
+
     # ── LLM 工具注册：parallel_handoff（实现见 dispatch.py DispatchMixin） ──
     @llm_tool(name="parallel_handoff")
     async def parallel_handoff(
