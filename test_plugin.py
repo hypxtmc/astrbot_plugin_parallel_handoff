@@ -2896,6 +2896,129 @@ class TestFamilyPulse(unittest.TestCase):
         self.assertFalse(ok)
         self.assertTrue(p._pulse_draft_load().get("awaiting"), "非博士消息不应消费等待状态")
 
+    def test_draft_reply_present_window_multiple(self):
+        """在场窗口：博士被拉后连续回话，每句都注入 + 触发接茬，不一次性消费"""
+        p = self._make({
+            "enable_family_pulse": True,
+            "family_pulse_draft_enable": True,
+        })
+        import datetime
+        from zoneinfo import ZoneInfo
+
+        now = datetime.datetime.now(ZoneInfo("Asia/Shanghai"))
+        p._pulse_draft_save({
+            "date": now.strftime("%Y-%m-%d"), "count": 1, "awaiting": True,
+            "await_until": (now + datetime.timedelta(minutes=30)).isoformat(),
+            "present_until": (now + datetime.timedelta(minutes=30)).isoformat(),
+            "draft_by": "amiya",
+        })
+        p.context.llm_generate = AsyncMock(return_value=self._resp("博士你来啦"))
+
+        def _ev(msg):
+            e = MagicMock()
+            e.get_message_str.return_value = msg
+            e.get_message_type.return_value = "FriendMessage"
+            e.get_sender_id.return_value = "TESTUSER00000000000000000000000000"
+            return e
+
+        # 第一句：awaiting 消费 → 注入 + 接茬 + 在场续期（create_task 需在 event loop 内）
+        async def _check(msg):
+            return p._pulse_draft_reply_check(_ev(msg))
+
+        ok1 = asyncio.run(_check("我来啦"))
+        self.assertTrue(ok1)
+        self.assertFalse(p._pulse_draft_load().get("awaiting"), "第一句后 awaiting 应清除")
+        self.assertTrue(p._pulse_draft_load().get("present_until"), "在场窗口应续期")
+        # 第二句：present 窗口内 → 依然注入 + 接茬（多轮不中断）
+        ok2 = asyncio.run(_check("汤咸了？我尝尝"))
+        self.assertTrue(ok2, "在场窗口内第二句应继续接茬")
+        logs = p._pulse_read_day()
+        self.assertEqual(sum(1 for r in logs if r["agent"] == "doctor"), 2, "两句都应进旁轨")
+
+    def test_draft_followup_prefers_drafter(self):
+        """接茬优先拉他的人：drafter 先接，补位者在后"""
+        p = self._make({"enable_family_pulse": True, "family_pulse_draft_enable": True})
+        p.context.llm_generate = AsyncMock(return_value=self._resp("博士你终于来了"))
+
+        async def _run():
+            await p._pulse_draft_followup("我来了", "test:FriendMessage:TESTUSER00000000000000000000000000", "amiya")
+
+        asyncio.run(_run())
+        logs = p._pulse_read_day()
+        agents = [r["agent"] for r in logs if r["agent"] != "doctor"]
+        self.assertIn("amiya", agents, "拉博士的人应先接茬")
+        self.assertGreaterEqual(len(agents), 1)
+
+    # ── 唤即看：博士私聊回看旁轨日志 ──
+    def test_peek_doctor_private_sends(self):
+        """博士私聊「看看家里」→ 推送旁轨日志原文到博士 UMO + stop_event"""
+        p = self._make({
+            "enable_family_pulse": True,
+            "family_pulse_digest_umo": "test:FriendMessage:TESTUSER00000000000000000000000000",
+        })
+        p._pulse_append("amiya", "阿米娅", "今天想泡壶茶晒晒太阳")
+        p.context.send_message = AsyncMock()
+        event = MagicMock()
+        event.get_message_str.return_value = "看看家里"
+        event.get_message_type.return_value = "FriendMessage"
+        event.get_sender_id.return_value = "TESTUSER00000000000000000000000000"
+
+        ok = asyncio.run(p._pulse_peek(event))
+        self.assertTrue(ok)
+        event.stop_event.assert_called_once()
+        p.context.send_message.assert_awaited_once()
+        umo = p.context.send_message.await_args.args[0]
+        self.assertIn("TESTUSER", umo)
+        # 文本组装走纯函数断言（send 侧是 mock，取不到真实 MessageChain 内容）
+        text = p._build_digest_text(p._pulse_read_day(), "09-04")
+        self.assertIn("阿米娅", text)
+        self.assertIn("泡壶茶", text)
+
+    def test_peek_non_doctor_noop(self):
+        """非博士私聊「看看家里」→ 放行不推送、不 stop"""
+        p = self._make({"enable_family_pulse": True})
+        p.context.send_message = AsyncMock()
+        event = MagicMock()
+        event.get_message_str.return_value = "看看家里"
+        event.get_message_type.return_value = "GroupMessage"
+        event.get_sender_id.return_value = "other_user"
+        ok = asyncio.run(p._pulse_peek(event))
+        self.assertFalse(ok)
+        p.context.send_message.assert_not_awaited()
+        event.stop_event.assert_not_called()
+
+    def test_peek_yesterday_reads_prev_day(self):
+        """「看看家里 昨天」→ 读昨天日志；今天无日志也不串天"""
+        p = self._make({"enable_family_pulse": True})
+        import datetime
+        from zoneinfo import ZoneInfo
+
+        yesterday = (
+            datetime.datetime.now(ZoneInfo("Asia/Shanghai")) - datetime.timedelta(days=1)
+        ).strftime("%Y-%m-%d")
+        p._pulse_append("shu", "黍", "昨天腌的萝卜该翻缸了")
+        # 把刚写的记录挪到昨天的日志文件
+        import os
+        src = p._pulse_log_path()
+        dst = p._pulse_log_path(yesterday)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        os.replace(src, dst)
+        logs = p._pulse_read_day(yesterday)
+        self.assertTrue(any(r["agent"] == "shu" for r in logs), "应能读到昨天日志")
+        self.assertEqual(p._pulse_peek_day("看看家里 昨天"), yesterday)
+
+    def test_peek_disabled_noop(self):
+        """总开关关：不响应唤即看"""
+        p = self._make({"enable_family_pulse": False})
+        p.context.send_message = AsyncMock()
+        event = MagicMock()
+        event.get_message_str.return_value = "看看家里"
+        event.get_message_type.return_value = "FriendMessage"
+        event.get_sender_id.return_value = "TESTUSER00000000000000000000000000"
+        ok = asyncio.run(p._pulse_peek(event))
+        self.assertFalse(ok)
+        p.context.send_message.assert_not_awaited()
+
     # ── 摘要 ──
     def test_digest_no_logs_no_send(self):
         """当天无日志：不发送、不报错"""

@@ -489,8 +489,8 @@ class FamilyPulseMixin:
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-    def _pulse_read_day(self) -> List[dict]:
-        path = self._pulse_log_path()
+    def _pulse_read_day(self, day: Optional[str] = None) -> List[dict]:
+        path = self._pulse_log_path(day)
         if not os.path.exists(path):
             return []
         out: List[dict] = []
@@ -983,6 +983,8 @@ class FamilyPulseMixin:
                 datetime.datetime.now(ZoneInfo("Asia/Shanghai"))
                 + datetime.timedelta(minutes=30)
             ).isoformat()
+            # 在场窗口与等待窗口同开：博士被拉进来即在场，回话续期 30 分钟
+            st["present_until"] = st["await_until"]
             st["draft_by"] = drafter
             st["count"] = int(st.get("count", 0)) + 1
             st["last_ts"] = datetime.datetime.now(ZoneInfo("Asia/Shanghai")).isoformat()
@@ -995,14 +997,18 @@ class FamilyPulseMixin:
             return False
 
     def _pulse_draft_reply_check(self, event) -> bool:
-        """博士私聊回复旁路检测：正在等回复且消息来自博士私聊 → 注入日志并立即接茬。
+        """博士私聊回复旁路检测：博士在场（被拉后 30 分钟窗口）时，每句回话都注入并接茬。
 
         由 on_llm_request 钩子调用（主代理链路，零侵入：不 stop_event、不拦截）。
         返回 True 表示已消费（博士的话进了旁轨、触发了接茬），False 表示无关消息。
+
+        2026-09-04 v2.7.0 改「在场窗口」：awaiting 只是拉人后的第一句立即接茬，
+        接完置 present_until（30 分钟），窗口内博士继续回话依然注入 + 接茬，
+        不再一次性消费——被拉进去后插话能自然接上，直到博士冷场才散。
         """
         try:
             st = self._pulse_draft_load()
-            if not st.get("awaiting"):
+            if not st.get("awaiting") and not st.get("present_until"):
                 return False
             # 只认博士私聊（FriendMessage + 博士本人），适配器前缀变化也稳
             if not self._pulse_is_doctor_private(event):
@@ -1011,15 +1017,25 @@ class FamilyPulseMixin:
             from zoneinfo import ZoneInfo
 
             now = datetime.datetime.now(ZoneInfo("Asia/Shanghai"))
-            try:
-                until = datetime.datetime.fromisoformat(st.get("await_until", ""))
-                if now > until:  # 窗口过期：清等待状态，不接茬
+            # awaiting 窗口（拉人后 30 分钟）过期 → 清 awaiting，但 present 窗口还在就继续接
+            if st.get("awaiting"):
+                try:
+                    until = datetime.datetime.fromisoformat(st.get("await_until", ""))
+                    if now > until:
+                        st["awaiting"] = False
+                except Exception:  # noqa: BLE001
                     st["awaiting"] = False
-                    self._pulse_draft_save(st)
-                    return False
-            except Exception:  # noqa: BLE001
-                st["awaiting"] = False
-                self._pulse_draft_save(st)
+            # 在场窗口过期 → 整场散，不再接
+            pu = st.get("present_until")
+            if pu:
+                try:
+                    if now > datetime.datetime.fromisoformat(pu):
+                        st["present_until"] = None
+                        self._pulse_draft_save(st)
+                        return False
+                except Exception:  # noqa: BLE001
+                    pass
+            if not st.get("awaiting") and not st.get("present_until"):
                 return False
             msg = (event.get_message_str() or "").strip()
             if not msg:
@@ -1027,17 +1043,25 @@ class FamilyPulseMixin:
             # 注入博士的话到旁轨日志
             self._pulse_append("doctor", "博士", msg)
             st["awaiting"] = False
+            # 在场窗口续期：博士回话后 30 分钟内继续接茬，冷场才散
+            st["present_until"] = (
+                now + datetime.timedelta(minutes=30)
+            ).isoformat()
             self._pulse_draft_save(st)
-            # 立即接茬：挑 1~2 人接博士的话，异步推回（不阻塞主代理回复博士）
-            asyncio.create_task(self._pulse_draft_followup(msg, self._pulse_draft_umo()))
+            # 立即接茬：优先拉他的人接第一句（谁喊的谁接），异步推回
+            asyncio.create_task(
+                self._pulse_draft_followup(
+                    msg, self._pulse_draft_umo(), st.get("draft_by")
+                )
+            )
             _logger.info("[family_pulse] 博士回话已注入旁轨，触发接茬")
             return True
         except Exception as e:  # noqa: BLE001
             _logger.warning("[family_pulse] 拉博士接回检测异常(静默): %s", e)
             return False
 
-    async def _pulse_draft_followup(self, doctor_msg: str, umo: str) -> None:
-        """博士回话后的立即接茬 mini-tick：挑 1~2 人接博士的茬，推回博士私聊。"""
+    async def _pulse_draft_followup(self, doctor_msg: str, umo: str, drafter: Optional[str] = None) -> None:
+        """博士回话后的立即接茬 mini-tick：优先拉他的人先接，再补一人，推回博士私聊。"""
         try:
             import datetime
             from zoneinfo import ZoneInfo
@@ -1051,9 +1075,14 @@ class FamilyPulseMixin:
                 for r in recent
             ) or "（今天屋里还没什么动静）"
             members = self._pulse_members()
-            pick = min(2, len(members))
-            chosen = random.sample(members, pick) if pick >= 1 else []
-            for ag in chosen:
+            # 人选：拉他的人优先（谁喊的谁接），再随机补一人；无 drafter 则随机两人
+            chosen: List[str] = []
+            if drafter and drafter in members:
+                chosen.append(drafter)
+            rest = [m for m in members if m not in chosen]
+            if len(chosen) < 2 and rest:
+                chosen.append(random.choice(rest))
+            for ag in chosen[:2]:
                 disp = self._display_name(ag)
                 t_cur = self._pulse_ensure_thread(ag, self._pulse_load_threads())
                 prompt = (
@@ -1268,6 +1297,60 @@ class FamilyPulseMixin:
             _logger.info("[family_pulse] digest 已推送(%d 条)", len(logs))
         except Exception as e:  # noqa: BLE001
             _logger.warning("[family_pulse] digest 推送失败: %s", e)
+
+    # ── 唤即看：博士私聊随时回看旁轨（2026-09-04 博士拍板 A 方案） ──
+    def _pulse_peek_day(self, raw: str) -> Optional[str]:
+        """从博士消息里解析回看日期：含「昨天」→ 昨天，含「前天」→ 前天，否则今天。
+
+        只认明确词，不给模糊日期匹配，避免误读正常聊天内容。
+        """
+        import datetime
+        from zoneinfo import ZoneInfo
+
+        now = datetime.datetime.now(ZoneInfo("Asia/Shanghai"))
+        if "前天" in raw:
+            return (now - datetime.timedelta(days=2)).strftime("%Y-%m-%d")
+        if "昨天" in raw:
+            return (now - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+        return now.strftime("%Y-%m-%d")
+
+    async def _pulse_peek(self, event) -> bool:
+        """博士私聊发「看看家里」→ 回看旁轨日志（默认今天，可带 昨天/前天）。
+
+        仅响应博士私聊（FriendMessage + 博士本人），其他会话直接放行不拦截；
+        命中则 stop_event（主代理不再回话）+ 推送日志原文到博士私聊。
+        """
+        try:
+            if not self._cfg("enable_family_pulse", False):
+                return False
+            if not self._pulse_is_doctor_private(event):
+                return False
+            raw = (event.get_message_str() or "").strip()
+            if not raw:
+                return False
+            day = self._pulse_peek_day(raw)
+            logs = self._pulse_read_day(day)
+            disp = day[5:]  # MM-DD
+            if logs:
+                msg = self._build_digest_text(logs, disp)
+            else:
+                msg = f"🏠 家里动静 · {disp}\n（这天屋里没什么动静）"
+            try:
+                event.stop_event()
+            except Exception:  # noqa: BLE001
+                pass
+            umo = self._pulse_draft_umo()
+            if not umo:
+                return False
+            from astrbot.core.message.components import Plain
+            from astrbot.core.message.message_event_result import MessageChain
+
+            await self.context.send_message(umo, MessageChain([Plain(msg)]))
+            _logger.info("[family_pulse] 唤即看: 博士回看 %s（%d 条）", day, len(logs))
+            return True
+        except Exception as e:  # noqa: BLE001
+            _logger.warning("[family_pulse] 唤即看失败(静默): %s", e)
+            return False
 
     # ── cron 注册 / 拆除（幂等，biliread 同款） ──────────
     async def _pulse_clear_legacy(self, name: str) -> None:
