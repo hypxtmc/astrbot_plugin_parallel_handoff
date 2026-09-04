@@ -2643,6 +2643,79 @@ class TestFamilyPulse(unittest.TestCase):
         stub._subagent_persona = "shu"
         self.assertEqual(stub._subagent_persona, "shu")
 
+    def test_merge_pulse_memory_recall_doctor_private(self):
+        """博士私聊直问子代理：主召回后额外并入旁轨会话记忆（方案 A）"""
+        p = self._make({"enable_family_pulse": True})
+        # test_plugin 顶部把 astrbot.api.provider 整体 mock 成 MagicMock，
+        # ProviderRequest.extra_user_content_parts 是 mock 属性 append 不生效，
+        # 这里局部恢复真实类，验证合并逻辑
+        from astrbot.core.provider.entities import ProviderRequest as RealPR
+
+        # mock livingmemory 插件：初始化就绪，handle_memory_recall 往 req 注入记忆
+        lm = MagicMock()
+        lm.initializer.is_initialized = True
+        lm.initializer.is_failed = False
+
+        async def fake_handle(event, req):
+            from astrbot.core.agent.message import TextPart
+
+            req.extra_user_content_parts.append(
+                TextPart(text="<旁轨记忆>腌萝卜").mark_as_temp()
+            )
+
+        lm.handle_memory_recall = AsyncMock(side_effect=fake_handle)
+
+        # 博士私聊事件（会话 ≠ 旁轨会话）
+        event = MagicMock()
+        event.unified_msg_origin = "qq_restapi:FriendMessage:TESTUSER00000000000000000000000000"
+        event.get_message_str.return_value = "阿米娅，你们今天聊了什么？"
+
+        with mock.patch("memory.ProviderRequest", RealPR):
+            parts = asyncio.run(
+                p._merge_pulse_memory_recall(
+                    ["<主召回>"], event, "amiya", "阿米娅，你们今天聊了什么？", lm
+                )
+            )
+        self.assertEqual(parts[0], "<主召回>", "主召回内容应保留在首位")
+        self.assertEqual(len(parts), 2, "应合并主召回 + 旁轨召回")
+        self.assertIn("腌萝卜", getattr(parts[1], "text", str(parts[1])), "旁轨记忆应并入")
+        # 旁轨桩查询词应覆盖为博士原话，而不是 "family_pulse"
+        call_event = lm.handle_memory_recall.await_args.args[0]
+        self.assertEqual(call_event.get_message_str(), "阿米娅，你们今天聊了什么？")
+        self.assertEqual(call_event._subagent_persona, "amiya")
+        self.assertEqual(
+            call_event.unified_msg_origin, "family_pulse:FriendMessage:subagents"
+        )
+
+    def test_merge_pulse_memory_recall_pulse_skips(self):
+        """旁轨心跳链路（事件本身是旁轨桩）：不重复并入"""
+        p = self._make({"enable_family_pulse": True})
+        lm = MagicMock()
+        lm.initializer.is_initialized = True
+        lm.initializer.is_failed = False
+        lm.handle_memory_recall = AsyncMock()
+        event = p._pulse_event_stub("family_pulse:FriendMessage:subagents")
+        event._subagent_persona = "amiya"
+        parts = asyncio.run(p._merge_pulse_memory_recall(
+            ["<主召回>"], event, "amiya", "今天想泡壶茶", lm
+        ))
+        self.assertEqual(parts, ["<主召回>"], "旁轨会话本身不应重复并入")
+        lm.handle_memory_recall.assert_not_awaited()
+
+    def test_merge_pulse_memory_recall_failure_degrades(self):
+        """旁轨并入失败：静默降级，不影响主召回"""
+        p = self._make({"enable_family_pulse": True})
+        lm = MagicMock()
+        lm.initializer.is_initialized = True
+        lm.initializer.is_failed = False
+        lm.handle_memory_recall = AsyncMock(side_effect=RuntimeError("boom"))
+        event = MagicMock()
+        event.unified_msg_origin = "qq_restapi:FriendMessage:TESTUSER00000000000000000000000000"
+        parts = asyncio.run(p._merge_pulse_memory_recall(
+            ["<主召回>"], event, "amiya", "你们今天聊了什么", lm
+        ))
+        self.assertEqual(parts, ["<主召回>"], "失败应返回原 parts")
+
     def test_tick_memory_recall_injects_extra_parts(self):
         """livingmemory 就绪时：召回记忆经 extra_user_content_parts 注入生成请求"""
         p = self._make({"enable_family_pulse": True})

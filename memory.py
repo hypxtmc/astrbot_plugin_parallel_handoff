@@ -122,6 +122,15 @@ class MemoryMixin:
                         f"[parallel_handoff] {agent_name} 记忆召回为空"
                         f"（插件就绪，无匹配记忆）"
                     )
+                # 2026-09-04 方案 A（博士拍板）：博士私聊直问子代理时并入旁轨会话记忆。
+                # 旁轨记忆落在 family_pulse:FriendMessage:subagents 会话 + agent persona
+                # 维度，博士私聊会话召回查不到（livingmemory 按 session+persona 双条件
+                # 过滤），导致「问阿米娅今天家里聊了什么」她说不记得。此处用旁轨桩
+                # 再造一次召回，把家里的记忆也带给子代理；旁轨心跳链路本身已是旁轨
+                # 会话，自动跳过不重复。
+                parts = await self._merge_pulse_memory_recall(
+                    parts, event, agent_name, clean_input, livingmemory_plugin
+                )
                 return parts
             except Exception as e:
                 logger.warning(
@@ -130,6 +139,57 @@ class MemoryMixin:
                 )
                 return []
         return []
+
+    # ── 旁轨记忆并入（2026-09-04 博士拍板方案 A） ──
+    async def _merge_pulse_memory_recall(
+        self,
+        parts: list,
+        event: AstrMessageEvent,
+        agent_name: str,
+        clean_input: str,
+        livingmemory_plugin,
+    ) -> list:
+        """博士私聊直问子代理时，额外并入旁轨会话（family_pulse）里该子代理的家常记忆。
+
+        背景：旁轨记忆落在 family_pulse:FriendMessage:subagents 会话 + agent persona 维度，
+        livingmemory 的 search_memories 按 session_id + persona_id 双条件过滤——
+        博士私聊会话召回查不到旁轨记忆，子代理被问「今天家里聊了什么」时说不记得。
+        这里用旁轨事件桩再造一次 handle_memory_recall（同一 persona，旁轨会话），
+        把「家里的记忆」合并进召回结果，让子代理翻得到腌萝卜那一段。
+
+        旁轨心跳链路（_pulse_llm）传进来的 event 本身就是旁轨桩（unified_msg_origin
+        等于旁轨会话），此处直接跳过，不重复召回。任何失败静默降级，不影响主召回。
+        """
+        try:
+            pulse_umo = self._cfg(
+                "family_pulse_memory_umo", "family_pulse:FriendMessage:subagents"
+            )
+            cur_umo = getattr(event, "unified_msg_origin", "")
+            if not pulse_umo or cur_umo == pulse_umo:
+                return parts  # 已在旁轨会话召回，或未配置旁轨会话，跳过
+            stub = self._pulse_event_stub(pulse_umo)
+            stub._subagent_persona = agent_name
+            # 覆盖 get_message_str：旁轨桩默认返回 "family_pulse"，会让 livingmemory
+            # 用这个串当查询关键词（actual_query），召回质量差；改成博士的原话
+            stub.get_message_str = (lambda q: lambda: q)(clean_input)
+            req2 = ProviderRequest(
+                prompt=clean_input,
+                extra_user_content_parts=[],
+            )
+            await livingmemory_plugin.handle_memory_recall(stub, req2)
+            pulse_parts = list(req2.extra_user_content_parts or [])
+            if pulse_parts:
+                logger.info(
+                    f"[parallel_handoff] 旁轨会话记忆并入 OK [{agent_name}]: "
+                    f"{len(pulse_parts)} 条"
+                )
+            return parts + pulse_parts
+        except Exception as e:
+            logger.warning(
+                f"[parallel_handoff] 旁轨记忆并入失败(静默) "
+                f"[{agent_name}]: {e}"
+            )
+            return parts
 
     # ── 构建子代理工具集（记忆工具过滤） ──
     def _build_memory_tools(self, agent_name: str):
