@@ -1811,6 +1811,85 @@ class TestRandomState(unittest.TestCase):
         assert mgr.agents("nope") == []
         assert mgr.summary("nope") == {}
 
+    def test_roll_daily_state_default_no_dedup_unchanged(self):
+        """默认不传 avoid → 纯函数行为不变（确定性 seed 稳定）"""
+        from random_state import _base_hand
+        a = roll_daily_state("closure", avoid_hands=[])
+        b = roll_daily_state("closure", avoid_hands=[])
+        assert a.mood == b.mood and a.domain == b.domain
+        # avoid=[] 与 None 同行为（不剔池）
+        assert a.hand == roll_daily_state("closure").hand
+
+    def test_base_hand_strips_suffix(self):
+        """基础手头事剥离：去个性后缀后与池内原文对齐"""
+        from random_state import _base_hand, HAND_FLAVOR
+        assert _base_hand("在收拾房间，刚歇口气") == "在收拾房间"
+        assert _base_hand("刚开完会（一个人）") == "刚开完会"
+        # 无后缀原样返回
+        assert _base_hand("在听歌") == "在听歌"
+        # 池内每个 base 手头事都能在 HAND_FLAVOR 对应域找到
+        for domain, flavors in HAND_FLAVOR.items():
+            for f in flavors:
+                assert _base_hand(f) == f, f"{domain}:{f}"
+
+    def test_roll_daily_state_avoid_excludes_used(self):
+        """avoid 传已用 base hand → 该手头事不被抽到（跨天去重核心）"""
+        from random_state import HAND_FLAVOR, _base_hand
+        # 逐个生活域验证：同人同域、avoid=该域全部已用 → 不会被原样再抽
+        domain = "生活"
+        flavors = HAND_FLAVOR[domain]
+        if len(flavors) >= 2:
+            hand_a = flavors[0]
+            # avoid 含 hand_a → 抽到的 base 不能是 hand_a（除非全池只剩它）
+            for _ in range(20):
+                st = roll_daily_state("shu", avoid_hands=[hand_a])
+                if st.domain == domain:
+                    self.assertNotIn(_base_hand(st.hand), [hand_a])
+        # avoid=全池 → 回退全池，不抛异常且抽取合法
+        for _ in range(5):
+            st = roll_daily_state("closure", avoid_hands=flavors)
+            self.assertTrue(st.hand)
+
+    def test_manager_dedup_cross_day(self):
+        """RandomStateManager 带 seen 文件：跨天避重，且文件真实落盘"""
+        import tempfile
+        import shutil
+        tmp = tempfile.mkdtemp(prefix="rand_seen_")
+        self.addCleanup(shutil.rmtree, tmp)
+        seen_file = os.path.join(tmp, "seen.json")
+        from random_state import _record_seen, _seen_load, _recent_avoid_hands
+        _day_a = "2026-08-20"
+        _day_b = "2026-08-21"
+        _record_seen("shu", "生活", "在收拾房间，刚歇口气", _day_a, seen_file)
+        _record_seen("shu", "生活", "在收拾房间", _day_b, seen_file)
+        # 落盘验证（剥离后缀存 base）
+        assert os.path.exists(seen_file)
+        data = _seen_load(seen_file)
+        assert data[_day_a]["shu"]["hand"] == "在收拾房间"
+        assert data[_day_b]["shu"]["hand"] == "在收拾房间"
+        # 9-04 之前 7 天内的 avoid 命中（.20/.21 在 7 天窗口）
+        avoid = _recent_avoid_hands("shu", "生活", "2026-08-25", seen_file)
+        assert "在收拾房间" in avoid
+        # 窗口外（30 天前）不命中
+        avoid_old = _recent_avoid_hands("shu", "生活", "2026-09-20", seen_file)
+        assert "在收拾房间" not in avoid_old
+
+    def test_manager_dedup_first_use_no_crash(self):
+        """带 seen_path 的 manager 首次 get 不写历史时也正常工作（不崩、有状态）"""
+        import tempfile
+        import shutil
+        tmp = tempfile.mkdtemp(prefix="rand_seen_first_")
+        self.addCleanup(shutil.rmtree, tmp)
+        seen_file = os.path.join(tmp, "seen.json")
+        mgr = RandomStateManager(seen_path=seen_file)
+        st = mgr.get("scene", "amiya")
+        # 生成并写入 seen（get 内部 _roll_with_avoid + _record_seen）
+        assert st.hand
+        assert os.path.exists(seen_file)
+        from random_state import _seen_load
+        data = _seen_load(seen_file)
+        assert data.get(st.day, {}).get("amiya", {}).get("hand") == st.hand
+
 
 class TestDailyLifeInjector(unittest.TestCase):
     """M2 · GLM-4-Flash 注入器：降级兜底 + JSON 解析 + domain 归一"""
@@ -2034,3 +2113,549 @@ class TestDailyLifeInjectToDispatch(unittest.TestCase):
         extra = captured.get("extra") or []
         joined = self._text_of(extra)
         assert "今日日常" in joined
+
+
+# ── M5 · 家庭旁轨（family_pulse，2026-09-04 博士拍板 6 人常驻） ──────────────
+class TestFamilyPulse(unittest.TestCase):
+    """家庭旁轨：心跳闲聊 / 每日摘要 / cron 幂等 / 默认关零行为"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.PluginClass = _load_plugin_class()
+
+    def setUp(self):
+        import tempfile
+
+        self._tmp = tempfile.mkdtemp(prefix="fampulse_")
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _make(self, config: dict = None):
+        ctx = MagicMock()
+        plugin = self.PluginClass(context=ctx, config=config or {})
+        # 测试桩的假 Star.__init__ 不保存 context，手动挂回供 FamilyPulseMixin 使用
+        plugin.context = ctx
+        plugin._pulse_root = self._tmp
+        # 关系网也隔离：默认指向空临时目录 → _pulse_affinity 返回 None → 均匀随机，
+        # 避免测试环境误读真实 relationships.json 导致选人漂移（关系网专项测试自己写文件）
+        plugin._pulse_affinity_root = self._tmp
+        return plugin
+
+    def _resp(self, text: str):
+        r = MagicMock()
+        r.completion_text = text
+        return r
+
+    # ── 配置解析 ──
+    def test_members_default_on_invalid_json(self):
+        """常驻池非法 JSON / 缺员 → 回退默认 11 人全家池（博士 2026-09-04 拍板扩至所有子代理）"""
+        p = self._make({"family_pulse_members": "{bad json"})
+        self.assertEqual(
+            p._pulse_members(),
+            ["amiya", "shu", "closure", "xi", "theresia", "skadi", "ling", "nian", "liino", "m3", "kaltsit"],
+        )
+        p2 = self._make({"family_pulse_members": '["amiya"]'})
+        self.assertEqual(len(p2._pulse_members()), 11)
+
+    def test_members_custom(self):
+        p = self._make({"family_pulse_members": '["amiya","shu","closure"]'})
+        self.assertEqual(p._pulse_members(), ["amiya", "shu", "closure"])
+
+    def test_schema_has_pulse_keys(self):
+        """schema 必须包含家庭旁轨 6 个配置项且开关默认 False"""
+        schema_path = os.path.join(PLUGIN_DIR, "_conf_schema.json")
+        schema = json.load(open(schema_path, encoding="utf-8"))
+        for key in (
+            "enable_family_pulse",
+            "family_pulse_members",
+            "family_pulse_cron",
+            "family_pulse_digest_cron",
+            "family_pulse_provider_id",
+            "family_pulse_digest_umo",
+        ):
+            self.assertIn(key, schema)
+        self.assertIs(schema["enable_family_pulse"]["default"], False)
+
+    def test_period_desc_has_segment(self):
+        """时段描述包含中文时段词"""
+        from family_pulse import _pulse_period_desc
+
+        self.assertTrue(any(
+            k in _pulse_period_desc(1756950000)
+            for k in ("凌晨", "早上", "中午", "下午", "傍晚", "深夜")
+        ))
+
+    # ── 挑人 ──
+    def test_pick_two(self):
+        """返回 2 人且互不相同"""
+        p = self._make({})
+        a, b = p._pulse_pick_two(["amiya", "shu", "closure", "xi"])
+        self.assertTrue(a and b and a != b)
+
+    def _write_affinity(self, p, pairs):
+        """往临时目录写一个迷你 relationships.json，并让插件读它"""
+        rel = {"relationship_edges": {}, "relationship_state": pairs}
+        p._pulse_affinity_root = self._tmp
+        p._pulse_affinity_path = lambda: os.path.join(self._tmp, "relationships.json")
+        with open(os.path.join(self._tmp, "relationships.json"), "w", encoding="utf-8") as f:
+            json.dump(rel, f, ensure_ascii=False)
+
+    def test_affinity_parses_and_skips_unmapped(self):
+        """关系网解析成英文 id 矩阵，博士/普瑞赛斯等无 id 对跳过"""
+        p = self._make({})
+        self._write_affinity(p, {
+            "阿米娅<->特蕾西娅": {"亲密度": 95, "基调": "敬+依恋"},
+            "凯尔希<->博士": {"亲密度": 100, "基调": "君臣"},
+        })
+        aff = p._pulse_affinity()
+        self.assertIn(frozenset(("amiya", "theresia")), aff)
+        self.assertEqual(aff[frozenset(("amiya", "theresia"))][0], 95)
+        # 博士无英文 id → 该对整条被跳过
+        self.assertNotIn(frozenset(("kaltsit", "博士")), aff)
+
+    def test_pick_two_bias_affinity(self):
+        """亲密度加权：关系好的 pair 明显比默默无闻的更常被抽中"""
+        p = self._make({})
+        # 四人间只给 (shu, xi) 极高的亲密度，其余都无记录（基线一致）
+        self._write_affinity(p, {
+            "黍<->夕": {"亲密度": 99999, "基调": "别扭依赖"},
+        })
+        hits = {"shu_xi": 0, "other": 0}
+        for _ in range(400):
+            a, b = p._pulse_pick_two(["amiya", "shu", "xi", "closure"])
+            if {a, b} == {"shu", "xi"}:
+                hits["shu_xi"] += 1
+            else:
+                hits["other"] += 1
+        # 强权重 + 基线应使亲密对压倒性领先
+        self.assertGreater(hits["shu_xi"], hits["other"] * 3)
+
+    def test_pick_two_uniform_when_no_affinity(self):
+        """无关系网文件（aff=None）→ 退化为均匀随机，多轮出现多种组合（不写死）"""
+        p = self._make({})  # 不写任何关系网文件
+        seen = set()
+        for _ in range(300):
+            a, b = p._pulse_pick_two(["amiya", "shu", "closure", "xi"])
+            seen.add(frozenset((a, b)))
+        self.assertGreaterEqual(len(seen), 4)  # 至少出现过半组合＝未锁死
+
+    def test_pulse_tone_returns_tone(self):
+        """_pulse_tone 取到关系基调；无收录对返回空串（不注入）"""
+        p = self._make({})
+        self._write_affinity(p, {
+            "黍<->夕": {"亲密度": 92, "基调": "别扭依赖"},
+        })
+        self.assertEqual(p._pulse_tone("shu", "xi"), "别扭依赖")
+        self.assertEqual(p._pulse_tone("amiya", "closure"), "")
+
+    # ── 手头事线程（半衰不清零） ──
+    def test_ensure_thread_creates_and_persists(self):
+        """无线程时弹出新物件，落盘可读回同一件"""
+        p = self._make({})
+        with self._tmp_thread_guard(p):
+            t = p._pulse_ensure_thread("shu", {})
+            self.assertTrue(t)
+            store = p._pulse_load_threads()
+            self.assertEqual(store["shu"]["text"], t)
+            self.assertGreater(store["shu"]["decay"], 0)
+
+    def test_ensure_thread_reuses_until_done(self):
+        """线程未耗竭：反复取回同一件，不重掷"""
+        p = self._make({})
+        with self._tmp_thread_guard(p):
+            store = p._pulse_load_threads()
+            t1 = p._pulse_ensure_thread("xi", store)
+            t2 = p._pulse_ensure_thread("xi", store)
+            self.assertEqual(t1, t2)
+
+    def test_advance_decays_and_removes(self):
+        """戳一次 decay-1；归 0 剔除，下次重掷新物件"""
+        p = self._make({})
+        with self._tmp_thread_guard(p):
+            p._pulse_ensure_thread("amiya", {})
+            before = p._pulse_load_threads()
+            decay = before["amiya"]["decay"]
+            # 直接推到 -1 以验证剔除
+            store = p._pulse_load_threads()
+            store["amiya"]["decay"] = 1
+            p._pulse_save_threads(store)
+            p._pulse_advance_thread("amiya")
+            self.assertNotIn("amiya", p._pulse_load_threads())
+
+    def test_thread_persists_across_instances(self):
+        """不同插件实例共享同一线程文件 → 跨天/重启连续性"""
+        p1 = self._make({})
+        p1._pulse_ensure_thread("skadi", {})
+        p2 = self._make({})
+        store = p2._pulse_load_threads()
+        self.assertIn("skadi", store)
+
+    # ── B方案：动态种子取材（破固定文案循环） ──
+    def _write_pulse_log(self, p, agent, text):
+        """往临时根按今天日期写一条旁轨日志，模拟该 agent 真实念叨过"""
+        import datetime
+        from zoneinfo import ZoneInfo
+
+        today = datetime.datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
+        path = os.path.join(self._tmp, f"{today}.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        rec = {"ts": "12:00", "agent": agent, "display": agent, "text": text}
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    def test_recent_seed_preferred_over_flavors(self):
+        """有真实念叨日志时，新线程种子取自她的真实话，不用固定文案"""
+        p = self._make({})
+        with self._tmp_thread_guard(p):
+            # 先给她一条真实念叨
+            self._write_pulse_log(p, "shu", "腌萝卜那缸又该翻一遍了，坛沿都起沫")
+            # 手动清空线程存储，强制走"重掷"分支
+            rec = {"shu": {"text": "x", "decay": 0}}
+            t = p._pulse_ensure_thread("shu", rec)
+            self.assertEqual(t, "腌萝卜那缸又该翻一遍了，坛沿都起沫")
+            store = p._pulse_load_threads()
+            self.assertEqual(store["shu"]["text"], t)
+            # 种子应来自真实念叨而非固定池
+            from family_pulse import THREAD_FLAVORS
+            pool_texts = {t for t, _ in THREAD_FLAVORS.get("shu", [])}
+            self.assertNotIn(t, pool_texts)
+
+    def test_recent_seed_no_log_falls_back_to_flavors(self):
+        """无真实念叨（冷启动）时才回退固定物件池"""
+        p = self._make({})
+        with self._tmp_thread_guard(p):
+            from family_pulse import THREAD_FLAVORS
+            t = p._pulse_ensure_thread("amiya", {})
+            self.assertTrue(t)
+            pool_texts = {t for t, _ in THREAD_FLAVORS.get("amiya", [])}
+            self.assertIn(t, pool_texts)
+
+    def test_recent_seed_across_days(self):
+        """种子取材跨近几日日志（含昨天）→ 跨天连续性成立"""
+        import datetime
+        from zoneinfo import ZoneInfo
+
+        p = self._make({})
+        with self._tmp_thread_guard(p):
+            # 昨天的一条念叨
+            yesterday = (
+                datetime.datetime.now(ZoneInfo("Asia/Shanghai"))
+                - datetime.timedelta(days=1)
+            ).strftime("%Y-%m-%d")
+            ypath = os.path.join(self._tmp, f"{yesterday}.jsonl")
+            os.makedirs(os.path.dirname(ypath), exist_ok=True)
+            with open(ypath, "w", encoding="utf-8") as f:
+                f.write(
+                    json.dumps(
+                        {
+                            "ts": "21:00",
+                            "agent": "xi",
+                            "display": "xi",
+                            "text": "昨天那幅龙还晾在架上没落款",
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+            seed = p._pulse_recent_seed("xi")
+            self.assertIsNotNone(seed)
+            self.assertEqual(seed[0], "昨天那幅龙还晾在架上没落款")
+
+    def test_advance_then_reseed_from_life_log(self):
+        """线程耗竭剔除后，下一跳从生活日志长新线，而非回固定池"""
+        p = self._make({})
+        with self._tmp_thread_guard(p):
+            self._write_pulse_log(p, "closure", "那块电源板又窜出杂讯，拆开重焊")
+            rec = {"closure": {"text": "旧事", "decay": 1}}
+            # 存进存储再 advance，归 0 剔除
+            p._pulse_save_threads(rec)
+            p._pulse_advance_thread("closure")
+            self.assertNotIn("closure", p._pulse_load_threads())
+            # 重掷：应吃生活日志的种子
+            t = p._pulse_ensure_thread("closure", {})
+            self.assertEqual(t, "那块电源板又窜出杂讯，拆开重焊")
+
+    # ── 真演化主菜：动态取材升级（2026-09-04 博士拍板：9 成真演化按底色） ──
+    def test_recent_seed_excludes_used(self):
+        """used 传已在线的线程 → 该条不再被取材（破重复循环，博士 16:45 撞车修复）"""
+        p = self._make({})
+        with self._tmp_thread_guard(p):
+            self._write_pulse_log(p, "shu", "腌萝卜那缸该翻一遍，坛沿起沫")
+            self._write_pulse_log(p, "shu", "菜园子那几垄白菜该收了")
+            # used 含第一条 → 只能取第二条（唯一可用）
+            seed = p._pulse_recent_seed("shu", used={"腌萝卜那缸该翻一遍，坛沿起沫"})
+            self.assertIsNotNone(seed)
+            self.assertEqual(seed[0], "菜园子那几垄白菜该收了")
+
+    def test_recent_seed_all_used_returns_none(self):
+        """候选全被 used → None（无新可取材，交由冷启动兜底）"""
+        p = self._make({})
+        with self._tmp_thread_guard(p):
+            self._write_pulse_log(p, "xi", "那幅画还晾在架上没落款")
+            seed = p._pulse_recent_seed("xi", used={"那幅画还晾在架上没落款"})
+            self.assertIsNone(seed)
+
+    def test_recent_seed_domain_prefers_fit(self):
+        """传今日 domain 底色 → 优先取含该域关键词的真实念叨（贴角色演，不跑偏）"""
+        p = self._make({})
+        with self._tmp_thread_guard(p):
+            # 两条念叨：一条带「生活」域关键词（收拾），一条是纯针线随笔
+            self._write_pulse_log(p, "shu", "刚把灶台收拾干净了")
+            self._write_pulse_log(p, "shu", "翻出旧针线包发了好一阵呆")
+            from random_state import DOMAIN_KEYWORDS
+            self.assertIn("收拾", DOMAIN_KEYWORDS["生活"])
+            seed = p._pulse_recent_seed("shu", domain="生活")
+            self.assertIsNotNone(seed)
+            self.assertEqual(seed[0], "刚把灶台收拾干净了")
+
+    def test_recent_seed_skips_too_short(self):
+        """短旁白（<4 字）不作为新种子——只要真实念叨"""
+        import datetime
+        from zoneinfo import ZoneInfo
+        p = self._make({})
+        with self._tmp_thread_guard(p):
+            # 写一句 3 字的短旁白
+            today = datetime.datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
+            path = os.path.join(self._tmp, f"{today}.jsonl")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(json.dumps(
+                    {"ts": "12:00", "agent": "amiya", "display": "amiya", "text": "嗯嗯"},
+                    ensure_ascii=False,
+                ) + "\n")
+            seed = p._pulse_recent_seed("amiya")
+            self.assertIsNone(seed)  # 短旁白被过滤 → 无候选
+
+    def _tmp_thread_guard(self, p):
+        """让线程文件落在临时目录，不污染真实数据"""
+        import contextlib
+
+        @contextlib.contextmanager
+        def _inner():
+            p._pulse_root = self._tmp
+            yield
+
+        return _inner()
+
+    def test_tick_uses_thread_in_prompt(self):
+        """心跳会让开的 LLM prompt 带上未完结的线程文案"""
+        p = self._make({"enable_family_pulse": True})
+        captured = {}
+
+        async def capture(**kw):
+            captured["prompt"] = kw.get("prompt", "")
+
+            class _R:
+                completion_text = "刚把那件外套的补丁别好了"
+
+            return _R()
+
+        p.context.llm_generate = capture
+        with self._tmp_thread_guard(p):
+            p.family_pulse_tick = self._wrap_tick(p, p.family_pulse_tick)
+            asyncio.run(p.family_pulse_tick())
+        self.assertIn("手头有件没做完的事", captured.get("prompt", ""))
+
+    def _wrap_tick(self, p, orig):
+        """让 tick 视角下的线程根目录也走临时目录"""
+        import functools
+
+        @functools.wraps(orig)
+        async def wrapped():
+            return await orig()
+
+        return wrapped
+
+    # ── 心跳 ──
+    def test_tick_disabled_noop(self):
+        """开关关：不调 LLM、不落日志"""
+        p = self._make({"enable_family_pulse": False})
+        p.context.llm_generate = AsyncMock()
+        asyncio.run(p.family_pulse_tick())
+        p.context.llm_generate.assert_not_awaited()
+        self.assertEqual(p._pulse_read_day(), [])
+
+    def test_tick_success_writes_log(self):
+        """心跳成功：两人各落一条日志"""
+        p = self._make({"enable_family_pulse": True})
+        p.context.llm_generate = AsyncMock(return_value=self._resp("刚把柳木画板搬去晾"))
+        asyncio.run(p.family_pulse_tick())
+        logs = p._pulse_read_day()
+        self.assertEqual(len(logs), 2)
+        self.assertEqual(len({r["agent"] for r in logs}), 2)
+
+    def test_tick_llm_failure_silent(self):
+        """LLM 全挂：静默跳过，不炸、不落日志"""
+        p = self._make({"enable_family_pulse": True})
+
+        async def boom(**kw):
+            raise RuntimeError("glm down")
+
+        p.context.llm_generate = boom
+        asyncio.run(p.family_pulse_tick())
+        self.assertEqual(p._pulse_read_day(), [])
+
+    def test_tick_opener_fail_no_reply(self):
+        """开场失败（空文本）→ 只调一次 LLM，不再强行接话"""
+        p = self._make({"enable_family_pulse": True})
+        p.context.llm_generate = AsyncMock(return_value=self._resp(""))
+        asyncio.run(p.family_pulse_tick())
+        self.assertEqual(p.context.llm_generate.await_count, 1)
+        self.assertEqual(p._pulse_read_day(), [])
+
+    def test_event_stub_carries_livingmemory_fields(self):
+        """事件桩提供 livingmemory 召回/存储所需的最小字段"""
+        p = self._make({})
+        stub = p._pulse_event_stub("family_pulse:FriendMessage:subagents")
+        self.assertEqual(stub.unified_msg_origin, "family_pulse:FriendMessage:subagents")
+        self.assertTrue(callable(stub.get_message_str))
+        self.assertTrue(callable(stub.get_message_type))
+        self.assertTrue(callable(stub.get_sender_id))
+        self.assertTrue(callable(stub.get_message_type))
+        # 可被 _memory_recall 打 persona 标
+        stub._subagent_persona = "shu"
+        self.assertEqual(stub._subagent_persona, "shu")
+
+    def test_tick_memory_recall_injects_extra_parts(self):
+        """livingmemory 就绪时：召回记忆经 extra_user_content_parts 注入生成请求"""
+        p = self._make({"enable_family_pulse": True})
+        seen = {}
+
+        async def fake_recall(event, agent, clean_input, plugin):
+            seen["agent"] = agent
+            seen["event_persona"] = event._subagent_persona
+            seen["plugin"] = plugin
+            return ["<recalled-memory>"]
+
+        async def fake_store(plugin, event, agent, final_input, raw):
+            seen["stored_agent"] = agent
+            seen["stored_text"] = raw
+
+        p._find_livingmemory_plugin = lambda: object()  # 找到插件
+        p._memory_recall = fake_recall
+        p._memory_store = fake_store
+        p.context.llm_generate = AsyncMock(return_value=self._resp("刚把柳木画板搬去晾"))
+        asyncio.run(p.family_pulse_tick())
+        self.assertEqual(p.context.llm_generate.await_count, 2)
+        # 至少一次生成携带了召回记忆（注入 extra_user_content_parts）
+        injected = [
+            kw.get("extra_user_content_parts")
+            for a in p.context.llm_generate.await_args_list
+            for kw in [a.kwargs]
+            if kw.get("extra_user_content_parts")
+        ]
+        self.assertTrue(
+            any(
+                isinstance(parts, list) and "<recalled-memory>" in parts
+                for parts in injected
+            )
+        )
+        # 记忆召回与存储都发生了，且 agent 是挑中的两人的其一（全家 11 人池）
+        _FAMILY_POOL = {"amiya", "shu", "closure", "xi", "theresia", "skadi", "ling", "nian", "liino", "m3", "kaltsit"}
+        self.assertIn(seen.get("agent"), _FAMILY_POOL)
+        self.assertEqual(seen["event_persona"], seen["agent"])
+        self.assertEqual(seen["stored_agent"], seen["agent"])
+        self.assertTrue(seen["stored_text"])
+
+    def test_tick_memory_recall_failure_degrades(self):
+        """livingmemory 召回抛异常：记忆静默降级，心跳照常落日志"""
+        p = self._make({"enable_family_pulse": True})
+
+        def boom(**kw):
+            raise RuntimeError("recall down")
+
+        p._find_livingmemory_plugin = lambda: object()
+        p._memory_recall = boom
+        p.context.llm_generate = AsyncMock(return_value=self._resp("刚把柳木画板搬去晾"))
+        asyncio.run(p.family_pulse_tick())
+        # 心跳照常跑完、两人都说了话
+        logs = p._pulse_read_day()
+        self.assertEqual(len(logs), 2)
+
+    def _pulse_text(self, kwargs):
+        """从 llm_generate 缓存 kwargs 里取 prompt 文本（含记忆注入的完整串联）"""
+        return str(kwargs.get("prompt", ""))
+
+    def _pulse_extra_parts(self, kwargs):
+        return kwargs.get("extra_user_content_parts") or []
+
+    # ── 摘要 ──
+    def test_digest_no_logs_no_send(self):
+        """当天无日志：不发送、不报错"""
+        p = self._make({"enable_family_pulse": True})
+        p.context.send_message = AsyncMock()
+        asyncio.run(p.family_pulse_digest())
+        p.context.send_message.assert_not_awaited()
+
+    def test_digest_sends_summary(self):
+        """有日志：摘要文本含发言人、发送到博士 UMO"""
+        p = self._make({"enable_family_pulse": True})
+        p._pulse_append("amiya", "阿米娅", "今天想泡壶茶晒晒太阳")
+        # 文本组装（纯函数）断言
+        text = p._build_digest_text(p._pulse_read_day(), "09-04")
+        self.assertIn("家里动静", text)
+        self.assertIn("阿米娅", text)
+        self.assertIn("泡壶茶", text)
+        # 发送侧：UMO 正确、调用一次
+        p.context.send_message = AsyncMock()
+        asyncio.run(p.family_pulse_digest())
+        p.context.send_message.assert_awaited_once()
+        umo = p.context.send_message.await_args.args[0]
+        self.assertIn("TESTUSER", umo)
+
+    def test_digest_disabled_no_send(self):
+        """开关关：有日志也不发送"""
+        p = self._make({"enable_family_pulse": False})
+        p._pulse_append("amiya", "阿米娅", "日志在但开关关着")
+        p.context.send_message = AsyncMock()
+        asyncio.run(p.family_pulse_digest())
+        p.context.send_message.assert_not_awaited()
+
+    # ── cron 幂等 ──
+    def test_setup_jobs_idempotent(self):
+        """注册前清同名遗留（biliread 堆积教训同款），注册 2 个新任务"""
+        from types import SimpleNamespace
+
+        p = self._make({"enable_family_pulse": True})
+        old = MagicMock()
+        old.name = "family_pulse_tick"
+        old.job_id = "legacy-1"
+        p.context.cron_manager.list_jobs = AsyncMock(return_value=[old])
+        p.context.cron_manager.delete_job = AsyncMock()
+        p.context.cron_manager.add_basic_job = AsyncMock(
+            side_effect=[SimpleNamespace(job_id="j1"), SimpleNamespace(job_id="j2")]
+        )
+        asyncio.run(p.setup_pulse_jobs())
+        p.context.cron_manager.delete_job.assert_awaited_once_with("legacy-1")
+        self.assertEqual(p.context.cron_manager.add_basic_job.await_count, 2)
+        self.assertEqual(p._pulse_job_ids, ["j1", "j2"])
+
+    def test_teardown_removes_jobs(self):
+        p = self._make({})
+        p._pulse_job_ids = ["j1", "j2"]
+        p.context.cron_manager.delete_job = AsyncMock()
+        asyncio.run(p.teardown_pulse_jobs())
+        self.assertEqual(p.context.cron_manager.delete_job.await_count, 2)
+        self.assertEqual(p._pulse_job_ids, [])
+
+    def test_initialize_disabled_no_register(self):
+        """开关关：initialize 不注册任何 cron"""
+        p = self._make({"enable_family_pulse": False})
+        p.context.cron_manager.add_basic_job = AsyncMock()
+        asyncio.run(p.initialize())
+        p.context.cron_manager.add_basic_job.assert_not_awaited()
+
+    def test_initialize_enabled_registers(self):
+        """开关开：initialize 注册 2 个任务"""
+        from types import SimpleNamespace
+
+        p = self._make({"enable_family_pulse": True})
+        p.context.cron_manager.list_jobs = AsyncMock(return_value=[])
+        p.context.cron_manager.add_basic_job = AsyncMock(
+            side_effect=[SimpleNamespace(job_id="j1"), SimpleNamespace(job_id="j2")]
+        )
+        asyncio.run(p.initialize())
+        self.assertEqual(p.context.cron_manager.add_basic_job.await_count, 2)

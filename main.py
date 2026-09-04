@@ -37,6 +37,7 @@ try:
     from . import ctx_engine as _ctx_engine_mod
     from . import router as _router_mod
     from . import arbitrate as _arbitrate_mod
+    from . import family_pulse as _family_pulse_mod
 except ImportError:
     import config as _config_mod
     import directive as _directive_mod
@@ -47,6 +48,7 @@ except ImportError:
     import ctx_engine as _ctx_engine_mod
     import router as _router_mod
     import arbitrate as _arbitrate_mod
+    import family_pulse as _family_pulse_mod
 
 
 @register(
@@ -64,6 +66,7 @@ class ParallelHandoffPlugin(
     _config_mod.ConfigMixin,
     _router_mod.RouterMixin,
     _arbitrate_mod.ArbitrationMixin,
+    _family_pulse_mod.FamilyPulseMixin,
     Star,
 ):
     """并行子代理调用插件"""
@@ -157,6 +160,25 @@ class ParallelHandoffPlugin(
         """
         return await super()._busy_bypass_check(event)
 
+
+    # ── 生命周期：家庭旁轨定时任务（实现见 family_pulse.py FamilyPulseMixin） ──
+    async def initialize(self):
+        """插件加载/热重载时注册家庭旁轨 cron（幂等：先清同名遗留再注册）。
+
+        开关 enable_family_pulse 默认 False——关闭时零注册、零行为变化。
+        """
+        if self._cfg("enable_family_pulse", False):
+            try:
+                await self.setup_pulse_jobs()
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"[parallel_handoff] 家庭旁轨注册失败: {e}")
+
+    async def terminate(self):
+        """卸载/重载时拆掉家庭旁轨定时任务，不留垃圾（biliread 同款）。"""
+        try:
+            await self.teardown_pulse_jobs()
+        except Exception:  # noqa: BLE001
+            pass
 
     # ── 热重载（插件入口命令，完整实现保留本模块） ────────────
     @filter.regex(r"^(热重载一下并行子代理调用插件|热重载并行插件|重载插件|reload_parallel)$")
