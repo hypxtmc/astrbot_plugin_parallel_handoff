@@ -105,15 +105,16 @@ class MemoryMixin:
                         )
                         return []
 
-                event.persona_id = agent_name
-                # 2026-09-04 子代理独立记忆库：livingmemory 的 get_persona_id()
-                # 只认 _subagent_persona 标记（它不读 persona_id 属性，历史赋值保留防其他链路依赖）
-                event._subagent_persona = agent_name
+                # 2026-09-05 记忆串库修复：召回改走子代理专属会话桩。
+                # livingmemory 按 session+persona 双条件过滤，存储侧拆专属会话后
+                # 召回必须用同一 umo 才能查到新库记忆；且不再污染原始 event
+                #（此前在原始 event 上打 _subagent_persona，残留会让主代理链路挂错 persona）
+                stub = self._subagent_event_stub(event, agent_name)
                 req = ProviderRequest(
                     prompt=clean_input,
                     extra_user_content_parts=[],
                 )
-                await livingmemory_plugin.handle_memory_recall(event, req)
+                await livingmemory_plugin.handle_memory_recall(stub, req)
 
                 # 保留记忆注入内容，透传给子代理的 provider
                 parts = list(req.extra_user_content_parts or [])
@@ -140,7 +141,7 @@ class MemoryMixin:
                 return []
         return []
 
-    # ── 旁轨记忆并入（2026-09-04 顾主拍板方案 A） ──
+    # ── 旁轨家常并入（2026-09-04 方案 A → 2026-09-05 顾主改版：只抓最近 6 小时） ──
     async def _merge_pulse_memory_recall(
         self,
         parts: list,
@@ -149,16 +150,18 @@ class MemoryMixin:
         clean_input: str,
         livingmemory_plugin,
     ) -> list:
-        """顾主私聊直问子代理时，额外并入旁轨会话（side_pulse）里该子代理的家常记忆。
+        """顾主私聊直问子代理时，并入「最近 N 小时家里动静」（jsonl 滑动窗口）。
 
-        背景：旁轨记忆落在 side_pulse:FriendMessage:subagents 会话 + agent persona 维度，
-        livingmemory 的 search_memories 按 session_id + persona_id 双条件过滤——
-        顾主私聊会话召回查不到旁轨记忆，子代理被问「今天家里聊了什么」时说不记得。
-        这里用旁轨事件桩再造一次 handle_memory_recall（同一 persona，旁轨会话），
-        把「家里的记忆」合并进召回结果，让子代理翻得到腌萝卜那一段。
+        2026-09-05 顾主改版：方案 A 原实现并入 livingmemory 旁轨会话的长期
+        记忆，从上线起几天累积下来，每次问都把几天历史全部堆进上下文，
+        非常难看。顾主拍板改成只抓最近 6 小时的闲聊：家里动静的权威来源
+        是旁轨 jsonl（心跳对话原文），按滑动时间窗过滤后注入；更早的生活
+        线由子代理自己的 recall_long_term_memory 工具按需查询（记忆工具
+        仍在手上），不再自动堆叠历史。
 
-        旁轨心跳链路（_pulse_llm）传进来的 event 本身就是旁轨桩（unified_msg_origin
-        等于旁轨会话），此处直接跳过，不重复召回。任何失败静默降级，不影响主召回。
+        旁轨心跳链路（_pulse_llm）传进来的 event 本身就是旁轨桩，此处直接
+        跳过，不重复注入。窗口小时数可配 side_pulse_recent_hours（默认 6）。
+        任何失败静默降级，不影响主召回。
         """
         try:
             pulse_umo = self._cfg(
@@ -166,30 +169,101 @@ class MemoryMixin:
             )
             cur_umo = getattr(event, "unified_msg_origin", "")
             if not pulse_umo or cur_umo == pulse_umo:
-                return parts  # 已在旁轨会话召回，或未配置旁轨会话，跳过
-            stub = self._pulse_event_stub(pulse_umo)
-            stub._subagent_persona = agent_name
-            # 覆盖 get_message_str：旁轨桩默认返回 "side_pulse"，会让 livingmemory
-            # 用这个串当查询关键词（actual_query），召回质量差；改成顾主的原话
-            stub.get_message_str = (lambda q: lambda: q)(clean_input)
-            req2 = ProviderRequest(
-                prompt=clean_input,
-                extra_user_content_parts=[],
-            )
-            await livingmemory_plugin.handle_memory_recall(stub, req2)
-            pulse_parts = list(req2.extra_user_content_parts or [])
+                return parts  # 已在旁轨会话，或未配置旁轨会话，跳过
+            pulse_parts = self._pulse_log_fallback(agent_name)
             if pulse_parts:
                 logger.info(
-                    f"[parallel_handoff] 旁轨会话记忆并入 OK [{agent_name}]: "
+                    f"[parallel_handoff] 旁轨近窗家常注入 OK [{agent_name}]: "
                     f"{len(pulse_parts)} 条"
                 )
-            return parts + pulse_parts
+                return parts + pulse_parts
+            return parts
         except Exception as e:
             logger.warning(
-                f"[parallel_handoff] 旁轨记忆并入失败(静默) "
+                f"[parallel_handoff] 旁轨家常注入失败(静默) "
                 f"[{agent_name}]: {e}"
             )
             return parts
+
+    # ── 旁轨近窗家常注入（2026-09-05 顾主改版：滑动时间窗，默认 6 小时） ──
+    def _pulse_log_fallback(self, agent_name: str, max_lines: int = 15) -> list:
+        """「家里动静」查看链路的注入源：旁轨 jsonl 按最近 N 小时窗口过滤。
+
+        2026-09-05 顾主改版：原来取「当天全部最近 max_lines 句」，一天下来
+        从早到晚全堆进上下文；现在只取最近 side_pulse_recent_hours
+        （默认 6）小时内的家常。ts 为当天 "HH:MM"，窗口跨零点时 jsonl
+        只有当天文件、无法回溯昨日，退化为取当天零点后全部再截尾。
+        更早的生活线由子代理 recall_long_term_memory 工具按需查询。
+        任何失败静默降级，不阻塞主召回。
+        """
+        try:
+            read_day = getattr(self, "_pulse_read_day", None)
+            if not callable(read_day):
+                return []
+            logs = read_day()
+            if not logs:
+                return []
+            import datetime
+            from zoneinfo import ZoneInfo
+
+            now = datetime.datetime.now(ZoneInfo("Asia/Shanghai"))
+            hours = 6
+            try:
+                hours = float(self._cfg("side_pulse_recent_hours", 6) or 6)
+            except Exception:
+                pass
+            floor_min = max(0, int(now.hour * 60 + now.minute - hours * 60))
+
+            in_window = []
+            for r in logs:
+                ts = str(r.get("ts", ""))
+                try:
+                    hh, mm = ts.split(":")
+                    r_min = int(hh) * 60 + int(mm)
+                except Exception:
+                    continue  # ts 缺损/非当天格式，不注入
+                if r_min >= floor_min:
+                    in_window.append(r)
+            logs = in_window[-max_lines:]
+            lines = []
+            for r in logs:
+                name = r.get("display", r.get("agent", ""))
+                text = (r.get("text") or "").strip()
+                if not text:
+                    continue
+                # 2026-09-05 过滤：顾主贴来的日志块（如带 [Core]/[INFO] 的系统日志）
+                # 会被 _pulse_append 原样写进旁轨日志，不适合当「家里聊了什么」注入
+                if text.startswith("[20") and (
+                    "[Core]" in text or "[INFO]" in text or "core.event_bus" in text
+                ):
+                    continue
+                if len(text) > 500 and (
+                    "[INFO]" in text or "[WARN" in text or "[ERROR]" in text
+                ):
+                    continue
+                lines.append(f"{r.get('ts', '')} · {name}：{text}")
+            if not lines:
+                return []
+            today = now.strftime("%Y-%m-%d")
+            body = "\n".join(lines)
+            # 2026-09-05 修复：extra_user_content_parts 元素必须是 TextPart 对象
+            # （裸字符串会触发 provider 端「不支持的额外内容块类型: <class 'str'>」），
+            # 与 livingmemory 注入方式对齐：TextPart(text=...).mark_as_temp()
+            from astrbot.core.agent.message import TextPart
+
+            return [
+                TextPart(
+                    text=(
+                        f"【家里最近 {hours:g} 小时】{today} 的旁轨家常"
+                        f"（{len(lines)} 句）：\n{body}"
+                    )
+                ).mark_as_temp()
+            ]
+        except Exception as e:
+            logger.warning(
+                f"[parallel_handoff] 旁轨家常注入失败(静默): {e}"
+            )
+            return []
 
     # ── 构建子代理工具集（记忆工具过滤） ──
     def _build_memory_tools(self, agent_name: str):
@@ -230,6 +304,181 @@ class MemoryMixin:
             )
         return subagent_tools
 
+    # ── 子代理专属记忆会话（2026-09-05 记忆串库修复） ─────────────
+
+    @staticmethod
+    def _subagent_event_stub(event, agent_name: str):
+        """造子代理专属记忆会话桩（仿 side_pulse._pulse_event_stub）。
+
+        umo = 「{原会话}:subagent:{agent_name}」——存储/召回/提炼三条链路
+        共用同一专属会话，与主代理会话彻底隔离；鸭子类型兼容 livingmemory
+        对 event 的全部字段访问。失败由调用方 try/except 静默降级。
+        """
+        import types as _types
+
+        umo = f"{event.unified_msg_origin}:subagent:{agent_name}"
+        message_obj = _types.SimpleNamespace(
+            raw_message="subagent_memory", sender=None
+        )
+        stub = _types.SimpleNamespace(
+            unified_msg_origin=umo,
+            message_obj=message_obj,
+            persona_id=agent_name,
+            _subagent_persona=agent_name,  # get_persona_id 优先级 0，按子代理隔离
+        )
+        stub.get_message_str = lambda: "subagent_memory"
+        stub.get_message_type = lambda: 1  # 非群聊，走私聊存储
+        stub.get_sender_id = lambda: umo
+        try:
+            _platform = event.get_platform_name()
+        except Exception:
+            _platform = "qq_restapi"
+        stub.get_platform_name = lambda: _platform
+        stub.get_self_id = lambda: "subagent_memory_bot"
+        return stub
+
+    # ── 子代理英文 id → AstrBot 人格真名（提炼提示词专用） ──
+    def _persona_name(self, agent_name: str) -> str:
+        """把子代理英文 id 映射成 AstrBot personas 表里的人格真名。
+
+        2026-09-05 修：_maybe_reflect_subagent 的 process_conversation
+        (persona_id=...) 只用于取提炼 prompt 的人格底色，原样传英文 id
+        （shu/agent_d…）在 personas 表（中文名：黍/助手D…）查不到，每小时
+        心跳提炼都 WARN 一条并退化 base_prompt。存储维度（classify_atoms
+        的 persona_id）保持英文 id 与召回侧 _subagent_persona 一致，
+        不经过本函数，防止记忆库 persona 维度分裂。
+        助手C的人格在库中登记为「助手C-子代理」，特例映射。
+        查不到映射时原样返回（行为与旧版一致，仅可能仍有 WARN）。
+        """
+        try:
+            disp = (self._get_name_display_map() or {}).get(agent_name) or agent_name
+        except Exception:
+            disp = agent_name
+        if disp == "助手C":
+            disp = "助手C-子代理"
+        return disp
+
+    async def _maybe_reflect_subagent(
+        self, livingmemory_plugin, stub, agent_name: str
+    ):
+        """子代理专属会话的主动记忆提炼（达到轮数阈值时触发）。
+
+        livingmemory 的 Reflection 只在主代理 LLM 响应链上触发，子代理
+        专属会话永远不会被自动总结 → documents 长期记忆恒为 0 条。
+        此处复用 /lmem summarize 同款提炼链路（process_conversation →
+        classify_atoms → add_memory），persona 挂子代理名下，记忆落
+        子代理自己的独立长期记忆库。任何失败只记日志不抛出。
+        """
+        try:
+            ch = getattr(livingmemory_plugin, "command_handler", None)
+            if ch is None:
+                return
+            cm = getattr(ch, "conversation_manager", None)
+            mp = getattr(ch, "_memory_processor", None)
+            me = getattr(ch, "memory_engine", None)
+            cfg = getattr(ch, "config_manager", None)
+            if not (cm and mp and me and cfg):
+                return
+
+            session_id = stub.unified_msg_origin
+            count = await cm.store.get_message_count(session_id)
+            last = await cm.get_session_metadata(
+                session_id, "last_summarized_index", 0
+            )
+            try:
+                last = int(last)
+            except (TypeError, ValueError):
+                last = 0
+            if last > count:  # 消息被清理后索引越界，对齐到当前总数
+                last = count
+
+            threshold = cfg.get("reflection_engine.summary_trigger_rounds", 10)
+            unsummarized = count - last
+            if unsummarized < 2 or (unsummarized // 2) < threshold:
+                return
+
+            history = await cm.get_messages_range(
+                session_id=session_id, start_index=last, end_index=count
+            )
+            if not history:
+                return
+
+            persona_id = agent_name  # 存储维度，须与召回侧 _subagent_persona 一致，勿改
+            # 2026-09-05 修：提炼提示词用 personas 表人格真名（中文），
+            # 否则每小时心跳提炼都 WARN「人格 'shu' 不存在」
+            persona_prompt_id = self._persona_name(agent_name)
+            memory_scope = session_id
+            try:
+                from astrbot_plugin_livingmemory.core.memory_scope import (
+                    resolve_memory_scope,
+                )
+
+                memory_scope = resolve_memory_scope(cfg, stub) or session_id
+            except Exception:
+                pass  # import 失败时退化为 session 作用域，不致命
+
+            content, metadata, importance = await mp.process_conversation(
+                messages=history,
+                is_group_chat=False,
+                persona_id=persona_prompt_id,
+            )
+            atoms = mp.classify_atoms_from_metadata(
+                metadata=metadata,
+                parent_importance=importance,
+                session_id=memory_scope,
+                persona_id=persona_id,
+            )
+            metadata["source_window"] = {
+                "session_id": session_id,
+                "start_index": last,
+                "end_index": count,
+                "message_count": unsummarized,
+                "triggered_by": "subagent_auto",
+            }
+            metadata["source_session_id"] = session_id
+
+            source_messages = None
+            try:
+                from astrbot_plugin_livingmemory.core.utils import (
+                    serialize_source_messages,
+                )
+
+                thr = float(
+                    cfg.get(
+                        "reflection_engine.source_retention_importance_threshold",
+                        0.8,
+                    )
+                )
+                if importance >= thr:
+                    source_messages = serialize_source_messages(history)
+            except Exception:
+                source_messages = None
+
+            await me.add_memory(
+                content=content,
+                session_id=memory_scope,
+                persona_id=persona_id,
+                importance=importance,
+                metadata=metadata,
+                atoms=atoms,
+                source_messages=source_messages,
+            )
+            await cm.update_session_metadata(
+                session_id, "last_summarized_index", count
+            )
+            await cm.update_session_metadata(
+                session_id, "pending_summary", None
+            )
+            logger.info(
+                f"[parallel_handoff] 子代理记忆提炼 OK [{agent_name}]: "
+                f"{unsummarized} 条消息 → persona={persona_id} "
+                f"（importance={importance:.2f}，scope={memory_scope}）"
+            )
+        except Exception as e:
+            logger.warning(
+                f"[parallel_handoff] 子代理记忆提炼失败 [{agent_name}]: {e}"
+            )
+
     # ── 记忆存储：存入长期记忆 ──
     async def _memory_store(
         self,
@@ -239,33 +488,40 @@ class MemoryMixin:
         final_input: str,
         raw_response: str,
     ):
-        """将本轮 user/assistant 消息写入 livingmemory 对话管理器并做消息数限制"""
+        """将本轮 user/assistant 消息写入 livingmemory 对话管理器并做消息数限制。
+
+        2026-09-05 记忆串库修复：此前直接用顾主私聊 event 写历史——
+        子代理消息混进主代理会话，livingmemory Reflection 总结主会话时
+        把她们的话一并提炼进主代理记忆库（顾主观察到「记忆都落给了
+        主代理」的根因）；且子代理专属会话无人触发提炼，长期记忆恒空。
+        现改用「{原会话}:subagent:{agent}」专属会话桩存储，写完即检查
+        阈值、按子代理 persona 主动提炼长期记忆。
+        """
         if livingmemory_plugin:
             try:
-                # 2026-09-04 子代理独立记忆库：存储链路同样打标，
-                # 提炼出的记忆挂到子代理 persona 维度，不与主代理/其他子代理串库
-                event._subagent_persona = agent_name
+                stub = self._subagent_event_stub(event, agent_name)
                 conv_mgr = (
                     livingmemory_plugin
                     .event_handler._memory_recall.conversation_manager
                 )
                 # 2026-08-31 修复：存储前剥离 ctx_engine 跨轮历史块，只存本轮干净输入
-                # （此前注入的 "--- 对话历史 ---..." 整块随轮次越滚越大，
-                #  召回时被 inject_with_recent_context 拼进查询文本导致 token 膨胀）
                 clean_input = self._strip_chain_injection(
                     self._strip_ctx_injection(final_input)
                 )
                 await conv_mgr.add_message_from_event(
-                    event, role="user", content=clean_input
+                    stub, role="user", content=clean_input
                 )
                 await conv_mgr.add_message_from_event(
-                    event, role="assistant", content=raw_response
+                    stub, role="assistant", content=raw_response
                 )
-                session_id = event.unified_msg_origin
                 await (
                     livingmemory_plugin
                     .event_handler._memory_recall.message_utils
-                    .enforce_message_limit(session_id)
+                    .enforce_message_limit(stub.unified_msg_origin)
+                )
+                # 达到总结阈值时按子代理 persona 提炼长期记忆
+                await self._maybe_reflect_subagent(
+                    livingmemory_plugin, stub, agent_name
                 )
             except Exception as e:
                 logger.warning(
