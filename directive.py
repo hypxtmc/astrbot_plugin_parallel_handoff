@@ -40,7 +40,7 @@ class DirectiveMixin:
         已含标记则跳过，避免 agent 循环多轮重复注入。
 
         [智能按需 2026-08-29] directive_inject_mode=smart（默认）时，先做零成本预判
-        （复用 router._t1_route 点名/领域词 + _t15_continue_route 会话续接）：
+        （复用 router._t1_route 点名/领域词 + _t1_sticky_route 会话粘滞锁定）：
         命中疑似路由意图才注入完整指令；日常闲聊/技术任务不注入，省 token 不污染上下文。
         模式 always 保持旧行为：每轮 LLM 请求都注入。
 
@@ -154,7 +154,7 @@ class DirectiveMixin:
             return "affection"
         if self._TASK_TECH_RE.search(message):
             return "tech"
-        if self._t15_continue_route(event, message):
+        if self._t1_sticky_route(event, message):
             return "affection"
         return None
 

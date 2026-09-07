@@ -1303,10 +1303,10 @@ class TestModeShortcutDecision(unittest.TestCase):
 
     # ── 单元：_mode_shortcut_decision ──
     def test_tech_task_release_to_main(self):
-        """技术干活任务（含 tech 特征）：放行主代理，不短路"""
+        """技术干活任务（含 tech 特征）：2026-09-07 方案A 起短路直发被点名者，不放行主代理"""
         p = self._fresh_router()
         msg = "阿米娅帮我查一下这个报错的traceback"
-        assert p._mode_shortcut_decision(self._plain_event(msg), msg, "amiya") is False
+        assert p._mode_shortcut_decision(self._plain_event(msg), msg, "amiya") is True
 
     def test_affection_direct_shortcut(self):
         """贴贴任务 + affection 默认 direct：短路直发"""
@@ -1331,14 +1331,14 @@ class TestModeShortcutDecision(unittest.TestCase):
 
     # ── 集成：_smart_router_check 完整链路 ──
     def test_smart_router_tech_release_no_direct(self):
-        """T1 命中 tech 任务 → 放行主代理，不 call_subagent、不 stop_event"""
+        """T1 命中 tech 任务 + 点名 → 2026-09-07 方案A 起短路直发被点名者，不落主代理"""
         p = self._fresh_router()
         ev = self._plain_event("阿米娅帮我查一下这个报错的traceback")
         p.call_subagent = AsyncMock()
         res = asyncio.run(p._smart_router_check(ev))
-        assert res is False
-        p.call_subagent.assert_not_called()
-        ev.stop_event.assert_not_called()
+        assert res is True
+        p.call_subagent.assert_called_once()
+        ev.stop_event.assert_called_once()
 
     def test_smart_router_affection_direct_shortcut(self):
         """T1 命中贴贴任务（affection direct 默认）→ 短路直发"""
@@ -1375,13 +1375,13 @@ class TestRouteSuggestionHandoff(unittest.TestCase):
         return ev
 
     def test_tech_release_records_suggestion(self):
-        """tech 任务放行主代理时，T1 判向目标被暂存"""
+        """tech 任务 + 点名 2026-09-07 方案A 起短路直发，不暂存判向目标（不经主代理）"""
         p = self._fresh_router()
         ev = self._plain_event("阿米娅帮我查一下这个报错的traceback")
         p.call_subagent = AsyncMock()
         res = asyncio.run(p._smart_router_check(ev))
-        assert res is False
-        assert p._pop_route_suggestion() == "amiya"
+        assert res is True
+        assert p._pop_route_suggestion() is None
 
     def test_shortcut_does_not_record_suggestion(self):
         """短路直发（affection direct）不暂存判向目标——直发不经主代理"""
@@ -1393,7 +1393,7 @@ class TestRouteSuggestionHandoff(unittest.TestCase):
         assert p._pop_route_suggestion() is None
 
     def test_busy_bypass_release_records_suggestion(self):
-        """忙碌旁路裁决放行时同样暂存判向目标"""
+        """忙碌旁路 2026-09-07 方案A 起 tech 短路直发，不暂存判向目标"""
         import router as router_mod
         if router_mod._ACTIVE_AGENT_RUNNERS is None:
             return  # 环境无 follow-up 模块，跳过
@@ -1403,8 +1403,8 @@ class TestRouteSuggestionHandoff(unittest.TestCase):
             ev = self._plain_event("可露希尔帮我改一下这段代码的逻辑")
             p.call_subagent = AsyncMock()
             res = asyncio.run(p._busy_bypass_check(ev))
-            assert res is False  # tech 放行
-            assert p._pop_route_suggestion() == "closure"
+            assert res is True  # tech 短路直发
+            assert p._pop_route_suggestion() is None
         finally:
             router_mod._ACTIVE_AGENT_RUNNERS = {}
 
@@ -1887,9 +1887,11 @@ class TestRandomState(unittest.TestCase):
         # 生成并写入 seen（get 内部 _roll_with_avoid + _record_seen）
         assert st.hand
         assert os.path.exists(seen_file)
-        from random_state import _seen_load
+        from random_state import _seen_load, _base_hand
         data = _seen_load(seen_file)
-        assert data.get(st.day, {}).get("amiya", {}).get("hand") == st.hand
+        # _record_seen 的去重契约是存 base hand（跨天去重比对），
+        # 断言带后缀 st.hand 剥后缀后与存储一致（原断言误用带后缀值比对而恒挂）
+        assert data.get(st.day, {}).get("amiya", {}).get("hand") == _base_hand(st.hand)
 
     def test_private_domain_in_pools(self):
         """私房域入池（2026-09-04 博士拍板 A）：LIFE_DOMAINS/DOMAIN_KEYWORDS/HAND_FLAVOR 三处齐备"""
