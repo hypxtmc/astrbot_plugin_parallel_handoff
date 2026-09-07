@@ -1746,6 +1746,174 @@ class TestContextEngine:
 
         # 空串安全
         assert _strip_ctx_injection("") == ""
+        # 空串安全
+        assert _strip_ctx_injection("") == ""
+
+    # ── 子代理专属记忆会话（2026-09-05 记忆串库修复回归） ──────────
+
+    def _make_subagent_memory_fixture(self, count=0, last=0, threshold=10):
+        """构造 memory_store/reflect 测试用的桩：fake event + fake livingmemory
+
+        conversation_manager/memory_processor/memory_engine 的接口在生产里
+        全是 async，统一用 AsyncMock 对齐（同步 lambda 会触发
+        「'int' object can't be awaited」）。
+        """
+        import asyncio
+        import types as ts
+        from unittest.mock import AsyncMock
+        from memory import MemoryMixin
+
+        m = MemoryMixin()
+        orig_event = ts.SimpleNamespace(
+            unified_msg_origin="s1:FriendMessage:u1",
+            get_platform_name=lambda: "qq_restapi",
+        )
+        cm = ts.SimpleNamespace(
+            store=ts.SimpleNamespace(
+                get_message_count=AsyncMock(return_value=count)
+            ),
+            added=[],
+            meta={},
+            add_message_from_event=AsyncMock(
+                side_effect=lambda stub, role="", content="": cm.added.append(
+                    (stub.unified_msg_origin, role, content)
+                )
+            ),
+            get_session_metadata=AsyncMock(return_value=last),
+            update_session_metadata=AsyncMock(
+                side_effect=lambda sid, key, val: cm.meta.__setitem__(key, val)
+            ),
+            get_messages_range=AsyncMock(
+                return_value=[ts.SimpleNamespace(content="m1")]
+            ),
+        )
+        enforce_calls = []
+        mu = ts.SimpleNamespace(
+            enforce_message_limit=AsyncMock(
+                side_effect=lambda sid: enforce_calls.append(sid)
+            )
+        )
+        added = []
+        me = ts.SimpleNamespace(
+            add_memory=AsyncMock(side_effect=lambda **kw: added.append(kw))
+        )
+        mp = ts.SimpleNamespace(
+            process_conversation=AsyncMock(
+                return_value=("总结内容", {"topics": ["家常"]}, 0.9)
+            ),
+            classify_atoms_from_metadata=lambda **kw: [{"atom": "a"}],
+        )
+        cfg = ts.SimpleNamespace(
+            get=lambda k, d=None: threshold if k == "reflection_engine.summary_trigger_rounds" else d
+        )
+        ch = ts.SimpleNamespace(
+            conversation_manager=cm,
+            _memory_processor=mp,
+            memory_engine=me,
+            config_manager=cfg,
+        )
+        lm = ts.SimpleNamespace(
+            command_handler=ch,
+            event_handler=ts.SimpleNamespace(
+                _memory_recall=ts.SimpleNamespace(
+                    conversation_manager=cm, message_utils=mu
+                )
+            ),
+        )
+        return m, orig_event, lm, cm, me, added, enforce_calls
+
+    def test_subagent_stub_umo_and_persona(self):
+        """专属会话桩：umo 拼接 :subagent:{agent}，persona 打子代理标，鸭子方法可用"""
+        import types as ts
+        from memory import MemoryMixin
+
+        m = MemoryMixin()
+        ev = ts.SimpleNamespace(
+            unified_msg_origin="s1:FriendMessage:u1",
+            get_platform_name=lambda: "qq_restapi",
+        )
+        stub = m._subagent_event_stub(ev, "amiya")
+        assert stub.unified_msg_origin == "s1:FriendMessage:u1:subagent:amiya"
+        assert stub._subagent_persona == "amiya"
+        assert stub.persona_id == "amiya"
+        assert stub.get_message_type() == 1  # 非群聊
+        assert stub.get_platform_name() == "qq_restapi"
+        # 原始 event 不被污染
+        assert getattr(ev, "_subagent_persona", None) is None
+
+    def test_memory_store_writes_to_dedicated_session(self):
+        """存储改走专属会话桩，历史不再混进主代理会话；写完检查提炼阈值"""
+        import asyncio
+
+        m, orig_event, lm, cm, me, added, enforce = (
+            self._make_subagent_memory_fixture(count=3, last=0, threshold=10)
+        )
+        asyncio.run(
+            m._memory_store(lm, orig_event, "amiya", "博士你好", "博士好呀")
+        )
+        # 两条消息都写进专属会话
+        assert all(sid.endswith(":subagent:amiya") for sid, _, _ in cm.added)
+        assert cm.added[0][1] == "user" and "博士你好" in cm.added[0][2]
+        assert cm.added[1][1] == "assistant"
+        # 消息上限检查用专属会话 umo
+        assert enforce and enforce[0].endswith(":subagent:amiya")
+        # 未达阈值（1.5轮 < 10）→ 不提炼
+        assert added == []
+
+    def test_reflect_triggered_at_threshold(self):
+        """达到总结轮数阈值 → 提炼长期记忆并挂子代理 persona + 更新索引"""
+        import asyncio
+
+        m, orig_event, lm, cm, me, added, enforce = (
+            self._make_subagent_memory_fixture(count=22, last=0, threshold=10)
+        )
+        stub = m._subagent_event_stub(orig_event, "amiya")
+        asyncio.run(m._maybe_reflect_subagent(lm, stub, "amiya"))
+        assert len(added) == 1
+        kw = added[0]
+        assert kw["persona_id"] == "amiya"
+        assert kw["content"] == "总结内容"
+        assert kw["session_id"].endswith(":subagent:amiya")
+        assert kw["atoms"] == [{"atom": "a"}]
+        assert kw["metadata"]["source_window"]["triggered_by"] == "subagent_auto"
+        # 总结索引推进 + pending 清空
+        assert cm.meta["last_summarized_index"] == 22
+        assert cm.meta["pending_summary"] is None
+
+    def test_reflect_skipped_below_threshold(self):
+        """未达阈值 → 不提炼、不动索引"""
+        import asyncio
+
+        m, orig_event, lm, cm, me, added, enforce = (
+            self._make_subagent_memory_fixture(count=6, last=0, threshold=10)
+        )
+        stub = m._subagent_event_stub(orig_event, "amiya")
+        asyncio.run(m._maybe_reflect_subagent(lm, stub, "amiya"))
+        assert added == []
+        assert "last_summarized_index" not in cm.meta
+
+    def test_reflect_survives_missing_components(self):
+        """command_handler 缺失/组件不全 → 静默跳过不抛"""
+        import asyncio
+        import types as ts
+
+        m, orig_event, lm, cm, me, added, enforce = (
+            self._make_subagent_memory_fixture(count=22, last=0, threshold=10)
+        )
+        stub = m._subagent_event_stub(orig_event, "amiya")
+        # command_handler 缺失
+        asyncio.run(m._maybe_reflect_subagent(ts.SimpleNamespace(), stub, "amiya"))
+        assert added == []
+        # 组件不全（无 memory_engine）
+        broken = ts.SimpleNamespace(
+            command_handler=ts.SimpleNamespace(
+                conversation_manager=cm, _memory_processor=None, config_manager=None
+            )
+        )
+        asyncio.run(m._maybe_reflect_subagent(broken, stub, "amiya"))
+        assert added == []
+
+# ── 三期·random_state 状态机 + daily_life 注入器（M1/M2，2026-09-03） ──────
 # ── 三期·random_state 状态机 + daily_life 注入器（M1/M2，2026-09-03） ──────
 from random_state import (
     LIFE_DOMAINS,
@@ -2646,31 +2814,27 @@ class TestFamilyPulse(unittest.TestCase):
         self.assertEqual(stub._subagent_persona, "shu")
 
     def test_merge_pulse_memory_recall_doctor_private(self):
-        """博士私聊直问子代理：主召回后额外并入旁轨会话记忆（方案 A）"""
+        """博士私聊直问子代理：并入最近 6 小时家常（2026-09-05 博士改版，不再堆几天记忆）"""
         p = self._make({"enable_family_pulse": True})
-        # test_plugin 顶部把 astrbot.api.provider 整体 mock 成 MagicMock，
-        # ProviderRequest.extra_user_content_parts 是 mock 属性 append 不生效，
-        # 这里局部恢复真实类，验证合并逻辑
-        from astrbot.core.provider.entities import ProviderRequest as RealPR
-
-        # mock livingmemory 插件：初始化就绪，handle_memory_recall 往 req 注入记忆
         lm = MagicMock()
         lm.initializer.is_initialized = True
         lm.initializer.is_failed = False
+        lm.handle_memory_recall = AsyncMock()
+        # 旁轨 jsonl：近期 + 很早的记录
+        import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZI
 
-        async def fake_handle(event, req):
-            from astrbot.core.agent.message import TextPart
-
-            req.extra_user_content_parts.append(
-                TextPart(text="<旁轨记忆>腌萝卜").mark_as_temp()
-            )
-
-        lm.handle_memory_recall = AsyncMock(side_effect=fake_handle)
-
+        now = _dt.datetime.now(_ZI("Asia/Shanghai"))
+        recent_ts = (now - _dt.timedelta(minutes=30)).strftime("%H:%M")
+        p._pulse_read_day = lambda: [
+            {"ts": recent_ts, "agent": "shu", "display": "黍", "text": "RECENT_LINE"},
+        ]
         # 博士私聊事件（会话 ≠ 旁轨会话）
         event = MagicMock()
         event.unified_msg_origin = "qq_restapi:FriendMessage:TESTUSER00000000000000000000000000"
         event.get_message_str.return_value = "阿米娅，你们今天聊了什么？"
+
+        from astrbot.core.provider.entities import ProviderRequest as RealPR
 
         with mock.patch("memory.ProviderRequest", RealPR):
             parts = asyncio.run(
@@ -2679,18 +2843,14 @@ class TestFamilyPulse(unittest.TestCase):
                 )
             )
         self.assertEqual(parts[0], "<主召回>", "主召回内容应保留在首位")
-        self.assertEqual(len(parts), 2, "应合并主召回 + 旁轨召回")
-        self.assertIn("腌萝卜", getattr(parts[1], "text", str(parts[1])), "旁轨记忆应并入")
-        # 旁轨桩查询词应覆盖为博士原话，而不是 "family_pulse"
-        call_event = lm.handle_memory_recall.await_args.args[0]
-        self.assertEqual(call_event.get_message_str(), "阿米娅，你们今天聊了什么？")
-        self.assertEqual(call_event._subagent_persona, "amiya")
-        self.assertEqual(
-            call_event.unified_msg_origin, "family_pulse:FriendMessage:subagents"
-        )
+        self.assertEqual(len(parts), 2, "应合并主召回 + 近窗家常")
+        self.assertIn("RECENT_LINE", getattr(parts[1], "text", str(parts[1])), "近窗家常应并入")
+        self.assertIn("家里最近 6 小时", getattr(parts[1], "text", str(parts[1])))
+        # 2026-09-05 改版：不再调 livingmemory 旁轨召回（几天累积的元凶被砍）
+        lm.handle_memory_recall.assert_not_awaited()
 
     def test_merge_pulse_memory_recall_pulse_skips(self):
-        """旁轨心跳链路（事件本身是旁轨桩）：不重复并入"""
+        """旁轨心跳链路（事件本身是旁轨桩）：不重复注入家常"""
         p = self._make({"enable_family_pulse": True})
         lm = MagicMock()
         lm.initializer.is_initialized = True
@@ -2701,22 +2861,217 @@ class TestFamilyPulse(unittest.TestCase):
         parts = asyncio.run(p._merge_pulse_memory_recall(
             ["<主召回>"], event, "amiya", "今天想泡壶茶", lm
         ))
-        self.assertEqual(parts, ["<主召回>"], "旁轨会话本身不应重复并入")
+        self.assertEqual(parts, ["<主召回>"], "旁轨会话本身不应重复注入")
         lm.handle_memory_recall.assert_not_awaited()
 
+    def test_persona_name_mapping(self):
+        """子代理英文 id → personas 表人格真名（2026-09-05 修提炼 WARN）"""
+        p = self._make(
+            {
+                "name_display_map": {
+                    "amiya": "阿米娅",
+                    "closure": "可露希尔",
+                    "theresia": "特蕾西娅",
+                    "skadi": "斯卡蒂",
+                    "xi": "夕",
+                    "ling": "令",
+                    "nian": "年",
+                    "shu": "黍",
+                    "liino": "梨诺",
+                    "m3": "M3",
+                    "kaltsit": "凯尔希",
+                }
+            }
+        )
+        # name_display_map 配置里的映射
+        self.assertEqual(p._persona_name("shu"), "黍")
+        self.assertEqual(p._persona_name("skadi"), "斯卡蒂")
+        self.assertEqual(p._persona_name("amiya"), "阿米娅")
+        self.assertEqual(p._persona_name("m3"), "M3")
+        # 特蕾西娅：display 是「特蕾西娅」，人格真名是「特蕾西娅-子代理」
+        self.assertEqual(p._persona_name("theresia"), "特蕾西娅-子代理")
+        # 未知 id：原样返回（不崩）
+        self.assertEqual(p._persona_name("unknown_agent"), "unknown_agent")
+        # _get_name_display_map 异常时兜底返回原 id
+        with mock.patch.object(
+            p, "_get_name_display_map", side_effect=RuntimeError("boom")
+        ):
+            self.assertEqual(p._persona_name("shu"), "shu")
+
+    def test_pulse_next_fire_daytime(self):
+        """作息心跳：窗内 14:42 → 本区间 [14:17,16:17) 内随机点"""
+        import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZI
+
+        p = self._make({"enable_family_pulse": True})
+        tz = _ZI("Asia/Shanghai")
+        now = _dt.datetime(2026, 9, 5, 14, 42, tzinfo=tz)
+
+        class _DetRng:
+            def uniform(self, a, b):
+                return a + (b - a) * 0.5  # 区间中点
+
+        fire = p._pulse_next_fire(now, _DetRng())
+        self.assertEqual(
+            (fire.hour, fire.minute), (15, 17), "14:42 应落在 [14:17,16:17) 区间中点"
+        )
+
+    def test_pulse_next_fire_segment_passed_defers(self):
+        """作息心跳：区间随机点已过（重启恢复）→ 顺延到下区间"""
+        import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZI
+
+        p = self._make({"enable_family_pulse": True})
+        tz = _ZI("Asia/Shanghai")
+        now = _dt.datetime(2026, 9, 5, 15, 0, tzinfo=tz)
+
+        class _DetRng:
+            def __init__(self):
+                self.calls = []
+
+            def uniform(self, a, b):
+                self.calls.append((a, b))
+                return a  # 第一次 fire=14:17 已过 → 顺延；第二次 16:17 整点起跳
+
+        rng = _DetRng()
+        fire = p._pulse_next_fire(now, rng)
+        self.assertGreaterEqual((fire.hour, fire.minute), (16, 17), "应顺延到 [16:17,18:17)")
+        self.assertLess(fire.hour, 18)
+
+    def test_pulse_next_fire_late_night_residual(self):
+        """作息心跳：凌晨 00:30 → 昨晚跨零点窗残区间 [00:17,01:00) 内"""
+        import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZI
+
+        p = self._make({"enable_family_pulse": True})
+        tz = _ZI("Asia/Shanghai")
+        now = _dt.datetime(2026, 9, 6, 0, 30, tzinfo=tz)
+
+        class _DetRng:
+            def uniform(self, a, b):
+                return a + (b - a) * 0.5
+
+        fire = p._pulse_next_fire(now, _DetRng())
+        self.assertEqual(fire.date(), now.date())
+        self.assertGreaterEqual((fire.hour, fire.minute), (0, 17))
+        self.assertLess(fire.hour, 1, "残区间心跳点须早于 01:00")
+
+    def test_pulse_next_fire_night_silent(self):
+        """作息心跳：03:00 深夜静默 → 明早 06:17 起的区间随机点"""
+        import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZI
+
+        p = self._make({"enable_family_pulse": True})
+        tz = _ZI("Asia/Shanghai")
+        now = _dt.datetime(2026, 9, 6, 3, 0, tzinfo=tz)
+
+        class _DetRng:
+            def uniform(self, a, b):
+                return a + (b - a) * 0.5
+
+        fire = p._pulse_next_fire(now, _DetRng())
+        self.assertEqual((fire.hour, fire.minute), (7, 17), "当天第一区间 [06:17,08:17) 中点")
+        self.assertEqual(fire.date(), now.date(), "03:00 的下次窗口是当天早上 06:17")
+
+    def test_pulse_next_fire_before_window(self):
+        """作息心跳：05:00 尚未开窗 → 今天 06:17 起的区间随机点"""
+        import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZI
+
+        p = self._make({"enable_family_pulse": True})
+        tz = _ZI("Asia/Shanghai")
+        now = _dt.datetime(2026, 9, 6, 5, 0, tzinfo=tz)
+
+        class _DetRng:
+            def uniform(self, a, b):
+                return a + (b - a) * 0.25
+
+        fire = p._pulse_next_fire(now, _DetRng())
+        self.assertEqual(fire.date(), now.date())
+        self.assertGreaterEqual((fire.hour, fire.minute), (6, 17))
+        self.assertLess(fire.hour, 8, "首区间 [06:17,08:17)")
+
     def test_merge_pulse_memory_recall_failure_degrades(self):
-        """旁轨并入失败：静默降级，不影响主召回"""
+        """家常注入失败：静默降级，不影响主召回"""
         p = self._make({"enable_family_pulse": True})
         lm = MagicMock()
         lm.initializer.is_initialized = True
         lm.initializer.is_failed = False
-        lm.handle_memory_recall = AsyncMock(side_effect=RuntimeError("boom"))
+        lm.handle_memory_recall = AsyncMock()
+
+        def _boom(agent_name):
+            raise RuntimeError("boom")
+
+        p._pulse_log_fallback = _boom
         event = MagicMock()
         event.unified_msg_origin = "qq_restapi:FriendMessage:TESTUSER00000000000000000000000000"
         parts = asyncio.run(p._merge_pulse_memory_recall(
             ["<主召回>"], event, "amiya", "你们今天聊了什么", lm
         ))
         self.assertEqual(parts, ["<主召回>"], "失败应返回原 parts")
+
+    def test_pulse_log_fallback_six_hour_window(self):
+        """旁轨家常滑动窗口：只注入最近 6 小时内的记录（2026-09-05 博士改版）"""
+        p = self._make({"enable_family_pulse": True})
+        import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZI
+
+        now = _dt.datetime.now(_ZI("Asia/Shanghai"))
+        recent_ts = (now - _dt.timedelta(minutes=30)).strftime("%H:%M")
+        old_ts = (now - _dt.timedelta(hours=7)).strftime("%H:%M")
+        p._pulse_read_day = lambda: [
+            {"ts": old_ts, "agent": "amiya", "display": "阿米娅", "text": "OLD_LINE"},
+            {"ts": recent_ts, "agent": "shu", "display": "黍", "text": "RECENT_LINE"},
+        ]
+        parts = p._pulse_log_fallback("amiya")
+        self.assertEqual(len(parts), 1)
+        text = getattr(parts[0], "text", "")
+        self.assertIn("RECENT_LINE", text)
+        self.assertIn("家里最近 6 小时", text)
+        now_min = now.hour * 60 + now.minute
+        if now_min >= 420:
+            # 未跨零点：7 小时前必被滤掉（跨零点时 jsonl 只有当天文件，
+            # 昨日 ts 无法用今天的 HH:MM 模拟，跳过该断言）
+            self.assertNotIn("OLD_LINE", text)
+
+    def test_pulse_log_fallback_window_configurable_and_truncate(self):
+        """窗口小时数可配 + 窗口内超量截尾"""
+        p = self._make({"enable_family_pulse": True, "family_pulse_recent_hours": 1})
+        import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZI
+
+        now = _dt.datetime.now(_ZI("Asia/Shanghai"))
+        recent_ts = (now - _dt.timedelta(minutes=10)).strftime("%H:%M")
+        # 2 小时前：1 小时窗口下应被滤掉
+        mid_ts = (now - _dt.timedelta(hours=2)).strftime("%H:%M")
+        p._pulse_read_day = lambda: [
+            {"ts": mid_ts, "agent": "amiya", "display": "阿米娅", "text": "MID_LINE"},
+            {"ts": recent_ts, "agent": "shu", "display": "黍", "text": "RECENT_LINE"},
+        ]
+        parts = p._pulse_log_fallback("amiya")
+        text = getattr(parts[0], "text", "")
+        self.assertIn("RECENT_LINE", text)
+        self.assertIn("家里最近 1 小时", text)
+        now_min = now.hour * 60 + now.minute
+        if now_min >= 120:
+            self.assertNotIn("MID_LINE", text)
+
+        # 截尾：窗口内 20 条 → 只留最近 15 条
+        logs = [
+            {
+                "ts": (now - _dt.timedelta(minutes=20 - i)).strftime("%H:%M"),
+                "agent": "amiya",
+                "display": "阿米娅",
+                "text": f"L{i}",
+            }
+            for i in range(20)
+        ]
+        p._pulse_read_day = lambda: logs
+        parts = p._pulse_log_fallback("amiya")
+        text = getattr(parts[0], "text", "")
+        self.assertIn("L19", text, "最新一条应保留")
+        self.assertNotIn("L4\n", text, "15 条截尾：第 5 条（L4）应被截掉")
+        self.assertNotIn("L0：", text, "最旧一条应被截掉")
 
     def test_tick_memory_recall_injects_extra_parts(self):
         """livingmemory 就绪时：召回记忆经 extra_user_content_parts 注入生成请求"""
@@ -3025,6 +3380,38 @@ class TestFamilyPulse(unittest.TestCase):
         self.assertGreaterEqual(len(agents), 1)
 
     # ── 唤即看：博士私聊回看旁轨日志 ──
+    def test_pulse_recent_logs_window(self):
+        """6h 窗口过滤：15:31 回看只留 ≥09:31 的日志，全天 177 条不再整刷"""
+        import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZI
+
+        now = _dt.datetime(2026, 9, 5, 15, 31, tzinfo=_ZI("Asia/Shanghai"))
+        logs = [
+            {"ts": "06:18", "text": "早"},
+            {"ts": "09:00", "text": "旧"},
+            {"ts": "10:00", "text": "中"},
+            {"ts": "15:00", "text": "新1"},
+            {"ts": "15:30", "text": "新2"},
+            {"ts": "bad", "text": "坏"},
+        ]
+        p = self._make({"enable_family_pulse": True})
+        got = p._pulse_recent_logs(logs, 6, now)
+        self.assertEqual([r["text"] for r in got], ["中", "新1", "新2"])
+
+    def test_pulse_recent_logs_cross_zero_degrades(self):
+        """凌晨 00:30 回看（跨零点）→ 退化取当天零点后全部，不误杀"""
+        import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZI
+
+        now = _dt.datetime(2026, 9, 6, 0, 30, tzinfo=_ZI("Asia/Shanghai"))
+        logs = [
+            {"ts": "00:17", "text": "刚"},
+            {"ts": "00:29", "text": "刚2"},
+        ]
+        p = self._make({"enable_family_pulse": True})
+        got = p._pulse_recent_logs(logs, 6, now)
+        self.assertEqual(len(got), 2)
+
     def test_peek_doctor_private_sends(self):
         """博士私聊「看看家里」→ 推送旁轨日志原文到博士 UMO + stop_event"""
         p = self._make({
@@ -3128,7 +3515,8 @@ class TestFamilyPulse(unittest.TestCase):
 
     # ── cron 幂等 ──
     def test_setup_jobs_idempotent(self):
-        """注册前清同名遗留（biliread 堆积教训同款），注册 2 个新任务"""
+        """注册前清同名遗留（biliread 堆积教训同款）；
+        2026-09-05 改版：cron 只注册 digest，心跳换作息式自管循环"""
         from types import SimpleNamespace
 
         p = self._make({"enable_family_pulse": True})
@@ -3138,20 +3526,31 @@ class TestFamilyPulse(unittest.TestCase):
         p.context.cron_manager.list_jobs = AsyncMock(return_value=[old])
         p.context.cron_manager.delete_job = AsyncMock()
         p.context.cron_manager.add_basic_job = AsyncMock(
-            side_effect=[SimpleNamespace(job_id="j1"), SimpleNamespace(job_id="j2")]
+            side_effect=[SimpleNamespace(job_id="j1")]
         )
         asyncio.run(p.setup_pulse_jobs())
         p.context.cron_manager.delete_job.assert_awaited_once_with("legacy-1")
-        self.assertEqual(p.context.cron_manager.add_basic_job.await_count, 2)
-        self.assertEqual(p._pulse_job_ids, ["j1", "j2"])
+        self.assertEqual(p.context.cron_manager.add_basic_job.await_count, 1)
+        self.assertEqual(p._pulse_job_ids, ["j1"])
+        # 心跳循环 task 已创建（asyncio.run 退出时会 cancel 残留 task，只验存在）
+        self.assertIsNotNone(getattr(p, "_pulse_loop_task", None))
 
     def test_teardown_removes_jobs(self):
         p = self._make({})
-        p._pulse_job_ids = ["j1", "j2"]
+        p._pulse_job_ids = ["j1"]
         p.context.cron_manager.delete_job = AsyncMock()
-        asyncio.run(p.teardown_pulse_jobs())
-        self.assertEqual(p.context.cron_manager.delete_job.await_count, 2)
+        holder = {}
+
+        async def _run():
+            holder["task"] = asyncio.create_task(asyncio.sleep(3600))
+            p._pulse_loop_task = holder["task"]
+            await p.teardown_pulse_jobs()
+
+        asyncio.run(_run())
+        self.assertEqual(p.context.cron_manager.delete_job.await_count, 1)
         self.assertEqual(p._pulse_job_ids, [])
+        self.assertIsNone(p._pulse_loop_task)
+        self.assertTrue(holder["task"].cancelled() or holder["task"].done())
 
     def test_initialize_disabled_no_register(self):
         """开关关：initialize 不注册任何 cron"""
@@ -3161,16 +3560,18 @@ class TestFamilyPulse(unittest.TestCase):
         p.context.cron_manager.add_basic_job.assert_not_awaited()
 
     def test_initialize_enabled_registers(self):
-        """开关开：initialize 注册 2 个任务"""
+        """开关开：initialize 注册 digest cron + 心跳自管循环（2026-09-05 改版）"""
         from types import SimpleNamespace
 
         p = self._make({"enable_family_pulse": True})
         p.context.cron_manager.list_jobs = AsyncMock(return_value=[])
         p.context.cron_manager.add_basic_job = AsyncMock(
-            side_effect=[SimpleNamespace(job_id="j1"), SimpleNamespace(job_id="j2")]
+            side_effect=[SimpleNamespace(job_id="j1")]
         )
         asyncio.run(p.initialize())
-        self.assertEqual(p.context.cron_manager.add_basic_job.await_count, 2)
+        self.assertEqual(p.context.cron_manager.add_basic_job.await_count, 1)
+        # 心跳循环 task 已创建（asyncio.run 退出时会 cancel 残留 task，只验存在）
+        self.assertIsNotNone(getattr(p, "_pulse_loop_task", None))
 
     # ── 氛围三档（2026-09-04 博士拍板：家里聊荤的可以下流）──
     def test_pulse_mood_group_branches(self):

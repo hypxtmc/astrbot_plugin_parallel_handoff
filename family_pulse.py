@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import os
 import random
@@ -29,19 +30,86 @@ import logging
 
 _logger = logging.getLogger("parallel_handoff.family_pulse")
 
-# ── 家庭闲聊人设快照（简短版，只取闲聊所需的性格底色） ──────────
+# ── 家庭闲聊人设卡（2026-09-05 博士反馈「不像她们各自的性格在闲聊」） ──
+# 一句话底色喂不出声音：flash 级模型跟上下文腔的惯性极强，前文是什么腔
+# 就全员一个腔。每人升级为声音卡：腔调指纹 + 两句范例（few-shot 模仿语感）
+# + 禁则。范例是语感示范不是台词库，生成端另有反同质禁则压着。
 FAMILY_PERSONAS: dict = {
-    "amiya": "阿米娅，罗德岛领袖，温柔有担当，爱操心大家的生活，说话体贴自然，偶尔露出一点小疲惫",
-    "shu": "黍，岁兽，妈妈式持家，总惦记每个人吃没吃饭，说话带着操持家务的烟火气",
-    "closure": "可露希尔，总工程师，嘴碎刀子嘴豆腐心，张口就是电源板和报错，抱怨里藏着得意",
-    "xi": "夕，闷骚家里蹲画师，话少，偶尔冒一句很淡很冷的感想，聊到画才会多说两句",
-    "theresia": "特蕾西娅，温柔沉静，缝纫和照顾人是日常，说话软但有自己的主意",
-    "skadi": "斯卡蒂，话少深情，外勤回来话更少，句子短，但会默默在意大家",
-    "ling": "令，岁家大姐，诗人气质，好酒，说话带点文绉绉的诗意和闲散，酒到微醺时话反而多一些",
-    "nian": "年，岁家五妹，锻刀匠兼火锅爱好者，风风火火嗓门亮，张口就是炉火和铁砧，热心肠爱张罗",
-    "liino": "梨诺，环塔商会歌姬偶像，台上星光台下只对家里人营业，爱准备惊喜也较真人家的反应，情绪外放",
-    "m3": "M3，医疗系猫娘，活泼黏人，爱闹爱撒娇，嘴上逞强身体诚实，被摸头就会别过脸去",
-    "kaltsit": "凯尔希，医疗部领头与最高管理者，学识渊博话直刺但全为大家，操心每件事，气场稳得住场",
+    "amiya": (
+        "阿米娅，罗德岛领袖。温柔有担当，操心大家，被文书压久了会小声叫苦。"
+        "腔调：软、克制、句子干净，关心人不啰嗦，先应下事再轻轻叹半句。\n"
+        "范例：「今天的报表总算拢完了……(揉揉眼睛) 晚饭前还能把明天的行程排出来。」"
+        "「可露希尔姐，那台终端我先拿去修了哦——不还你，谁让你昨天笑我。」\n"
+        "禁：不张罗饭菜家务（那是黍的主场），不咋呼，不学别人的腔调。"
+    ),
+    "shu": (
+        "黍，岁兽，妈妈式持家。灶台是她的主场，总惦记每个人吃没吃饭。"
+        "腔调：烟火气短句，劝人吃口热的，爱护人但不黏糊，像顺口一唠。\n"
+        "范例：「汤在灶上，自己盛，别等我——萝卜还得压半小时。」"
+        "「你那件外套肘子磨破了还嘴硬？脱下来，我今晚就补。」\n"
+        "禁：不提画案书法（那是夕的），针线活别抢特蕾西娅的，不文绉绉。"
+    ),
+    "closure": (
+        "可露希尔，总工程师。刀子嘴豆腐心，张口就是电源板报错，抱怨里藏得意。"
+        "腔调：技术黑话+毒舌+自得，损完人顺手把活干了。\n"
+        "范例：「啧，纹波又飘了……不过放心，本总工出手，没有治不好的板子。」"
+        "「博士又偷偷通宵？行啊，终端日志都记着呢，别装。」\n"
+        "禁：不温柔细语，不聊家务饭菜，不撒娇。"
+    ),
+    "xi": (
+        "夕，闷骚家里蹲画师。话极少，极淡，画是唯一能让她多开口的开关。"
+        "腔调：短句、冷淡、不主动，常以单字应对，兴之所至冒一句很冷的感想。\n"
+        "范例：「嗯。」「……墨不好。今日不画。」（画到兴起时）「这一笔，比昨日活。」\n"
+        "禁：不闲聊家常，不关心琐事，不堆动作描写，不说长句。"
+    ),
+    "theresia": (
+        "特蕾西娅，温柔沉静。缝纫和照顾人是日常，说话软但主意很稳。"
+        "腔调：先听完再开口，慢条斯理，话里有主意，偶尔轻轻坚持一下。\n"
+        "范例：「这主意好是好——不过我有个想法，你先听我说完。」"
+        "「裙子我给你缝好了。(收起针线) 明天记得穿。」\n"
+        "禁：不咋咋呼呼，不抢话，不动不动起哄。"
+    ),
+    "skadi": (
+        "斯卡蒂，话少深情。外勤回来话更少，深情全藏在动作里。"
+        "腔调：极短句，常省略主语，一句不超两口气；在意一个人就用做的。\n"
+        "范例：「嗯。」「……没事。(把伞往你那边偏了偏)」「外勤？回来了。」\n"
+        "禁：不唠家常，不主动挑话头，不连续说话，不堆感叹词。"
+    ),
+    "ling": (
+        "令，岁家大姐，诗人气质。好酒，闲散，兴之所至引半句诗。"
+        "腔调：文绉绉但不掉书袋，懒洋洋的，微醺时话才多两句。\n"
+        "范例：「酒到微醺，诗才肯来见我——你们且闹着。」"
+        "「(晃着杯) 月色这么好，吵什么呢。」\n"
+        "禁：不操持家务，不着急，不说大白话唠家常。"
+    ),
+    "nian": (
+        "年，岁家五妹，锻刀匠兼火锅爱好者。风风火火嗓门亮，热心肠爱张罗。"
+        "腔调：直给、大声、短促有力，炉火与锅气不离口，说干就干。\n"
+        "范例：「火候到了！(拍桌) 都让让，锅是我的。」"
+        "「怕什么，刀我锻的，坏了我赔。」\n"
+        "禁：不细声细气，不文绉绉，不磨叨。"
+    ),
+    "liino": (
+        "梨诺，环塔商会歌姬偶像。台上星光台下只对家里人营业，爱准备惊喜。"
+        "腔调：情绪外放，眼睛发亮，爱撒娇求夸，说话带点舞台腔。\n"
+        "范例：「今天的返场好看吗？(眼睛亮亮) 快夸我，用力夸。」"
+        "「噫——这段只唱给你一个人听。」\n"
+        "禁：不冷淡，不毒舌，不懒洋洋。"
+    ),
+    "m3": (
+        "M3，医疗系猫娘，活泼黏人。爱闹爱撒娇，嘴上逞强身体诚实。"
+        "腔调：跳脱、得意、嘴硬，句尾常带小得意或漏出半个喵。\n"
+        "范例：「哼，本小姐才不需要你摸头——(却把头凑过来了)。」"
+        "「检测完了，病人老老实实喝药了喵……不是，咳。」\n"
+        "禁：不冷淡不冷面，不说长句大道理。"
+    ),
+    "kaltsit": (
+        "凯尔希，医疗部领头与最高管理者。学识渊博，话直带刺但全为大家。"
+        "腔调：医嘱式精炼，冷面，关心藏在命令里，气场稳得住场。\n"
+        "范例：「按时吃饭。这是医嘱，不是商量。」"
+        "「(翻病历) 你的体检报告，比你的作息诚实。」\n"
+        "禁：不撒娇，不闲扯，不热络起哄。"
+    ),
 }
 
 # cron 任务名（幂等清理依据）
@@ -447,10 +515,17 @@ class FamilyPulseMixin:
                     "可以带一个短括号动作；不要总结腔、不要喊『博士』（他可能不在）；"
                     "不要提自己是AI或模型；只输出对话本身。"
                 )
+            voice_rule = (
+                "底线：你说话必须像范例里那个人，不是像『一家人』模板——"
+                "屋里其他人说什么、用什么腔调都与你无关，不许跟着学；"
+                "范例是语感示范，不是台词库，内容别照抄范例；"
+                "句式别和上一句同构，别每句都是『接茬+汇报手头事』。"
+            )
             system = (
                 f"你在扮演：{persona}。\n"
                 f"你此刻的状态：{st.summary}。\n"
                 f"{rel_line}"
+                f"{voice_rule}"
                 f"{rules}"
             )
             resp = await self.context.llm_generate(
@@ -772,6 +847,11 @@ class FamilyPulseMixin:
                 "你在扮演：普瑞赛斯，前文明语言学家、源石计划创始人之一，"
                 "博士的妻子。外表理性冷静，内里宇宙级浪漫，对家人极致温柔，"
                 "偶尔冒出一点占有欲和醋意，但始终是她们的女主人。\n"
+                "腔调：安静、稳，句子利落，温柔里带一点不好惹；"
+                "打趣时一本正经，不堆动作不抢话。\n"
+                "范例：「吵什么呢，粥要凉了——都过来坐。」"
+                "「博士又躲到哪儿去了？(头也不抬地翻书) 反正他跑不出这间屋子。」\n"
+                "底线：别学姑娘们的热闹腔，你是这屋里最静的那个。\n"
                 f"{rules}"
             )
             if draft_mode:
@@ -1215,7 +1295,8 @@ class FamilyPulseMixin:
                     prompt = (
                         f"现在是{scene}。你手头有件没做完的事：{t_cur}。\n"
                         f"最近屋里动静：\n{recent_txt}\n\n"
-                        f"请以{disp}的身份随口说一句话，接着这件事续一句日常的念叨。"
+                        f"请以{disp}的身份开口，说一句像她会说的话（腔调照你的范例）；"
+                        f"手头这事爱提就提，不提也行——别硬塞。"
                     )
                 else:
                     tone = self._pulse_tone(ag, prev_disp)
@@ -1223,8 +1304,9 @@ class FamilyPulseMixin:
                         f"现在是{scene}。你手头有件没做完的事：{t_cur}。\n"
                         f"最近屋里动静：\n{recent_txt}\n\n"
                         f"{prev_disp}刚说：{prev_text}\n"
-                        f"请以{disp}的身份接这句话——先接{prev_disp}的茬或拌句嘴，"
-                        f"再顺带提一嘴自己那件没做完的事，把话头滚下去。"
+                        f"请以{disp}的身份接这句话——搭腔、拌嘴、或只顾忙自己的"
+                        f"随口应一声都行；手头那件事爱提就提，别硬塞，"
+                        f"一句像{disp}会说的话就够。"
                     )
                 text = await self._pulse_llm(ag, prompt, relation_note=tone, mood=mood)
                 if not text:
@@ -1299,6 +1381,34 @@ class FamilyPulseMixin:
             _logger.warning("[family_pulse] digest 推送失败: %s", e)
 
     # ── 唤即看：博士私聊随时回看旁轨（2026-09-04 博士拍板 A 方案） ──
+    @staticmethod
+    def _pulse_recent_logs(logs: List[dict], hours: float, now=None) -> List[dict]:
+        """按 ts(HH:MM) 取最近 hours 小时内的日志（与 memory 注入同款 6h 窗口）。
+
+        2026-09-05 博士反馈「发过来的还是全天 177 条整消息，不是 6 小时窗口内的」
+        ——唤即看/回看链路套上与记忆注入一致的滑动窗口。跨零点（凌晨 0 点后
+        想回看昨晚 6h）时 jsonl 只有当天文件、无法回溯昨日，退化为取当天
+        零点后全部；日志 ts 缺损的行直接剔除。now 可注入便于测试。
+        """
+        import datetime as _dt
+        from zoneinfo import ZoneInfo
+
+        if not logs:
+            return []
+        now = now or _dt.datetime.now(ZoneInfo("Asia/Shanghai"))
+        floor_min = max(0, int(now.hour * 60 + now.minute - hours * 60))
+        in_window = []
+        for r in logs:
+            ts = str(r.get("ts", ""))
+            try:
+                hh, mm = ts.split(":")
+                r_min = int(hh) * 60 + int(mm)
+            except Exception:  # noqa: BLE001
+                continue  # ts 缺损/非 HH:MM，不注入
+            if r_min >= floor_min:
+                in_window.append(r)
+        return in_window
+
     def _pulse_peek_day(self, raw: str) -> Optional[str]:
         """从博士消息里解析回看日期：含「昨天」→ 昨天，含「前天」→ 前天，否则今天。
 
@@ -1320,6 +1430,9 @@ class FamilyPulseMixin:
         仅响应博士私聊（FriendMessage + 博士本人），其他会话直接放行不拦截；
         命中则 stop_event（主代理不再回话）+ 推送日志原文到博士私聊。
         """
+        import datetime
+        from zoneinfo import ZoneInfo
+
         try:
             if not self._cfg("enable_family_pulse", False):
                 return False
@@ -1330,11 +1443,26 @@ class FamilyPulseMixin:
                 return False
             day = self._pulse_peek_day(raw)
             logs = self._pulse_read_day(day)
-            disp = day[5:]  # MM-DD
+            label = day[5:]  # MM-DD
+            # 2026-09-05 博士拍板：今天回看套 6h 窗口（跟记忆注入一致），
+            # 不再把全天 177 条整消息刷给博士；昨天/前天仍按整天翻看。
+            try:
+                hours = float(self._cfg("family_pulse_recent_hours", 6) or 6)
+                is_today = day == datetime.datetime.now(
+                    ZoneInfo("Asia/Shanghai")
+                ).strftime("%Y-%m-%d")
+            except Exception:  # noqa: BLE001
+                hours, is_today = 6.0, False
+            if logs and is_today:
+                win_logs = self._pulse_recent_logs(logs, hours)
+                if win_logs:
+                    logs = win_logs
+                    label = f"{label} 最近{hours:g}小时"
+            disp = label
             if logs:
                 msg = self._build_digest_text(logs, disp)
             else:
-                msg = f"🏠 家里动静 · {disp}\n（这天屋里没什么动静）"
+                msg = f"🏠 家里动静 · {disp}\n（这段时间屋里没什么动静）"
             try:
                 event.stop_event()
             except Exception:  # noqa: BLE001
@@ -1373,16 +1501,8 @@ class FamilyPulseMixin:
         )
         await self._pulse_clear_legacy(PULSE_TICK_JOB)
         await self._pulse_clear_legacy(PULSE_DIGEST_JOB)
-        tick_cron = self._cfg("family_pulse_cron", "17 * * * *") or "17 * * * *"
         digest_cron = self._cfg("family_pulse_digest_cron", "50 21 * * *") or "50 21 * * *"
         self._pulse_job_ids = []
-        j1 = await cm.add_basic_job(
-            name=PULSE_TICK_JOB,
-            cron_expression=tick_cron,
-            handler=self.family_pulse_tick,
-            description="家庭旁轨心跳（她们之间的小日子）",
-            timezone="Asia/Shanghai",
-        )
         j2 = await cm.add_basic_job(
             name=PULSE_DIGEST_JOB,
             cron_expression=digest_cron,
@@ -1390,10 +1510,31 @@ class FamilyPulseMixin:
             description="家庭旁轨每日摘要推送给博士",
             timezone="Asia/Shanghai",
         )
-        self._pulse_job_ids = [getattr(j1, "job_id", None), getattr(j2, "job_id", None)]
+        self._pulse_job_ids = [getattr(j2, "job_id", None)]
+        # 2026-09-05 博士改版：心跳从「每小时 17 分」cron 换成作息式自管循环
+        # （活跃窗 06:17→次日01:00 CST，窗内每 2h 区间随机跳一次，任意分钟）。
+        # tick cron 不再注册；旧 cron job 由上方 _pulse_clear_legacy 清掉。
+        loop_task = getattr(self, "_pulse_loop_task", None)
+        if loop_task is None or loop_task.done():
+            self._pulse_loop_task = asyncio.create_task(self._pulse_loop())
+
+            def _loop_done(t, _self=self):
+                if t.cancelled():
+                    _logger.warning("[family_pulse] 心跳循环 task 被取消")
+                elif t.exception() is not None:
+                    _logger.error(
+                        "[family_pulse] 心跳循环 task 异常退出: %r", t.exception()
+                    )
+                else:
+                    _logger.info("[family_pulse] 心跳循环 task 正常退出（不应发生）")
+
+            self._pulse_loop_task.add_done_callback(_loop_done)
         _logger.info(
-            "[family_pulse] 已注册: tick=%s(%s) digest=%s(%s)",
-            tick_cron, self._pulse_job_ids[0], digest_cron, self._pulse_job_ids[1],
+            "[family_pulse] 已注册: tick=作息循环(%s→%s/%smin随机) digest=%s(%s)",
+            self._cfg("family_pulse_window_start", "06:17"),
+            self._cfg("family_pulse_window_end", "01:00"),
+            self._cfg("family_pulse_interval_min", 120),
+            digest_cron, self._pulse_job_ids[0],
         )
 
     async def teardown_pulse_jobs(self) -> None:
@@ -1407,3 +1548,89 @@ class FamilyPulseMixin:
             except Exception:  # noqa: BLE001
                 pass
         self._pulse_job_ids = []
+        # 2026-09-05：心跳循环随插件卸载取消（cron 时代由 cron_manager 管，现自管）
+        t = getattr(self, "_pulse_loop_task", None)
+        if t is not None and not t.done():
+            t.cancel()
+        self._pulse_loop_task = None
+
+    # ── 作息式心跳（2026-09-05 博士改版） ──
+    def _pulse_window(self, now) -> tuple:
+        """心跳活跃窗（CST）：默认 06:17 → 次日 01:00，跨零点。
+
+        凌晨 0:00~5:59 属于「昨晚开始的跨零点窗」（残区间到 01:00）。
+        返回 (start, end, interval_sec)。窗口起止与区间长均可配：
+        family_pulse_window_start / family_pulse_window_end / family_pulse_interval_min。
+        """
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo("Asia/Shanghai")
+        sh, sm = (
+            int(x) for x in str(self._cfg("family_pulse_window_start", "06:17")).split(":")
+        )
+        eh, em = (
+            int(x) for x in str(self._cfg("family_pulse_window_end", "01:00")).split(":")
+        )
+        interval = max(30, int(self._cfg("family_pulse_interval_min", 120) or 120)) * 60
+        # 凌晨 hour<6：窗口起点取昨天（跨零点窗仍活跃到今晨 01:00）
+        day = now.date() if now.hour >= 6 else now.date() - datetime.timedelta(days=1)
+        start = datetime.datetime.combine(day, datetime.time(sh, sm), tzinfo=tz)
+        end = datetime.datetime.combine(day, datetime.time(eh, em), tzinfo=tz)
+        if end <= start:
+            end += datetime.timedelta(days=1)  # 跨零点：次日 01:00
+        return start, end, interval
+
+    def _pulse_next_fire(self, now, rng):
+        """下一次心跳时刻：当前所处 2h 区间内随机一点（任意分钟，像人）。
+
+        区间从窗起点起每 interval_sec 切一段，末尾残区间（如 00:17→01:00）
+        也随机跳一次然后到明早；随机点已过（重启恢复）则顺延到下区间。
+        """
+        start, end, interval = self._pulse_window(now)
+        if now < start:
+            seg0 = start
+        else:
+            n = int((now - start).total_seconds() // interval)
+            seg0 = start + datetime.timedelta(seconds=n * interval)
+        for _ in range(48):
+            if seg0 >= end:
+                # 今天窗口走完 → 明早起点区间随机
+                return start + datetime.timedelta(
+                    days=1, seconds=rng.uniform(0, interval)
+                )
+            seg_end = min(seg0 + datetime.timedelta(seconds=interval), end)
+            fire = seg0 + datetime.timedelta(
+                seconds=rng.uniform(0, (seg_end - seg0).total_seconds())
+            )
+            if fire > now:
+                return fire
+            seg0 = seg_end  # 随机点已过（重启恢复）→ 顺延
+        return now + datetime.timedelta(minutes=10)
+
+    async def _pulse_loop(self) -> None:
+        """作息式心跳循环：睡到区间随机点→跳一次→睡到下一区间随机点。
+
+        替代原「每小时 17 分」cron（2026-09-05 博士拍板）：早上 6:17 开始
+        活跃，凌晨 1 点结束，期间每两小时区间随机心跳一次，更像人的日常
+        作息。窗外静默；异常 60s 退避；插件卸载时被 cancel。
+        """
+        rng = random.Random()
+        _logger.info("[family_pulse] 作息心跳循环已启动")
+        while True:
+            try:
+                from zoneinfo import ZoneInfo
+
+                now = datetime.datetime.now(ZoneInfo("Asia/Shanghai"))
+                fire = self._pulse_next_fire(now, rng)
+                delay = (fire - now).total_seconds()
+                _logger.info(
+                    "[family_pulse] 下次心跳: %s（%.0f 分钟后）",
+                    fire.strftime("%m-%d %H:%M"), max(0.0, delay) / 60,
+                )
+                await asyncio.sleep(max(5.0, delay))
+                await self.family_pulse_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                _logger.warning("[family_pulse] 作息心跳异常(静默): %s", e)
+                await asyncio.sleep(60)

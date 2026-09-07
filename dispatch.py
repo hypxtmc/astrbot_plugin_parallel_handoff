@@ -513,6 +513,47 @@ class DispatchMixin:
             latency_ms = int((time.perf_counter() - t0) * 1000)
             raw_response = llm_resp.completion_text or ""
 
+            # ── 空回复诊断+兜底（2026-09-05） ──
+            # 子代理带 recall/memorize 记忆工具，模型被问「今天聊了什么」常走
+            # 工具调用分支 → completion_text=None，而 llm_generate 是一次性调用
+            # 无工具循环，tool_call 无人执行无人续跑 → 空回复。
+            # 兜底：诊断日志打出 tools_call_name；降级为无工具重试一次
+            # （旁轨家常/记忆注入已在 extra_user_content_parts 里，模型可直接作答）。
+            if not raw_response.strip():
+                _tcn = list(getattr(llm_resp, "tools_call_name", []) or [])
+                _rc = (getattr(llm_resp, "reasoning_content", None) or "").strip()
+                logger.warning(
+                    f"[parallel_handoff] 空回复诊断 [{agent_name}]: "
+                    f"tool_calls={_tcn if _tcn else '无'} "
+                    f"reasoning={'有(' + str(len(_rc)) + '字)' if _rc else '无'}"
+                )
+                try:
+                    retry_resp = await asyncio.wait_for(
+                        self.context.llm_generate(
+                            chat_provider_id=prov_id,
+                            prompt=final_input,
+                            system_prompt=handoff.agent.instructions or "",
+                            extra_user_content_parts=memory_extra_parts,
+                            # 不带 tools：避免再次触发工具调用分支
+                        ),
+                        timeout=llm_timeout,
+                    )
+                    raw_response = retry_resp.completion_text or ""
+                    if raw_response.strip():
+                        logger.info(
+                            f"[parallel_handoff] 空回复无工具重试成功 [{agent_name}]"
+                        )
+                    else:
+                        _rc2 = (getattr(retry_resp, "reasoning_content", None) or "").strip()
+                        logger.warning(
+                            f"[parallel_handoff] 空回复重试仍空 [{agent_name}] "
+                            f"reasoning={'有(' + str(len(_rc2)) + '字)' if _rc2 else '无'}"
+                        )
+                except Exception as retry_e:
+                    logger.warning(
+                        f"[parallel_handoff] 空回复重试失败 [{agent_name}]: {retry_e}"
+                    )
+
             # ── 记忆存储：存入长期记忆（memory.py） ──
             await self._memory_store(
                 livingmemory_plugin, event, agent_name, final_input, raw_response

@@ -117,6 +117,14 @@ class ForwardMixin:
                     segments = content.split("\n")
                 segments = [s.strip() for s in segments if s.strip()]
             segments = [_thaw_fence(s) for s in segments]
+            if not segments:
+                # 2026-09-05 修复：子代理返回空串（如 livingmemory 无记忆 + LLM 空输出）
+                # 时此前静默跳过，博士端「Completed 但收不到」。改为发一条兜底提示。
+                await self.context.send_message(
+                    event.unified_msg_origin,
+                    MessageChain([Plain("（她沉默了一会儿，没说出话来）")]),
+                )
+                return
             for idx, seg_text in enumerate(segments):
                 if idx == 0 and prefix:
                     msg = f"{prefix}\n{seg_text}"
