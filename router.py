@@ -367,37 +367,46 @@ class RouterMixin:
         except (TypeError, ValueError):
             return 300.0
 
-    def _t15_continue_route(self, event: AstrMessageEvent, message: str) -> str | None:
-        """[T1.5 层 2026-08-21] 会话续接：消息是纯承接短句、时间窗内有上次成功路由目标、
-        且未出现其他子代理名（防承接句点名打架）→ 直接续接上次对象，不走 T2 不落主代理。
+    def _t1_sticky_route(self, event: AstrMessageEvent, message: str) -> str | None:
+        """[T0.5 层 2026-09-07 方案A粘滞锁定] 会话级连续路由：本次会话点名锁定了某代理
+        → 其后每条消息默认由该代理直发处理（含技术请求，不再甩回主代理统帅），
+        久聊不释放；除非本条出现新的子代理名（交给 T1 重新点名覆盖），
+        或消息含「主代理」最高级令牌（由上层先行清锁，本层不接管）。
 
-        目的：修掉 "好舒服，继续" 这类承上句被 T2 零上下文判 lost → 落主代理转一圈的缺陷。
-        纯句判定 + 时间窗 + 无新点名 三重约束，宁可不接也不误路由。
+        取代旧 T1.5 的「纯承接短句 + 300s 时间窗 + 无新点名」弱续接设计，
+        按顾主 2026-09-07 指定改为会话级硬锁定（agent → 一路粘着，久聊不解放绑）。
         """
         if not message:
             return None
-        # 1) 纯承接句：剥掉承接词与句首尾标点空白后必须无残留
-        if len(message) > 40:
-            return None
-        cleaned = self._T1_CONTINUE_WORD_RE.sub("", message)
-        cleaned = re.sub(r"^[\s，,。.？！!？~～、]+|[\s，,。.？！!？~～、]+$", "", cleaned)
-        if cleaned:
-            return None
-        # 2) 时间窗内存在上次路由目标
+        # 1) 会话存在已锁定的路由目标
         last, _ = self._route_mem()
         hit = last.get(event.unified_msg_origin)
         if not hit:
             return None
-        agent, ts = hit
-        if time.time() - ts > self._continue_window():
-            return None
+        agent = hit[0]
         pool = self._router_agent_pool()
+        # 锁定的目标已不在可用池（被移除）→ 不粘滞
         if agent not in pool:
             return None
-        # 3) 无新子代理名出现（出现则不接，交给 T1/T2 决断）
+        # 2) 本条出现新的子代理名 → 不沿用旧锁，交给 T1 重新点名覆盖
         if self._t1_mentions(message):
             return None
+        # 3) 未点名 → 一路粘滞锁定代理处理（含技术请求）
         return agent
+
+    def _record_route_hit(self, event: AstrMessageEvent, agent: str):
+        """记录本次成功路由（供粘滞锁定续接：点名建立/切换后一路沿用）。
+        2026-09-07 方案A：记录即会话锁定，久聊不释放；由新点名或主代理令牌覆盖/清除。
+        """
+        last, _ = self._route_mem()
+        # 名字显示映射：存稳定 agent id 便于池校验与切回
+        disp_map = self._get_name_display_map() or {}
+        aid = agent
+        for _aid, cn in disp_map.items():
+            if str(cn) == agent or str(_aid) == agent:
+                aid = _aid
+                break
+        last[event.unified_msg_origin] = (aid, time.time())
 
     def _t1_mentions(self, message: str) -> set:
         """返回消息中出现过的所有子代理名集合（仅供 T1.5 防误续，维度与 T1 名称判定一致）。"""
@@ -510,8 +519,10 @@ class RouterMixin:
         affection_mode_config 模式调度——技术干活任务被单发直连，顾主配置形同虚设；
         短路后主代理 LLM 不调用，directive 强制路由指令根本没机会注入。
 
-        裁决规则（顾主配置永远优先）：
-        - 任务分类 tech（技术特征）→ 放行主代理走 tech 模式统帅收卷（relay+parallel）
+        裁决规则（顾主配置永远优先；2026-09-07 方案A 调整 tech 分支）：
+        - 任务分类 tech（技术特征）+ 路由命中（点名/粘滞）→ **短路直发被点名者处理**
+          （顾主 2026-09-07 拍板：点名粘滞期间技术请求也归被点名子代理直发处理，
+          不再放行主代理统帅收卷——旧 8-31 规则作废，因为统帅形态实际未生效）
         - 任务分类 affection → 按 affection_mode_config.route_mode：
             direct → 短路直发（贴贴快速直达）；relay → 放行主代理（回复返回主代理汇总）
         - 无法分类（None，纯点名无特征）→ 保持短路（原行为兜底）
@@ -521,7 +532,9 @@ class RouterMixin:
         except Exception:
             return True
         if task_kind == "tech":
-            return False
+            # [2026-09-07 方案A粘滞锁定] 技术请求短路直发给被点名/粘滞的子代理处理，
+            # 不再放行主代理统帅收卷。route 参数即 T1/T2/粘滞判定的目标代理。
+            return True
         if task_kind == "affection":
             mcfg = self._get_mode_config("affection")
             rmode = str(mcfg.get("route_mode", "direct")).strip().lower()
@@ -648,11 +661,11 @@ class RouterMixin:
         route = self._t1_route(message)
         conf = 1.0 if route else 0.0
         source = "T1"
-        # T1.5 会话续接（零成本，纯规则）
+        # T0.5 会话粘滞锁定（零成本，纯规则；2026-09-07 方案A 取代旧 T1.5 弱续接）
         if not route:
-            route = self._t15_continue_route(event, message)
+            route = self._t1_sticky_route(event, message)
             conf = 1.0 if route else 0.0
-            source = "T1.5"
+            source = "T0.5"
         # T2 小模型（带最近会话上下文）
         if not route:
             route, conf = await self._t2_route(event, message)
