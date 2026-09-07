@@ -117,6 +117,7 @@ class TestSchema(unittest.TestCase):
             "main_agent_name",
             "enable_scene_inject",
             "enable_segmented_forward",
+            "enable_chain_memory_persist",
             "name_prefix_overrides",
             "name_display_map",
         ]
@@ -1913,6 +1914,69 @@ class TestContextEngine:
         asyncio.run(m._maybe_reflect_subagent(broken, stub, "amiya"))
         assert added == []
 
+class TestChainMemoryPersist(unittest.TestCase):
+    """2026-09-07 3P/4P 接龙修复：
+
+    1. chained 注入升级为「全场脉络」，剥离函数须能把新注入剥干净（防污染记忆）
+    2. 兼容旧的「接龙·上一位」注入（向后兼容，不破坏既有行为）
+    3. 纯视角沉淀文本（pov_text）不得被误剥
+    4. 记忆沉淀开关 enable_chain_memory_persist 存在且默认开
+    """
+
+    def test_new_full_scene_injection_stripped(self):
+        """新「全场脉络」注入块必须被 _strip_chain_injection 剥净，只剩本轮真实输入。
+        这是防污染的关键：若剥不净，3P 接入会让临时上下文漏进长期记忆/存储链路。"""
+        from memory import _strip_chain_injection
+
+        injected = (
+            "（接龙·全场脉络，到目前为止）：\n"
+            "▍博士：晚上好\n"
+            "【阿米娅】来啦\n"
+            "\n"
+            "请接续上文，现在轮到你（【斯卡蒂】）回应，顺着全场的话茬自然往下："
+            "博士我们继续聊点刺激的"
+        )
+        out = _strip_chain_injection(injected)
+        self.assertEqual(out.strip(), "博士我们继续聊点刺激的")
+        self.assertNotIn("全场脉络", out)
+        self.assertNotIn("博士：晚上好", out)
+
+    def test_old_chain_injection_still_compatible(self):
+        """旧的「接龙·上一位」注入仍能被剥离（向后兼容，不破坏既有行为）。"""
+        from memory import _strip_chain_injection
+
+        old = (
+            "（接龙·上一位）【阿米娅】的回复：\n"
+            "刚才说啥\n"
+            "\n"
+            "请接续上文，现在轮到你回应：咱们继续"
+        )
+        out = _strip_chain_injection(old)
+        self.assertEqual(out.strip(), "咱们继续")
+        self.assertNotIn("阿米娅", out)
+
+    def test_pov_text_not_stripped(self):
+        """3P 沉淀用纯视角文本不带接龙标记，不得被误剥。"""
+        from memory import _strip_chain_injection
+
+        pov = (
+            "这一天博士把我们凑到一块儿，他先起了个头：晚上好。\n"
+            "我还听到另一边：阿米娅对我说：…\n"
+            "\n（这是我们一起经历过的一段，我记得它，日子照常过着。）"
+        )
+        out = _strip_chain_injection(pov)
+        self.assertEqual(out, pov)
+
+    def test_persist_switch_exists_default_on(self):
+        """enable_chain_memory_persist 开关存在且默认开（3P 可留长期记忆）。"""
+        schema_path = os.path.join(PLUGIN_DIR, "_conf_schema.json")
+        with open(schema_path, "r", encoding="utf-8") as f:
+            schema = json.load(f)
+        self.assertIn("enable_chain_memory_persist", schema)
+        self.assertTrue(schema["enable_chain_memory_persist"]["default"])
+
+
+# ── 三期·random_state 状态机 + daily_life 注入器（M1/M2，2026-09-03） ──────
 # ── 三期·random_state 状态机 + daily_life 注入器（M1/M2，2026-09-03） ──────
 # ── 三期·random_state 状态机 + daily_life 注入器（M1/M2，2026-09-03） ──────
 from random_state import (
@@ -3632,3 +3696,95 @@ class TestFamilyPulse(unittest.TestCase):
         sys0 = p.context.llm_generate.call_args_list[0].kwargs.get("system_prompt", "")
         self.assertIn("不要喊『博士』", sys0)
         self.assertNotIn("可以下流", sys0)
+
+
+class TestStickyMultiGroup(unittest.TestCase):
+    """[方案① 2026-09-07] 多P场次粘滞：多点名结束后的无点名消息按整组续接，不掉队。
+
+    复现博士 23:30 现场 bug：第一轮阿米娅+斯卡蒂 2/2 成功，但旧 _route_last 只留
+    最后一个 agent，后续无点名消息只粘滞 skadi，阿米娅掉队。
+    现在 _route_last 升级为「在场者组」，_t1_sticky_route 对多人组返回 list[str]。
+    """
+
+    def _fresh_router(self):
+        p = _load_plugin_class()(
+            context=MagicMock(),
+            config={
+                "enable_smart_router": True,
+                "router_continue_window_sec": 300,
+            },
+        )
+        # mock 子代理池（含阿米娅+斯卡蒂）
+        p._router_agent_pool = lambda: {
+            "amiya": "阿米娅",
+            "skadi": "斯卡蒂",
+            "theresia": "特蕾西娅",
+        }
+        p._get_name_display_map = lambda: {
+            "amiya": "阿米娅",
+            "skadi": "斯卡蒂",
+            "theresia": "特蕾西娅",
+        }
+        return p
+
+    def _ev(self, sid="sess-mp"):
+        ev = MagicMock()
+        ev.unified_msg_origin = sid
+        return ev
+
+    def test_multi_hits_after_multiname_record_group(self):
+        """多点名第一轮后写整组：_record_route_hits 把阿米娅+斯卡蒂都写入在场者组"""
+        p = self._fresh_router()
+        ev = self._ev()
+        p._record_route_hits(ev, ["amiya", "skadi"])
+        last, _ = p._route_mem()
+        group = last[ev.unified_msg_origin]
+        self.assertEqual(set(group.keys()), {"amiya", "skadi"})
+
+    def test_sticky_returns_multi_group_list(self):
+        """无点名后续消息：_t1_sticky_route 命中多人组 → 返回整组 list（阿米娅不掉队）"""
+        p = self._fresh_router()
+        ev = self._ev()
+        p._record_route_hits(ev, ["amiya", "skadi"])
+        # 无点名消息（如"嗯，继续"）
+        sticky = p._t1_sticky_route(ev, "嗯，继续")
+        self.assertIsInstance(sticky, list)
+        self.assertEqual(set(sticky), {"amiya", "skadi"})
+
+    def test_single_group_still_returns_str(self):
+        """单人粘滞仍返回 str（单 agent 直发路径零回归）"""
+        p = self._fresh_router()
+        ev = self._ev("sess-single")
+        p._record_route_hit(ev, "theresia")
+        sticky = p._t1_sticky_route(ev, "继续聊")
+        self.assertEqual(sticky, "theresia")
+
+    def test_new_mention_releases_sticky(self):
+        """本条出现新的子代理名 → 不沿用旧锁（多点名覆盖旧组置空）"""
+        p = self._fresh_router()
+        ev = self._ev("sess-mention")
+        p._record_route_hits(ev, ["amiya", "skadi"])
+        # 新消息点了别的人（theresia）→ 粘滞释放，交给 T1 重新点名
+        sticky = p._t1_sticky_route(ev, "特蕾西娅，你来接")
+        self.assertIsNone(sticky)
+
+    def test_presis_token_higher_priority_clears_group(self):
+        """「普瑞赛斯」最高级令牌：清空在场者组（上层已清锁）"""
+        p = self._fresh_router()
+        ev = self._ev("sess-presis")
+        p._record_route_hits(ev, ["amiya", "skadi"])
+        # 清理逻辑等同 _smart_router_check 的 last.pop
+        last, _ = p._route_mem()
+        last.pop(ev.unified_msg_origin, None)
+        sticky = p._t1_sticky_route(ev, "普瑞赛斯你来")
+        self.assertIsNone(sticky)
+
+    def test_agent_removed_from_pool_dropped_from_group(self):
+        """不在池的子代理从在场者组剔除（避免粘滞到已移除角色）"""
+        p = self._fresh_router()
+        ev = self._ev("sess-removed")
+        p._record_route_hits(ev, ["amiya", "skadi"])
+        # 移除 skadi（模拟下池）后，只留 amiya 单人
+        p._router_agent_pool = lambda: {"amiya": "阿米娅", "theresia": "特蕾西娅"}
+        sticky = p._t1_sticky_route(ev, "继续")
+        self.assertEqual(sticky, "amiya")
