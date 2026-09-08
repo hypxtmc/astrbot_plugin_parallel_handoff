@@ -4091,3 +4091,54 @@ class TestCmdLockHardGroup(unittest.TestCase):
         ev = MagicMock()
         ev.unified_msg_origin = "sess-nolock"
         self.assertIsNone(p._cmd_locked_group(ev))
+class TestShortcircuitDedup(unittest.TestCase):
+    """[同消息去重屏障 2026-09-09 博士 bug 回归] OnWaitingLLMRequestEvent 对同一条
+    消息可能顺序触发两次 → 第二次必须被吞掉，子代理不得重复回话（夕回两遍 bug）。"""
+
+    def _fresh(self):
+        p = TestAgentCommand()._fresh_router()
+        p._shortcircuit_last = {}
+        return p
+
+    def _ev(self, sid, text):
+        ev = MagicMock()
+        ev.unified_msg_origin = sid
+        ev.get_message_str.return_value = text
+        ev.stop_event = MagicMock()
+        return ev
+
+    def test_second_identical_msg_deduped(self):
+        p = self._fresh()
+        sid = "sess-dedup"
+        ev1 = self._ev(sid, "继续做爱")
+        ev2 = self._ev(sid, "继续做爱")
+        self.assertFalse(p._dedup_shortcircuit(ev1, "继续做爱"))  # 第一条放行
+        self.assertTrue(p._dedup_shortcircuit(ev2, "继续做爱"))   # 同文本第二次吞掉
+        ev2.stop_event.assert_called_once()
+
+    def test_different_msg_not_deduped(self):
+        p = self._fresh()
+        sid = "sess-diff"
+        ev1 = self._ev(sid, "继续做爱")
+        ev2 = self._ev(sid, "换个姿势")
+        self.assertFalse(p._dedup_shortcircuit(ev1, "继续做爱"))
+        self.assertFalse(p._dedup_shortcircuit(ev2, "换个姿势"))  # 不同文本放行
+        ev2.stop_event.assert_not_called()
+
+    def test_window_expiry_allow_again(self):
+        p = self._fresh()
+        sid = "sess-expiry"
+        ev1 = self._ev(sid, "继续做爱")
+        self.assertFalse(p._dedup_shortcircuit(ev1, "继续做爱"))
+        # 模拟窗口过后（>12s）同文本应放行
+        p._shortcircuit_last[sid] = (p._shortcircuit_last[sid][0], p._shortcircuit_last[sid][1] - 15)
+        ev2 = self._ev(sid, "继续做爱")
+        self.assertFalse(p._dedup_shortcircuit(ev2, "继续做爱"))
+
+    def test_distinct_session_independent(self):
+        p = self._fresh()
+        a1 = self._ev("sess-A", "继续做爱")
+        b1 = self._ev("sess-B", "继续做爱")
+        self.assertFalse(p._dedup_shortcircuit(a1, "继续做爱"))
+        # B 会话同文本首条，不受 A 影响
+        self.assertFalse(p._dedup_shortcircuit(b1, "继续做爱"))

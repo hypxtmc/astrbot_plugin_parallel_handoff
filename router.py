@@ -535,6 +535,42 @@ class RouterMixin:
             buf = msgs[sid] = deque(maxlen=6)
         buf.append(message)
 
+    def _dedup_shortcircuit(self, event: AstrMessageEvent, message: str) -> bool:
+        """会话级消息去重屏障（2026-09-09 博士 bug 治本）。
+
+        bug 复现：/年+夕 命令锁 → 发"继续做爱"，T0.5 粘滞命中 nian+xi chained，
+        但夕回了两遍。根因：_smart_router_check 挂在 OnWaitingLLMRequestEvent 上，
+        同一条用户消息可能被顺序触发两次（follow-up / 管道二次遍历），且代码里
+        唯一防重 _suppress_mainagent_prefix 只管"主代理工具续写尾巴"那个特定场景，
+        对命令式/命令锁/粘滞chained/多点名等纯子代理短路路径完全不设防。
+        第二次触发时 _route_last/_cmd_lock 都还在，粘滞重新命中 → 整条 chained
+        再跑一遍 → 每个在场者都回两遍。
+
+        治本：同一条完整消息文本，在短时间窗（_shortcircuit_dedup_window_sec，
+        默认 12s）内对同一 session 第二次出现，直接 stop_event 吞掉，绝不重复
+        路由。覆盖所有短路路径的通用屏障。
+        返回 True = 已吞（去重），False = 正常放行。
+        """
+        if not hasattr(self, "_shortcircuit_last"):
+            self._shortcircuit_last = {}  # session -> (hash, ts)
+        sid = event.unified_msg_origin
+        msg_hash = hash(message)
+        now = time.time()
+        prev = self._shortcircuit_last.get(sid)
+        try:
+            window = float(self._cfg("_shortcircuit_dedup_window_sec", 12))
+        except (TypeError, ValueError):
+            window = 12.0
+        if prev and prev[0] == msg_hash and (now - prev[1]) <= window:
+            logger.info(
+                f"[parallel_handoff] SmartRouter: 同消息去重窗口 {window}s，吞掉重复触发 "
+                f"（session={sid}，杜绝子代理重复回话）"
+            )
+            event.stop_event()
+            return True
+        self._shortcircuit_last[sid] = (msg_hash, now)
+        return False
+
     def _continue_window(self) -> float:
         """会话续接时间窗（秒），默认 300s（5 分钟）。"""
         try:
@@ -1000,6 +1036,10 @@ class RouterMixin:
         if not message:
             return False
         self._record_user_msg(event, message)
+        # [去重屏障 2026-09-09 博士 bug 治本] 同消息二次触发（OnWaitingLLMRequestEvent
+        # 可能对同一消息顺序跑两次）→ 直接吞掉，杜绝子代理重复回话。
+        if self._dedup_shortcircuit(event, message):
+            return True
         # [T0 命令式触发 2026-09-08 博士指定] 以 / 开头的显式命令（如 /黍、/黍+年、
         # /特蕾西娅+阿米娅+斯卡蒂、/普瑞赛斯+阿米娅）→ 直接锁定目标，最高优先级短路，
         # 彻底跳过 T1 关键词猜测 / T0.5 粘滞 / T2 小模型。命令持续生效（写粘滞锁）。
