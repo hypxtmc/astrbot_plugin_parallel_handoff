@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 import unittest
 from unittest import mock
 from unittest.mock import AsyncMock, MagicMock
@@ -1148,6 +1149,46 @@ class TestBusyBypass(unittest.TestCase):
         self.assertFalse(res)
         ev.stop_event.assert_not_called()
 
+    def test_active_runner_sticky_multi_group_chained(self):
+        """[方案① 2026-09-07] 活跃 runner + 无点名承接句 → 粘滞多人组按整组 chained 续接。
+        复现博士 00:10 现场 bug：夕+年 3P 进行中，博士发「继续做爱」，
+        此前 _busy_bypass_check 无粘滞多人分支，返回 False 被 follow-up 吞（靠主代理手动调）。
+        现在应在 follow-up 捕获之前按整组 parallel_handoff chained 续接。"""
+        import router as router_mod
+        p = self._fresh_router()
+        router_mod._ACTIVE_AGENT_RUNNERS = {"sess-busy": object()}
+        # 先记录夕+年在场者组（等价上轮多点名后 _record_route_hits 写入）
+        ev0 = self._plain_event("夕和年，来做爱3p吧", umo="sess-busy")
+        p._record_route_hits(ev0, ["xi", "nian"])
+        # 无点名承接句
+        ev = self._plain_event("继续做爱", umo="sess-busy")
+        p.parallel_handoff = AsyncMock()
+        res = asyncio.run(p._busy_bypass_check(ev))
+        self.assertTrue(res)
+        p.parallel_handoff.assert_called_once()
+        kwargs = p.parallel_handoff.call_args.kwargs
+        calls = kwargs["calls"]
+        self.assertEqual({c["agent_name"] for c in calls}, {"xi", "nian"})
+        self.assertEqual(kwargs["call_mode"], "chained")
+        self.assertEqual(kwargs["route_mode"], "direct")
+        self.assertEqual(kwargs["mode"], "affection")
+        ev.stop_event.assert_called_once()
+
+    def test_active_runner_sticky_single_continued(self):
+        """[方案① 2026-09-07] 活跃 runner + 无点名承接句命中单人粘滞 → call_subagent 直发"""
+        import router as router_mod
+        p = self._fresh_router()
+        router_mod._ACTIVE_AGENT_RUNNERS = {"sess-busy": object()}
+        ev0 = self._plain_event("特蕾西娅聊正事", umo="sess-busy")
+        p._record_route_hit(ev0, "theresia")
+        ev = self._plain_event("继续", umo="sess-busy")
+        p.call_subagent = AsyncMock()
+        res = asyncio.run(p._busy_bypass_check(ev))
+        self.assertTrue(res)
+        kwargs = p.call_subagent.call_args.kwargs
+        self.assertEqual(kwargs["agent_name"], "theresia")
+        ev.stop_event.assert_called_once()
+
     def test_busy_filter_matches(self):
         """BusyRunnerFilter：有活跃 runner 才通过"""
         import router as router_mod
@@ -1923,6 +1964,15 @@ class TestChainMemoryPersist(unittest.TestCase):
     4. 记忆沉淀开关 enable_chain_memory_persist 存在且默认开
     """
 
+    @classmethod
+    def setUpClass(cls):
+        cls.PluginClass = _load_plugin_class()
+
+    def _make_plugin(self, config: dict = None):
+        mock_context = MagicMock()
+        plugin = self.PluginClass(context=mock_context, config=config or {})
+        return plugin
+
     def test_new_full_scene_injection_stripped(self):
         """新「全场脉络」注入块必须被 _strip_chain_injection 剥净，只剩本轮真实输入。
         这是防污染的关键：若剥不净，3P 接入会让临时上下文漏进长期记忆/存储链路。"""
@@ -1974,6 +2024,62 @@ class TestChainMemoryPersist(unittest.TestCase):
             schema = json.load(f)
         self.assertIn("enable_chain_memory_persist", schema)
         self.assertTrue(schema["enable_chain_memory_persist"]["default"])
+
+    def test_cross_round_injection_stripped(self):
+        """跨轮续接「上一场脉络」注入块必须被 _strip_chain_injection 剥净。
+        2026-09-08 博士实测：夕+年3P 第二轮「继续做爱」首发者夕失忆拉错人，
+        修复引入上一轮脉络注入；该注入是临时上下文，绝不可漏进长期记忆。"""
+        from memory import _strip_chain_injection
+
+        injected = (
+            "（接龙·上一场脉络，你们还没散场）：\n"
+            "【夕】我先进去了哦\n"
+            "【年】你倒是慢点\n"
+            "\n"
+            "顺着上一场的话茬自然往下：博士我们接着来"
+        )
+        out = _strip_chain_injection(injected)
+        self.assertEqual(out.strip(), "博士我们接着来")
+        self.assertNotIn("上一场脉络", out)
+        self.assertNotIn("【年】", out)
+
+    def test_build_prev_round_note_same_group(self):
+        """_build_prev_round_note：同场续接（本轮与上轮在场者有交集）返回脉络块，
+        全新场次（无交集）返回空 —— 防止串场污染。"""
+        plugin = TestChainMemoryPersist._make_plugin(self)
+        plugin._chain_round_ctx = {}
+        plugin._chain_round_ctx["sess-3p"] = {
+            "ts": time.time(),
+            "agents": ["xi", "nian"],
+            "speeches": [
+                {"agent": "xi", "display": "夕", "text": "我先进来了"},
+                {"agent": "nian", "display": "年", "text": "你慢点，等等我"},
+            ],
+        }
+        # 同场续接：夕+年 再来
+        note = plugin._build_prev_round_note("sess-3p", ["xi", "nian"])
+        self.assertIn("上一场脉络", note)
+        self.assertIn("【夕】", note)
+        self.assertIn("【年】", note)
+        # 全新场次：点名阿米娅+斯卡蒂（与上轮无交集）→ 不注入
+        note2 = plugin._build_prev_round_note("sess-3p", ["amiya", "skadi"])
+        self.assertEqual(note2, "")
+        # 无缓存的 session → 空
+        self.assertEqual(plugin._build_prev_round_note("sess-other", ["xi"]), "")
+
+    def test_build_prev_round_note_expired(self):
+        """跨轮脉络超过 5 分钟视为旧场，不注入（防止旧场次串味）。"""
+        plugin = TestChainMemoryPersist._make_plugin(self)
+        plugin._chain_round_ctx = {}
+        plugin._chain_round_ctx["sess-old"] = {
+            "ts": time.time() - 600,
+            "agents": ["xi", "nian"],
+            "speeches": [
+                {"agent": "xi", "display": "夕", "text": "老早以前说的"},
+            ],
+        }
+        note = plugin._build_prev_round_note("sess-old", ["xi", "nian"])
+        self.assertEqual(note, "")
 
 
 # ── 三期·random_state 状态机 + daily_life 注入器（M1/M2，2026-09-03） ──────
@@ -3788,3 +3894,137 @@ class TestStickyMultiGroup(unittest.TestCase):
         p._router_agent_pool = lambda: {"amiya": "阿米娅", "theresia": "特蕾西娅"}
         sticky = p._t1_sticky_route(ev, "继续")
         self.assertEqual(sticky, "amiya")
+class TestAgentCommand(unittest.TestCase):
+    """[T0 命令式触发 2026-09-08 博士指定] 以 / 开头显式命令锁定子代理/主代理，
+    取代自然语言关键词猜测。/黍 · /黍+年 · /特蕾西娅+阿米娅+斯卡蒂 ·
+    /普瑞赛斯+阿米娅+特蕾西娅，不设上限，命令持续生效（写粘滞锁）。"""
+
+    def _fresh_router(self):
+        p = _load_plugin_class()(
+            context=MagicMock(),
+            config={
+                "enable_smart_router": True,
+                "router_continue_window_sec": 300,
+            },
+        )
+        # mock 子代理池与显示名映射（含深度角色名）
+        p._router_agent_pool = lambda: {
+            "amiya": "阿米娅",
+            "skadi": "斯卡蒂",
+            "theresia": "特蕾西娅",
+            "closure": "可露希尔",
+            "xi": "夕",
+            "nian": "年",
+            "ling": "令",
+            "shu": "黍",
+            "liino": "梨诺",
+        }
+        p._get_name_display_map = lambda: {
+            "amiya": "阿米娅",
+            "skadi": "斯卡蒂",
+            "theresia": "特蕾西娅",
+            "closure": "可露希尔",
+            "xi": "夕",
+            "nian": "年",
+            "ling": "令",
+            "shu": "黍",
+            "liino": "梨诺",
+        }
+        return p
+
+    def _ev(self, sid="sess-cmd"):
+        ev = MagicMock()
+        ev.unified_msg_origin = sid
+        return ev
+
+    # ── 解析（_parse_agent_command）────────────────────
+    def test_single_command(self):
+        p = self._fresh_router()
+        agents, presis = p._parse_agent_command("/黍")
+        self.assertEqual(agents, ["shu"])
+        self.assertFalse(presis)
+
+    def test_multi_command_plus(self):
+        p = self._fresh_router()
+        agents, presis = p._parse_agent_command("/黍+年")
+        self.assertEqual(set(agents), {"shu", "nian"})
+        self.assertFalse(presis)
+
+    def test_multi_command_three_reordered(self):
+        p = self._fresh_router()
+        agents, presis = p._parse_agent_command("/特蕾西娅+阿米娅+斯卡蒂")
+        self.assertEqual(set(agents), {"theresia", "amiya", "skadi"})
+        self.assertFalse(presis)
+
+    def test_command_presis_single(self):
+        p = self._fresh_router()
+        agents, presis = p._parse_agent_command("/普瑞赛斯")
+        self.assertIsNone(agents)
+        self.assertTrue(presis)
+
+    def test_command_presis_with_agents(self):
+        p = self._fresh_router()
+        agents, presis = p._parse_agent_command("/普瑞赛斯+阿米娅+特蕾西娅")
+        self.assertEqual(set(agents), {"amiya", "theresia"})
+        self.assertTrue(presis)
+
+    def test_command_english_id(self):
+        p = self._fresh_router()
+        agents, presis = p._parse_agent_command("/amiya+skadi")
+        self.assertEqual(set(agents), {"amiya", "skadi"})
+        self.assertFalse(presis)
+
+    def test_command_alias(self):
+        p = self._fresh_router()
+        agents, presis = p._parse_agent_command("/兔兔+猫猫")
+        self.assertEqual(set(agents), {"amiya"})
+        self.assertFalse(presis)
+
+    def test_command_unknown_falls_back(self):
+        p = self._fresh_router()
+        agents, presis = p._parse_agent_command("/foo")
+        self.assertIsNone(agents)
+        self.assertFalse(presis)
+
+    def test_non_command_returns_none(self):
+        p = self._fresh_router()
+        agents, presis = p._parse_agent_command("黍，我们聊聊")
+        self.assertIsNone(agents)
+        self.assertFalse(presis)
+
+    def test_command_presis_with_valid_and_unknown(self):
+        p = self._fresh_router()
+        agents, presis = p._parse_agent_command("/普瑞赛斯+黍+foo")
+        self.assertEqual(set(agents), {"shu"})
+        self.assertTrue(presis)
+
+    # ── 粘滞锁定（命令命中后写入在场者组）────────────
+    def test_command_locks_multi_group(self):
+        p = self._fresh_router()
+        ev = self._ev("sess-cmd-multi")
+        p._record_route_hits(ev, ["shu", "nian"])
+        sticky = p._t1_sticky_route(ev, "继续吧")
+        self.assertIsInstance(sticky, list)
+        self.assertEqual(set(sticky), {"shu", "nian"})
+
+    def test_command_locks_single_then_sticky(self):
+        p = self._fresh_router()
+        ev = self._ev("sess-cmd-single")
+        p._record_route_hit(ev, "shu")
+        sticky = p._t1_sticky_route(ev, "继续聊")
+        self.assertEqual(sticky, "shu")
+
+    # ── 多代理建议暂存（/普瑞赛斯+阿米娅 directive 用）──
+    def test_route_suggestions_multi_pop_all(self):
+        p = self._fresh_router()
+        p._record_route_suggestions(["amiya", "theresia"])
+        got = p._pop_route_suggestions()
+        self.assertEqual(set(got), {"amiya", "theresia"})
+
+    def test_route_suggestion_single_legacy_compat(self):
+        p = self._fresh_router()
+        p._record_route_suggestion("shu")
+        got1 = p._pop_route_suggestion()
+        self.assertEqual(got1, "shu")
+        # 单次吐完，重取为空
+        self.assertIsNone(p._pop_route_suggestion())
