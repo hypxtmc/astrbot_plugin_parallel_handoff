@@ -180,6 +180,65 @@ class RouterMixin:
             pool = {k: v for k, v in pool.items() if k in ids}
         return pool
 
+    # ── T0 命令式触发层（2026-09-08 顾主指定）────────────
+    # 以 / 开头 + 名字（可 + 连接多名字）的显式命令，直接指定目标子代理/主代理，
+    # 取代「从自然语言关键词猜测路由目标」的旧机制。命令命中 → 最高优先级短路，
+    # 跳过 T1/T0.5/T2 全部猜测层，零正则歧义、零误触发。
+    # 格式：/黍 · /黍+年 · /助手C+助手A+助手D · /主代理+助手A+助手C
+    # 不设上限，点名几个就锁定几个；命令持续生效（写入粘滞锁，之后无需再发命令）。
+    # Python 同款命令见系统提示「以 / 开头指定」，与下方实现保持一致。
+    _CMD_RE = re.compile(
+        r"^/([^\s/]+(?:[/+、，,，][^\s/]+)*)\s*$", re.M
+    )
+
+    def _parse_agent_command(self, message: str):
+        """解析命令式触发。返回 (agents_list, has_main)。
+
+        agents_list: 命令点名的子代理 aid 列表（排除主代理，主代理是主代理本体）
+        has_main: 命令里是否含「主代理」（标记主代理在场：不调度、放行主代理，
+                    其余点名子代理由主代理并行调度（relay 汇总或直发按 mode））。
+        非命令 / 全未知 → (None, False)。
+        """
+        if not message or not message.startswith("/"):
+            return None, False
+        m = self._CMD_RE.match(message)
+        if not m:
+            return None, False
+        # 解析各段：/A+B+C（兼容 +、/、中英文顿逗号 作分隔）
+        raw_seg = m.group(1)
+        parts = re.split(r"[/+、，,，]", raw_seg)
+        parts = [p.strip() for p in parts if p.strip()]
+        if not parts:
+            return None, False
+        # 名字→aid 映射池（中文显示名 + agent id + 爱称别名）
+        pool = self._router_agent_pool()
+        name2aid = {aid: aid for aid in pool}
+        disp_map = self._get_name_display_map() or {}
+        for aid, cn in disp_map.items():
+            name2aid[str(cn)] = aid
+            name2aid[str(aid)] = aid
+        for aid, aliases in self.T1_ALIASES.items():
+            for al in aliases:
+                name2aid[str(al)] = aid
+        agents = []
+        has_main = False
+        unknown = []
+        for p in parts:
+            if p in ("主代理", "普瑞塞斯"):
+                has_main = True
+                continue
+            aid = name2aid.get(p)
+            if aid and aid in pool and aid not in agents:
+                agents.append(aid)
+            else:
+                unknown.append(p)
+        if not agents and not has_main:
+            # 全未知（如 /foo /bar）→ 非有效命令，回退 T1 自然语言路径
+            return None, False
+        if unknown:
+            logger.info(f"[parallel_handoff] 命令式含未知目标 {unknown}，已忽略（已知目标照常锁定）")
+        return (agents or None), has_main
+
     # ── T1 规则层 ────────────────────────────────────────
     # 报错/日志/代码强特征：命中且整条无呼叫词（找/叫/让/喊…）→ 判定为技术文本，
     # 子代理名此时多为报错主体/路径/引用，不构成点名，直接放行 main/T2；
@@ -654,18 +713,34 @@ class RouterMixin:
     # 避免"裁决放行 → 判向目标丢失 → 主代理调错人/不调子代理"的断链。
     def _record_route_suggestion(self, agent: str):
         """记录 T1/T2 判向目标（供 directive 注入附加），30s 有效期。"""
-        self._route_suggestion = (agent, time.time())
+        self._route_suggestion = ([agent], time.time())
+
+    def _record_route_suggestions(self, agents):
+        """[T0 命令式 2026-09-08] 记录多子代理判向目标（供 directive 注入附加），30s 有效期。"""
+        self._route_suggestion = (list(agents), time.time())
 
     def _pop_route_suggestion(self) -> str | None:
-        """读取未过期的判向目标建议（≤30s），过期清除。"""
+        """读取未过期的判向目标建议（≤30s）的第一位，过期清除。"""
         sug = getattr(self, "_route_suggestion", None)
         if not sug:
             return None
-        agent, ts = sug
+        agents, ts = sug
         if time.time() - ts > 30:
             self._route_suggestion = None
             return None
-        return agent
+        self._route_suggestion = (agents[1:], ts)
+        return agents[0] if agents else None
+
+    def _pop_route_suggestions(self) -> list:
+        """[T0 命令式 2026-09-08] 读取全部未过期判向目标（供 directive 一次附加多代理），过期清除。"""
+        sug = getattr(self, "_route_suggestion", None)
+        self._route_suggestion = None
+        if not sug:
+            return []
+        agents, ts = sug
+        if time.time() - ts > 30:
+            return []
+        return list(agents)
 
     async def _busy_bypass_check(self, event: AstrMessageEvent) -> bool:
         """[Busy Bypass 2026-08-31] 消息入口旁路：主代理正在干活（活跃 runner）时，
@@ -691,6 +766,41 @@ class RouterMixin:
         message = (event.get_message_str() or "").strip()
         if not message:
             return False
+        # [T0 命令式触发 2026-09-08 顾主指定] busy 场景同样启用 / 命令：
+        # 主代理正干活时，/<名A>、/<名A>+<名B> 等显式命令仍锁定并短路，不被 follow-up 吞。
+        cmd_agents, cmd_main = self._parse_agent_command(message)
+        if cmd_agents and not cmd_main:
+            logger.info(
+                f"[parallel_handoff] BusyBypass: T0 命令式 {cmd_agents} → "
+                f"锁定并短路（runner active 同样生效）"
+            )
+            calls = [{"agent_name": a, "input": message} for a in cmd_agents]
+            try:
+                await self.parallel_handoff(
+                    event,
+                    calls=calls,
+                    call_mode="chained" if len(calls) > 1 else "direct",
+                    route_mode="direct",
+                    mode="affection",
+                )
+            except Exception as e:
+                logger.error(
+                    f"[parallel_handoff] BusyBypass: T0 命令式调用失败 {e}; release to main"
+                )
+                return False
+            self._record_route_hits(event, cmd_agents)
+            event.stop_event()
+            return True
+        # 含主代理的命令（busy 时主代理在场优先，不短路子代理；记录粘滞后放行主代理）
+        if cmd_main:
+            if cmd_agents:
+                self._record_route_hits(event, cmd_agents)
+                self._record_route_suggestions(cmd_agents)
+            logger.info(
+                f"[parallel_handoff] BusyBypass: T0 命令式含主代理 → 放行主代理 "
+                f"(record lock for {cmd_agents})"
+            )
+            return False
         # 再次确认活跃 runner（filter 通过后可能已结束，兜底）
         if _ACTIVE_AGENT_RUNNERS is None or event.unified_msg_origin not in _ACTIVE_AGENT_RUNNERS:
             return False
@@ -713,6 +823,55 @@ class RouterMixin:
             except Exception as e:
                 logger.error(
                     f"[parallel_handoff] BusyBypass: 多点名接龙调用失败 {e}; release to main"
+                )
+                return False
+            event.stop_event()
+            return True
+        # [方案① 2026-09-07] 忙路旁路补 T0.5 粘滞多人组续接：
+        # 主代理 busy 时，多P场次的「继续做爱/再来」等无点名承接句也会被 follow-up 吞，
+        # 需在此（follow-up 捕获之前）按在场者组 chained 续接，不掉队、不靠手动调。
+        sticky_multi = self._t1_sticky_route(event, message)
+        if isinstance(sticky_multi, list) and len(sticky_multi) >= 2:
+            logger.info(
+                f"[parallel_handoff] BusyBypass: T0.5 粘滞多人组 {sticky_multi} → "
+                f"短路 chained 接龙（多P场次续接，runner active 不掉队）"
+            )
+            calls = [{"agent_name": a, "input": message} for a in sticky_multi]
+            try:
+                await self.parallel_handoff(
+                    event,
+                    calls=calls,
+                    call_mode="chained",
+                    route_mode="direct",
+                    mode="affection",
+                )
+            except Exception as e:
+                logger.error(
+                    f"[parallel_handoff] BusyBypass: 粘滞多人接龙调用失败 {e}; release to main"
+                )
+                return False
+            event.stop_event()
+            return True
+        # [方案① 2026-09-07] 忙路旁路补 T0.5 粘滞单人续接（与 _smart_router_check 对齐）
+        if isinstance(sticky_multi, str):
+            route = sticky_multi
+            if not self._mode_shortcut_decision(event, message, route):
+                logger.info(
+                    f"[parallel_handoff] BusyBypass: T0.5 route -> {route} "
+                    f"但模式配置要求放行主代理（统帅收卷/relay），不短路"
+                )
+                self._record_route_suggestion(route)
+                return False
+            self._record_route_hit(event, route)
+            logger.info(
+                f"[parallel_handoff] BusyBypass: T0.5 route -> {route} "
+                f"(runner active, skip follow-up capture)"
+            )
+            try:
+                await self.call_subagent(event, agent_name=route, input=message)
+            except Exception as e:
+                logger.error(
+                    f"[parallel_handoff] BusyBypass T0.5 direct call failed: {e}; release to main"
                 )
                 return False
             event.stop_event()
@@ -775,12 +934,58 @@ class RouterMixin:
         if not message:
             return False
         self._record_user_msg(event, message)
+        # [T0 命令式触发 2026-09-08 顾主指定] 以 / 开头的显式命令（如 /<名A>、/<名A>+<名B>、
+        # /助手C+助手A+助手D、/主代理+助手A）→ 直接锁定目标，最高优先级短路，
+        # 彻底跳过 T1 关键词猜测 / T0.5 粘滞 / T2 小模型。命令持续生效（写粘滞锁）。
+        cmd_agents, cmd_main = self._parse_agent_command(message)
+        if cmd_agents or cmd_main:
+            if cmd_agents and not cmd_main:
+                # 纯子代理命令：短路调度（单人或多人 chained），并把整组写入粘滞锁
+                logger.info(
+                    f"[parallel_handoff] SmartRouter: T0 命令式 {cmd_agents} → "
+                    f"锁定并短路（跳过 T1/T0.5/T2）"
+                )
+                calls = [{"agent_name": a, "input": message} for a in cmd_agents]
+                try:
+                    await self.parallel_handoff(
+                        event,
+                        calls=calls,
+                        call_mode="chained" if len(calls) > 1 else "direct",
+                        route_mode="direct",
+                        mode="affection",
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[parallel_handoff] SmartRouter: T0 命令式调用失败 {e}; release to main"
+                    )
+                    return False
+                self._record_route_hits(event, cmd_agents)
+                event.stop_event()
+                return True
+            # 含主代理（/主代理 或 /主代理+助手A）：主代理在场。
+            #   - agents 空 → 纯主代理，放行（返回 False）
+            #   - agents 非空 → 主代理调度子代理，放行主代理 + 暂存判向目标供 directive 附加
+            if cmd_agents:
+                logger.info(
+                    f"[parallel_handoff] SmartRouter: T0 命令式含主代理 + {cmd_agents} → "
+                    f"放行主代理并暂存候选子代理"
+                )
+                # 写粘滞锁：主代理+子代理共在场，后续无命令续接时子代理按锁调度
+                self._record_route_hits(event, cmd_agents)
+                self._record_route_suggestions(cmd_agents)
+            else:
+                logger.info(
+                    "[parallel_handoff] SmartRouter: T0 命令式 /主代理 → 纯主代理放行"
+                )
+                last, _ = self._route_mem()
+                last.pop(event.unified_msg_origin, None)
+            return False
         # [最高优先级 2026-09-03 顾主指定] 含连续「主代理」四字 → 无条件放行主代理（=主代理）。
         # 跳过 T1/T1.5/T2 全部判向，任何子代理都不得接管。返回 False 表示不短路、不 stop_event，
         # 消息自然落回主代理路径。登记路由历史防止 T1.5 后续承接接到子代理。
         if self._MAIN_TOKEN_RE.search(message):
             logger.info(
-                f"[parallel_handoff] SmartRouter: 消息含「主代理」→ 最高优先级放行主代理（不路由子代理）"
+                "[parallel_handoff] SmartRouter: 消息含「主代理」→ 最高优先级放行主代理（不路由子代理）"
             )
             # 清掉该会话的续接记忆，避免后续承接句被 T1.5 续给错误子代理
             last, _ = self._route_mem()

@@ -63,16 +63,19 @@ class DirectiveMixin:
             directive = self._build_route_directive(task_kind)
             if not directive:
                 return False
-            # [判向传递 2026-08-31] T1/T2 命中但裁决放行主代理时，把判向目标附加进指令，
+            # [判向传递 2026-08-31 / 2026-09-08] 命中但裁决放行主代理时，把判向目标附加进指令，
             # 避免"裁决放行 → 判向目标丢失 → 主代理调错人/不调子代理"的断链。
-            sug_agent = self._pop_route_suggestion()
-            if sug_agent:
+            # [2026-09-08 命令式增强] 支持多代理列表（/主代理+助手A+助手C → 全量附加）。
+            sug_agents = self._pop_route_suggestions()
+            if sug_agents:
                 display_map = self._get_name_display_map() or {}
-                sug_cn = display_map.get(sug_agent, sug_agent)
+                names = ", ".join(
+                    f"{display_map.get(a, a)}({a})" for a in sug_agents
+                )
                 directive += (
-                    f"\n- 路由目标建议（来自小模型路由层判向）：本条消息判定应优先路由给"
-                    f"【{sug_cn}】（agent id: {sug_agent}），请在其能力覆盖范围内优先调用该子代理"
-                    f"（可并行追加其他相关子代理），不要因模式配置而遗漏该判向目标"
+                    f"\n- 路由目标建议（来自命令式/判向层）：本条消息顾主显式点名/判定应优先路由给"
+                    f"【{names}】，请并行调度这些子代理（各取所长、可接龙），"
+                    f"不要遗漏任何一个判向目标"
                 )
             marker = "【路由强制指令·parallel_handoff】"
             parts = getattr(req, "extra_user_content_parts", None) or []
