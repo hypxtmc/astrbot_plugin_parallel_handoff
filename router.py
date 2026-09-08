@@ -465,6 +465,45 @@ class RouterMixin:
             self._route_reply = {}     # session -> (agent_id, ts, reply_tail)
         return self._route_last, self._route_msgs
 
+    def _record_cmd_lock(self, event, agents):
+        """[T0 命令式强制锁定 2026-09-08 博士指定] 记录会话级命令锁定在场者组。
+
+        命令锁定是独立于粘滞锁 _route_last 的最高权重强制锁：/年+夕 一经建立，
+        该会话直到被新命令或「普瑞赛斯」文本解除前，永远只跟锁定组对话。
+        与 _route_last 的区别：锁定组内出现任何其他子代理名都不会触发路由切换
+        （点名只是对话内容，不是目标），T1/T0.5/T2 全部失效。
+        """
+        if not hasattr(self, "_cmd_lock"):
+            self._cmd_lock = {}        # session -> {aid: ts}（命令强制在场者组）
+        disp_map = self._get_name_display_map() or {}
+        group = self._cmd_lock.setdefault(event.unified_msg_origin, {})
+        for raw in agents:
+            aid = raw
+            for _aid, cn in disp_map.items():
+                if str(cn) == raw or str(_aid) == raw:
+                    aid = _aid
+                    break
+            group[aid] = time.time()
+
+    def _cmd_locked_group(self, event):
+        """[T0 命令式 2026-09-08] 取命令锁定在场者组；无命令锁返回 None。
+
+        命令锁 = 最高权重强制锁，命中时 _smart_router_check 主流程直接短路，
+        跳过 T1/T0.5/T2 全部判向，彻底杜绝「对话里点其他子代理名」触发切换。
+        """
+        if not hasattr(self, "_cmd_lock"):
+            return None
+        grp = self._cmd_lock.get(event.unified_msg_origin)
+        if not grp:
+            return None
+        pool = self._router_agent_pool()
+        live = {a: ts for a, ts in grp.items() if a in pool}
+        if not live:
+            return None
+        if len(live) < 2:
+            return [next(iter(live.keys()))]
+        return list(live.keys())
+
     def _record_direct_reply(self, session_id: str, agent_name: str, reply_text: str):
         """记录该 session 最近一次子代理直发回复尾部（供 T2 剧情参照，避免承接句判失）。"""
         if not session_id or not agent_name or not reply_text:
@@ -788,11 +827,14 @@ class RouterMixin:
                     f"[parallel_handoff] BusyBypass: T0 命令式调用失败 {e}; release to main"
                 )
                 return False
-            self._record_route_hits(event, cmd_agents)
+            self._cmd_lock = {}
+            self._record_cmd_lock(event, cmd_agents)
             event.stop_event()
             return True
         # 含普瑞赛斯的命令（busy 时主代理在场优先，不短路子代理；记录粘滞后放行主代理）
         if cmd_presis:
+            if getattr(self, "_cmd_lock", None):
+                self._cmd_lock.pop(event.unified_msg_origin, None)
             if cmd_agents:
                 self._record_route_hits(event, cmd_agents)
                 self._record_route_suggestions(cmd_agents)
@@ -804,6 +846,30 @@ class RouterMixin:
         # 再次确认活跃 runner（filter 通过后可能已结束，兜底）
         if _ACTIVE_AGENT_RUNNERS is None or event.unified_msg_origin not in _ACTIVE_AGENT_RUNNERS:
             return False
+        # [T0 命令式强制锁定 2026-09-08 博士指定] busy 场景命令锁同样最高权重：
+        # 锁定到场者组按锁组路由，对话提及他名也不切换。
+        cmd_locked = self._cmd_locked_group(event)
+        if cmd_locked:
+            logger.info(
+                f"[parallel_handoff] BusyBypass: T0 命令强制锁在场组 {cmd_locked} → "
+                f"短路路由（runner active 也锁死，治本）"
+            )
+            calls = [{"agent_name": a, "input": message} for a in cmd_locked]
+            try:
+                await self.parallel_handoff(
+                    event,
+                    calls=calls,
+                    call_mode="chained" if len(calls) > 1 else "direct",
+                    route_mode="direct",
+                    mode="affection",
+                )
+            except Exception as e:
+                logger.error(
+                    f"[parallel_handoff] BusyBypass: T0 命令锁调用失败 {e}; release to main"
+                )
+                return False
+            event.stop_event()
+            return True
         # [多点名强呼叫短路 2026-09-07 方案A] 主代理 busy 时多点名同走 chained 接龙
         #（若非 runner active 分支，本方法不会走到；这里补上保证 busy 也不被 follow-up 吞）
         multi = self._t1_route_multi(message)
@@ -940,7 +1006,8 @@ class RouterMixin:
         cmd_agents, cmd_presis = self._parse_agent_command(message)
         if cmd_agents or cmd_presis:
             if cmd_agents and not cmd_presis:
-                # 纯子代理命令：短路调度（单人或多人 chained），并把整组写入粘滞锁
+                # 纯子代理命令：短路调度（单人或多人 chained），并写命令强制锁。
+                # 命令锁后续消息永远锁定这组，对话里出现其他子代理名也不切换（治本）。
                 logger.info(
                     f"[parallel_handoff] SmartRouter: T0 命令式 {cmd_agents} → "
                     f"锁定并短路（跳过 T1/T0.5/T2）"
@@ -959,12 +1026,16 @@ class RouterMixin:
                         f"[parallel_handoff] SmartRouter: T0 命令式调用失败 {e}; release to main"
                     )
                     return False
-                self._record_route_hits(event, cmd_agents)
+                # 写命令强制锁（会覆盖该会话旧命令锁）→ 此后 messages 按锁组强制路由
+                self._cmd_lock = {}
+                self._record_cmd_lock(event, cmd_agents)
                 event.stop_event()
                 return True
             # 含普瑞赛斯（/普瑞赛斯 或 /普瑞赛斯+阿米娅）：主代理在场。
-            #   - agents 空 → 纯主代理，放行（返回 False）
-            #   - agents 非空 → 主代理调度子代理，放行主代理 + 暂存判向目标供 directive 附加
+            #   - agents 空 → 纯主代理，放行并清除命令锁（博士回归主代理）
+            #   - agents 非空 → 主代理调度子代理，放行主代理 + 暂存判向目标
+            if getattr(self, "_cmd_lock", None):
+                self._cmd_lock.pop(event.unified_msg_origin, None)
             if cmd_agents:
                 logger.info(
                     f"[parallel_handoff] SmartRouter: T0 命令式含普瑞赛斯 + {cmd_agents} → "
@@ -987,11 +1058,39 @@ class RouterMixin:
             logger.info(
                 "[parallel_handoff] SmartRouter: 消息含「普瑞赛斯」→ 最高优先级放行主代理（不路由子代理）"
             )
-            # 清掉该会话的续接记忆，避免后续承接句被 T1.5 续给错误子代理
+            # 清掉该会话的续接记忆与命令锁，避免后续承接句被 T1.5 续给错误子代理
+            if getattr(self, "_cmd_lock", None):
+                self._cmd_lock.pop(event.unified_msg_origin, None)
             last, _ = self._route_mem()
             last.pop(event.unified_msg_origin, None)
             return False
         t0 = time.perf_counter()
+        # [T0 命令式强制锁定 2026-09-08 博士指定] 命令锁在场者组存在 → 该会话所有后续
+        # 消息直接按锁组路由（多人 chained / 单人 direct），T1 名字判定/T0.5 粘滞/T2
+        # 全部跳过——即使对话里点了其他子代理名（如「你对阿米娅的看法」），也只是
+        # 对话内容，绝不切换到阿米娅。只有新命令或「普瑞赛斯」文本能解除（上层已判）。
+        cmd_locked = self._cmd_locked_group(event)
+        if cmd_locked:
+            logger.info(
+                f"[parallel_handoff] SmartRouter: T0 命令强制锁在场组 {cmd_locked} → "
+                f"短路路由（对话提及他名不切换，治本）"
+            )
+            calls = [{"agent_name": a, "input": message} for a in cmd_locked]
+            try:
+                await self.parallel_handoff(
+                    event,
+                    calls=calls,
+                    call_mode="chained" if len(calls) > 1 else "direct",
+                    route_mode="direct",
+                    mode="affection",
+                )
+            except Exception as e:
+                logger.error(
+                    f"[parallel_handoff] SmartRouter: T0 命令锁调用失败 {e}; release to main"
+                )
+                return False
+            event.stop_event()
+            return True
         # [多点名强呼叫短路 2026-09-07 方案A] 一次明确点名多个子代理
         #（如「阿米娅，斯卡蒂，我们一起来玩」）→ 短路走 chained 接龙，
         # 主代理完全不下场（博士记忆#4：点几个名就几个延续、不插嘴）。

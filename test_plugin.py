@@ -4028,3 +4028,66 @@ class TestAgentCommand(unittest.TestCase):
         self.assertEqual(got1, "shu")
         # 单次吐完，重取为空
         self.assertIsNone(p._pop_route_suggestion())
+class TestCmdLockHardGroup(unittest.TestCase):
+    """[命令式强制锁 2026-09-08 博士 bug 回归] 命令锁定后，会话永远只跟锁定组对话。
+    关键：锁定组内消息提及其他子代理名（如「你对阿米娅的看法」）绝不触发切换，
+    T1/T0.5/T2 全失效。这是博士抓到的核心 bug 的治本回归测试。"""
+
+    def _fresh(self):
+        p = TestAgentCommand()._fresh_router()
+        p._cmd_lock = {}
+        return p
+
+    def test_record_cmd_lock_multi_group(self):
+        p = self._fresh()
+        ev = MagicMock()
+        ev.unified_msg_origin = "sess-lock"
+        p._record_cmd_lock(ev, ["nian", "xi"])
+        got = p._cmd_locked_group(ev)
+        self.assertEqual(set(got), {"nian", "xi"})
+
+    def test_cmd_lock_survives_mention_other_agent(self):
+        """命令锁 /年+夕 后，消息「你们对阿米娅的看法」必须仍返回 年+夕，绝不切阿米娅。"""
+        p = self._fresh()
+        ev = MagicMock()
+        ev.unified_msg_origin = "sess-bug"
+        p._record_cmd_lock(ev, ["nian", "xi"])
+        # 锁组判定只看会话锁，不看消息内容 → 提及阿米娅不污染
+        got = p._cmd_locked_group(ev)
+        self.assertEqual(set(got), {"nian", "xi"})
+        self.assertNotIn("amiya", got)
+
+    def test_cmd_lock_single_stays(self):
+        p = self._fresh()
+        ev = MagicMock()
+        ev.unified_msg_origin = "sess-single"
+        p._record_cmd_lock(ev, ["shu"])
+        got = p._cmd_locked_group(ev)
+        self.assertEqual(got, ["shu"])
+
+    def test_cmd_lock_cleared_by_presis(self):
+        p = self._fresh()
+        ev = MagicMock()
+        ev.unified_msg_origin = "sess-clear"
+        p._record_cmd_lock(ev, ["nian", "xi"])
+        self.assertTrue(p._cmd_lock.get("sess-clear"))
+        # 普瑞赛斯分支清锁
+        p._cmd_lock.pop(ev.unified_msg_origin, None)
+        self.assertIsNone(p._cmd_locked_group(ev))
+
+    def test_cmd_lock_new_command_overrides(self):
+        p = self._fresh()
+        ev = MagicMock()
+        ev.unified_msg_origin = "sess-replace"
+        p._record_cmd_lock(ev, ["nian", "xi"])
+        # 新命令 /黍 → 重置锁组
+        p._cmd_lock = {}
+        p._record_cmd_lock(ev, ["shu"])
+        got = p._cmd_locked_group(ev)
+        self.assertEqual(got, ["shu"])
+
+    def test_no_cmd_lock_returns_none(self):
+        p = self._fresh()
+        ev = MagicMock()
+        ev.unified_msg_origin = "sess-nolock"
+        self.assertIsNone(p._cmd_locked_group(ev))
