@@ -10,23 +10,56 @@ from astrbot.api.event import AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
 from astrbot.core.agent.tool import ToolSet
 
+try:  # 真实环境：包内相对导入
+    from ._lm_bridge import LivingMemoryBridge
+except ImportError:  # 单测环境：无 package，走绝对导入
+    from _lm_bridge import LivingMemoryBridge
+
 
 def _strip_chain_injection(text: str) -> str:
     """剥离接龙注入的前文块（临时上下文），避免污染子代理长期记忆。
 
     接龙模式（call_mode=chained）会把上一个子代理的输出注入下一个的
     input，这部分是临时上下文，不应进入本子代理的记忆召回/存储链路。
+    2026-09-07：注入升级为「全场脉络」（接龙·全场脉络），marker 同步扩展，
+    同时保留旧 marker（接龙·上一位）向后兼容。
     """
-    marker = "（接龙·上一位）"
-    if marker not in text:
+    # 兼容新旧注入前缀：新版「全场脉络」/ 旧版「上一位」都算临时上下文块起点
+    # 2026-09-08：新增跨轮续接注入块「上一场脉络」（首发者防失忆用），marker 同步扩展
+    markers = [
+        "（接龙·上一场脉络，你们还没散场）",
+        "（接龙·全场脉络，到目前为止）",
+        "（接龙·上一位）",
+    ]
+    # 兼容新旧结尾提示：新版固定尾「顺着全场的话茬自然往下：」/ 旧版「请接续上文，现在轮到你回应：」
+    # 跨轮续接尾「顺着上一场的话茬自然往下：」
+    end_markers = [
+        "顺着上一场的话茬自然往下：",
+        "顺着全场的话茬自然往下：",
+        "请接续上文，现在轮到你回应：",
+    ]
+    # 找到最早出现的注入前缀
+    hit_marker = None
+    hit_idx = -1
+    for m in markers:
+        i = text.find(m)
+        if i != -1 and (hit_idx == -1 or i < hit_idx):
+            hit_idx = i
+            hit_marker = m
+    if hit_marker is None:
         return text
-    idx = text.find(marker)
-    end_marker = "请接续上文，现在轮到你回应："
-    end = text.find(end_marker, idx)
+    # 从注入起点向后找结尾提示；找不到则截到注入起点为止
+    end = -1
+    end_len = 0
+    for em in end_markers:
+        e = text.find(em, hit_idx)
+        if e != -1 and (end == -1 or e < end):
+            end = e
+            end_len = len(em)
     if end == -1:
-        return text[:idx]
-    tail = text[end + len(end_marker):]
-    return text[:idx] + tail.lstrip("\n")
+        return text[:hit_idx]
+    # 剥掉 "注入起点 ~ 结尾提示整段"，只留结尾提示之后的真正输入
+    return text[:hit_idx] + text[end + end_len:].lstrip("\n")
 
 
 def _strip_ctx_injection(text: str) -> str:
@@ -71,6 +104,24 @@ class MemoryMixin:
             pass
         return livingmemory_plugin
 
+    # ── livingmemory 防腐层（2026-09-10 顾主拍板）──────────
+    def _lm_bridge(self, livingmemory_plugin):
+        """取（或复用）livingmemory 能力适配器，收敛全部私有路径访问。
+
+        livingmemory 的若干内部属性带下划线（event_handler._memory_recall.*、
+        command_handler._memory_processor 等），上游重构即断裂且原先只静默降级。
+        适配器统一做「版本探测 + 安全下钻 + 一次性告警」，按插件对象缓存，
+        保证同一进程内某项能力缺失的 WARN 只出现一次。
+        """
+        if livingmemory_plugin is None:
+            return None
+        cached = getattr(self, "_lm_bridge_cache", None)
+        if cached is not None and cached.plugin is livingmemory_plugin:
+            return cached
+        bridge = LivingMemoryBridge(livingmemory_plugin, logger=logger)
+        self._lm_bridge_cache = bridge
+        return bridge
+
     # ── 记忆召回：注入长期记忆 ──
     async def _memory_recall(
         self,
@@ -88,22 +139,24 @@ class MemoryMixin:
             try:
                 # livingmemory 未就绪时其 handle_memory_recall 会静默短路，
                 # 这里先快查初始化状态，区分「插件未就绪」与「确实无记忆」，
-                # 且不等其内部最长 30s 的初始化轮询，避免拖慢子代理调用
-                initializer = getattr(livingmemory_plugin, "initializer", None)
-                if initializer is not None:
-                    if getattr(initializer, "is_failed", False):
+                # 且不等其内部最长 30s 的初始化轮询，避免拖慢子代理调用。
+                # 2026-09-10：初始化探测收敛到 _lm_bridge（防腐层），行为不变。
+                bridge = self._lm_bridge(livingmemory_plugin)
+                healthy, detail = bridge.health()
+                if not healthy:
+                    initializer = getattr(livingmemory_plugin, "initializer", None)
+                    if detail == "init_failed":
                         logger.warning(
                             f"[parallel_handoff] livingmemory 初始化失败，跳过 "
                             f"{agent_name} 记忆召回: "
                             f"{getattr(initializer, 'error_message', 'unknown')}"
                         )
-                        return []
-                    if not getattr(initializer, "is_initialized", False):
+                    else:
                         logger.warning(
                             f"[parallel_handoff] livingmemory 未就绪（初始化中），"
                             f"跳过 {agent_name} 记忆召回"
                         )
-                        return []
+                    return []
 
                 # 2026-09-05 记忆串库修复：召回改走子代理专属会话桩。
                 # livingmemory 按 session+persona 双条件过滤，存储侧拆专属会话后
@@ -114,7 +167,10 @@ class MemoryMixin:
                     prompt=clean_input,
                     extra_user_content_parts=[],
                 )
-                await livingmemory_plugin.handle_memory_recall(stub, req)
+                recall_api = bridge.recall_api()
+                if recall_api is None:
+                    return []
+                await recall_api(stub, req)
 
                 # 保留记忆注入内容，透传给子代理的 provider
                 parts = list(req.extra_user_content_parts or [])
@@ -370,15 +426,12 @@ class MemoryMixin:
         子代理自己的独立长期记忆库。任何失败只记日志不抛出。
         """
         try:
-            ch = getattr(livingmemory_plugin, "command_handler", None)
-            if ch is None:
+            # 2026-09-10：私有路径访问收敛到 _lm_bridge 防腐层。
+            # 缺件时一次性 WARN 并附 livingmemory 版本号，不再静默返回。
+            kit = self._lm_bridge(livingmemory_plugin).reflection_kit()
+            if not kit:
                 return
-            cm = getattr(ch, "conversation_manager", None)
-            mp = getattr(ch, "_memory_processor", None)
-            me = getattr(ch, "memory_engine", None)
-            cfg = getattr(ch, "config_manager", None)
-            if not (cm and mp and me and cfg):
-                return
+            cm, mp, me, cfg = kit
 
             session_id = stub.unified_msg_origin
             count = await cm.store.get_message_count(session_id)
@@ -500,10 +553,11 @@ class MemoryMixin:
         if livingmemory_plugin:
             try:
                 stub = self._subagent_event_stub(event, agent_name)
-                conv_mgr = (
-                    livingmemory_plugin
-                    .event_handler._memory_recall.conversation_manager
-                )
+                # 2026-09-10：私有路径访问收敛到 _lm_bridge 防腐层
+                bridge = self._lm_bridge(livingmemory_plugin)
+                conv_mgr = bridge.conversation_manager()
+                if conv_mgr is None:
+                    return
                 # 2026-08-31 修复：存储前剥离 ctx_engine 跨轮历史块，只存本轮干净输入
                 clean_input = self._strip_chain_injection(
                     self._strip_ctx_injection(final_input)
@@ -514,11 +568,11 @@ class MemoryMixin:
                 await conv_mgr.add_message_from_event(
                     stub, role="assistant", content=raw_response
                 )
-                await (
-                    livingmemory_plugin
-                    .event_handler._memory_recall.message_utils
-                    .enforce_message_limit(stub.unified_msg_origin)
-                )
+                message_utils = bridge.message_utils()
+                if message_utils is not None:
+                    await message_utils.enforce_message_limit(
+                        stub.unified_msg_origin
+                    )
                 # 达到总结阈值时按子代理 persona 提炼长期记忆
                 await self._maybe_reflect_subagent(
                     livingmemory_plugin, stub, agent_name
