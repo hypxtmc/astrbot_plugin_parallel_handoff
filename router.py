@@ -621,6 +621,10 @@ class RouterMixin:
         """记录本次成功路由（供粘滞锁定续接：点名建立/切换后一路沿用）。
         2026-09-07 方案A：记录即会话锁定，久聊不释放；由新点名或普瑞赛斯令牌覆盖/清除。
         2026-09-07 方案①：并入「在场者组」（session -> {aid: ts}），同名归一化。
+        2026-09-09 博士 bug 治本（点名=换组）：单点名命中 → 覆盖在场者组为仅此一人。
+        旧实现是并入（group[aid]=ts 不清旧成员），导致锁 nian+xi 后自然语言点「斯卡蒂」
+        被 T1 当单点名追加进旧组变 3P，而不是换锁成斯卡蒂。博士心智：点名谁就是谁，
+        新点名重定义在场者组，旧成员退出。无点名承接句才沿用原组（见 _t1_sticky_route）。
         """
         last, _ = self._route_mem()
         # 名字显示映射：存稳定 agent id 便于池校验与切回
@@ -630,24 +634,40 @@ class RouterMixin:
             if str(cn) == agent or str(_aid) == agent:
                 aid = _aid
                 break
-        group = last.setdefault(event.unified_msg_origin, {})
-        group[aid] = time.time()
+        group = last.get(event.unified_msg_origin, {})
+        if aid in group:
+            # [3P 保组 2026-09-09] 点名者是旧在场者组成员（如 3P 中点"年"）→ 只刷新
+            # 时间戳、不拆散整组。多P场次后续无点名消息仍按整组 chained 续接不掉队
+            # （记忆#4 Bug B 修复语义，防 regression）。
+            group[aid] = time.time()
+            return
+        # [点名=换锁 2026-09-09 博士 bug 治本] 单点名命中新面孔 → 覆盖在场者组为仅此
+        # 一人。旧实现是并入（group[aid]=ts 不清旧成员），导致锁 nian+xi 后自然语言点
+        # 「斯卡蒂」被 T1 当单点名追加进旧组变 3P，而不是换锁成斯卡蒂（博士 2026-09-09
+        # 报：锁斯卡蒂失效，还是锁在年+夕身上）。博士心智：点名新面孔 = 换锁到 TA，
+        # 旧在场者退出；点名在场者 = 只是跟 TA 说话，不拆 3P。
+        last[event.unified_msg_origin] = {aid: time.time()}
 
     def _record_route_hits(self, event: AstrMessageEvent, agents) -> None:
-        """[方案① 2026-09-07] 把一整组在场者并入粘滞记忆（多P场次用）。
+        """[方案① 2026-09-07] 把一整组在场者写入粘滞记忆（多P场次用）。
 
         行内注意：agents 可为 list/tuple 等多点名返回值，统一并入同组。
+        2026-09-09 博士 bug 治本（点名=换组）：整组覆盖写入，清掉旧在场者。
+        与 _record_route_hit 对齐——多点名（如「阿米娅，斯卡蒂，一起来玩」）就是
+        重新定义在场者组；若沿用并入，则「年+夕」后再点「阿米娅+斯卡蒂」会变成
+        4P 而博士心智是要换到新组。
         """
         last, _ = self._route_mem()
         disp_map = self._get_name_display_map() or {}
-        group = last.setdefault(event.unified_msg_origin, {})
+        fresh = {}
         for raw in agents:
             aid = raw
             for _aid, cn in disp_map.items():
                 if str(cn) == raw or str(_aid) == raw:
                     aid = _aid
                     break
-            group[aid] = time.time()
+            fresh[aid] = time.time()
+        last[event.unified_msg_origin] = fresh
 
     def _t1_mentions(self, message: str) -> set:
         """返回消息中出现过的所有子代理名集合（仅供 T1.5 防误续，维度与 T1 名称判定一致）。"""

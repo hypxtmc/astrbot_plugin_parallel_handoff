@@ -4142,3 +4142,72 @@ class TestShortcircuitDedup(unittest.TestCase):
         self.assertFalse(p._dedup_shortcircuit(a1, "继续做爱"))
         # B 会话同文本首条，不受 A 影响
         self.assertFalse(p._dedup_shortcircuit(b1, "继续做爱"))
+
+class TestSwitchLockOnNewMention(unittest.TestCase):
+    """[点名=换锁 2026-09-09 博士 bug 回归] 命令/粘滞锁锁定 nian+xi 后，再点名
+    新面孔 skadi（自然语言「斯卡蒂」）→ 必须换锁成 skadi，而不是被并入 3P。
+    同时：3P 中点点名在场者（nian）→ 不拆散 3P（保组，防记忆#4 Bug B regression）。"""
+
+    def _fresh_router(self):
+        from test_plugin import TestCmdLockHardGroup as _base
+        return _base()._fresh()
+
+    def _plain_event(self, msg, umo="sess-switch"):
+        ev = MagicMock()
+        ev.unified_msg_origin = umo
+        ev.get_message_str.return_value = msg
+        ev.stop_event = MagicMock()
+        ev.message_str = msg
+        return ev
+
+    def _pool(self, p):
+        return {"nian": "年", "xi": "夕", "skadi": "斯卡蒂", "amiya": "阿米娅", "theresia": "特蕾西娅"}
+
+    def test_new_face_switches_lock_group(self):
+        """核心 bug：锁 {nian,xi} 后单点名 skadi（新面孔）→ 换锁成 {skadi}"""
+        p = self._fresh_router()
+        p._router_agent_pool = lambda: self._pool(p)
+        ev = self._plain_event("年+夕，来做爱3p吧")
+        p._record_route_hits(ev, ["nian", "xi"])
+        last, _ = p._route_mem()
+        self.assertEqual(set(last[ev.unified_msg_origin].keys()), {"nian", "xi"})
+        # 博士再点名斯卡蒂（自然语言，非斜杠命令）
+        ev2 = self._plain_event("斯卡蒂", "sess-switch")
+        p._record_route_hit(ev2, "skadi")
+        last2, _ = p._route_mem()
+        # 治本断言：不是并入成 {nian,xi,skadi}，而是换锁成 {skadi}
+        self.assertEqual(set(last2[ev.unified_msg_origin].keys()), {"skadi"})
+
+    def test_in_group_mention_keeps_3p(self):
+        """3P 中点点名在场者（nian）→ 保组 {nian,xi} 不拆散（记忆#4 Bug B regression）"""
+        p = self._fresh_router()
+        p._router_agent_pool = lambda: self._pool(p)
+        ev = self._plain_event("年+夕，来做爱3p吧")
+        p._record_route_hits(ev, ["nian", "xi"])
+        # 3P 进行中夸年一句
+        ev2 = self._plain_event("年，你好会亲", "sess-switch")
+        p._record_route_hit(ev2, "nian")
+        last2, _ = p._route_mem()
+        self.assertEqual(set(last2[ev.unified_msg_origin].keys()), {"nian", "xi"})
+
+    def test_multi_mention_redefines_group(self):
+        """多点名整组覆盖：{nian,xi} 后点 {amiya,skadi} → 换组为 {amiya,skadi}"""
+        p = self._fresh_router()
+        p._router_agent_pool = lambda: self._pool(p)
+        ev = self._plain_event("年+夕，来做爱3p吧")
+        p._record_route_hits(ev, ["nian", "xi"])
+        ev2 = self._plain_event("阿米娅，斯卡蒂，一起来玩", "sess-switch")
+        p._record_route_hits(ev2, ["amiya", "skadi"])
+        last2, _ = p._route_mem()
+        self.assertEqual(set(last2[ev.unified_msg_origin].keys()), {"amiya", "skadi"})
+
+    def test_sticky_after_switch_returns_new_face(self):
+        """换锁 skadi 后，无点名承接消息 → 粘滞返回 skadi 单人（不再拉起 3P）"""
+        p = self._fresh_router()
+        p._router_agent_pool = lambda: self._pool(p)
+        ev = self._plain_event("年+夕，来做爱3p吧")
+        p._record_route_hits(ev, ["nian", "xi"])
+        ev2 = self._plain_event("斯卡蒂", "sess-switch")
+        p._record_route_hit(ev2, "skadi")
+        sticky = p._t1_sticky_route(ev2, "继续聊")
+        self.assertEqual(sticky, "skadi")
