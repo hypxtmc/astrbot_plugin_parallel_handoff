@@ -4,6 +4,9 @@
 T2 无剧情参照，两人话被腰斩到主代理（00:12:01 事件）。本用例锁定两类修复：
 1. T1.5 词表扩充：情话承接类短句剥离后无残留 → 时间窗内直接续上次对象
 2. T2 参照注入：_record_direct_reply 记录直发回复尾部，_last_direct_reply 可回读
+
+2026-09-10 维护：T1.5 已于 2026-09-07 方案A 升级为 T0.5 会话级硬锁定，
+入口方法更名 _t15_continue_route → _t1_sticky_route（本文件同步对齐，见下方注释）。
 """
 import asyncio
 import re
@@ -55,7 +58,7 @@ class TestT15LoveWords(unittest.TestCase):
         self._route_once_to_theresia(p, sid)
         ev = MagicMock()
         ev.unified_msg_origin = sid
-        return p._t15_continue_route(ev, msg)
+        return p._t1_sticky_route(ev, msg)
 
     def test_let_me_feel_good(self):
         """'让我舒服起来' → 续 theresia"""
@@ -81,18 +84,31 @@ class TestT15LoveWords(unittest.TestCase):
         """'爱你呀' → 续 theresia（尾字语气词不影响剥离）"""
         self.assertEqual(self._t15("爱你呀"), "theresia")
 
-    def test_long_sentence_still_rejected(self):
-        """超过 40 字情话不进 T1.5（长度门槛兜底，防误接普通长句）"""
+    # ── 以下 3 例原为旧 T1.5「词表剥离 + 长度门槛 + 实词残留拒绝」契约。
+    # 2026-09-07 方案A 已把 T1.5 升级为 T0.5 会话级硬锁定（_t1_sticky_route），
+    # 博士明确指定「点名后一路粘着，久聊不释放」——续接不再按消息内容判定，
+    # 故契约随设计变更：锁定态下这些消息仍续接（真技术请求由 directive 层
+    # _classify_directive_task 的 tech 分类先行兜底）。测试同步锁定新语义。
+
+    def test_long_sentence_still_sticky(self):
+        """硬锁定下超长消息不再按长度释放（旧 40 字门槛已废）"""
         long_msg = "好，让我舒服起来，爱你，然后我们一起去吃火锅，再去看电影"
-        self.assertIsNone(self._t15(long_msg))
+        self.assertEqual(self._t15(long_msg), "theresia")
 
-    def test_plain_statement_not_continue(self):
-        """'爱你是我的自由' 有实词残留 → 不进 T1.5"""
-        self.assertIsNone(self._t15("爱你是我的自由"))
+    def test_plain_statement_still_sticky(self):
+        """硬锁定下含实词不释放续接（旧实词残留判定已废）"""
+        self.assertEqual(self._t15("爱你是我的自由"), "theresia")
 
-    def test_business_sentence_not_continue(self):
-        """'想要那份报表' 有实词残留 → 不进 T1.5"""
-        self.assertIsNone(self._t15("想要那份报表"))
+    def test_business_sentence_still_sticky(self):
+        """硬锁定下正事句也续接（真技术请求由 directive 层 tech 分类兜底）"""
+        self.assertEqual(self._t15("想要那份报表"), "theresia")
+
+    def test_no_lock_returns_none(self):
+        """未锁定会话时普通句不续接（防误接覆盖，替代旧词表剥离防线）"""
+        p = self._fresh_router()
+        ev = MagicMock()
+        ev.unified_msg_origin = "sess-unlocked"
+        self.assertIsNone(p._t1_sticky_route(ev, "想要那份报表"))
 
 
 class TestT2ReplyRef(unittest.TestCase):
