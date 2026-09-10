@@ -137,6 +137,13 @@ class ArbitrationMixin:
 
 **段四·回归+部署**：全量 test_arbitrate.py + test_plugin.py 过，`py_compile` 三查，`hot_reload_plugin` 上线。顾主验收四类场景：点名、群聊杂谈、承接句、多人并行。
 > 🔧 段四回归+部署已完成（2026-09-03 14:3x）：py_compile 三查通过；test_plugin.py 全量 **112 passed**（含 9 个读空气测试）；total 126=112+旧归档 test_plugin_20260822(14，非本次验收)；hot_reload 生效、插件 v2.3.0 正常加载、日志无异常。
+
+> 🔧 **段五·宁静权落地 + 两条死规则修复**（2026-09-10）：深挖发现段二落地时 R1/R4 两条规则**从未生效过**——
+> ① R1 依赖 `last_speaker == MAIN_SPEAKER`，而 `_presence_update` 全库只在 dispatch 子代理转发后被调用一次，**主代理回复从不入册**（`MAIN_SPEAKER` 一次都没写入过）；
+> ② R4 嵌在 R2 的无条件 `return True` 之前，两条 return 结果相同、判定白算，是死代码；且判据键名 `main` 与主代理真实记录键 `MAIN_SPEAKER("__main__")` 不一致，`c_main` 恒为 0。
+> 修复：**a.** forward.py 的 `on_decorating_result` 出口新增 `_presence_mark_main`，补齐主代理发言入册（R1/R4 唯一数据来源；主代理静默场景不入册，避免污染 `last_speaker`）；**b.** R4 提到 R2 之前独立判定 + 键名对齐 `MAIN_SPEAKER`；**c.** 新增二级闸门 `read_air_enforce`（默认 false）——false=段二 observe-only、行为零变化，true=宁静权**真实拦截**：`_arbitrate_directive` 返 `"main"` → `_smart_router_check` 清承接记忆 + 放行主代理自然接住（R6 约定：拦截必清 `_route_mem`，否则下一轮 T0.5 粘滞按旧在场者组又把同组续上，拦截形同虚设）。回退只需置 false，无需改码。
+> 验证：`test_plugin.py` 全量 **278 passed**（基线 272，零回归；新增 6 个读空气测试）。顺手治本一处**测试隔离缺陷**：`_presences` 是 mixin 类属性、跨测试实例共享，而全类测试共用同一 session key `"sess-readair"`，导致断言结果依赖执行顺序（新增测试改变字母序后即暴露）——现于 `_fresh_plugin` 内 `clear()`，每个测试从干净状态起步。
+> ⚠️ 旧测试 `test_read_air_quiet_on_old_rivalry` 用手工 `record("main", ...)` 造数据，**测试绿但生产从不写入该键** —— 属"假测试掩盖真实缺陷"，已由 `test_read_air_r4_fires_with_real_main_key`（用真实键 `MAIN_SPEAKER`）覆盖补齐。
 > 顾主四类场景验收需真实环境触发（点名/群聊杂谈/承接句/多人并行）→ 开关默认 False，三期补齐后一起实验性开启。
 
 ---

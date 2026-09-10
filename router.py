@@ -1236,9 +1236,22 @@ class RouterMixin:
         # 等三期随机性日常补齐后再实验性开启真实克制。总开关默认关，此调用零开销。
         try:
             if hasattr(self, "_arbitrate_directive") and self._read_air_enabled():
-                self._arbitrate_directive(event, message, route, True)
+                _ra_verdict = self._arbitrate_directive(event, message, route, True)
+                if _ra_verdict == "main":
+                    # [段五 2026-09-10] 宁静权【真实拦截】入口（仅 read_air_enforce=True 时可达）：
+                    # 读空气倾向克制 → 放行主代理自然接住，不短路抢派子代理。
+                    # R6 约定（docs/read_air_arbitrate_plan.md）：拦截必清承接记忆，否则下一轮
+                    # T0.5 粘滞路由会按旧在场者组把同一组又续上，拦截形同虚设。
+                    # 注意 _record_route_hit 已在上面执行，此处清理是配套动作、不可省。
+                    _ra_last, _ = self._route_mem()
+                    _ra_last.pop(event.unified_msg_origin, None)
+                    logger.info(
+                        f"[read_air][enforce] 宁静权拦截：本应短路 {route}，"
+                        f"改放行主代理自然接住（已清承接记忆）"
+                    )
+                    return False
         except Exception as _arb_e:
-            logger.warning(f"[read_air] arbitrate observe skipped (non-fatal): {_arb_e}")
+            logger.warning(f"[read_air] arbitrate skipped (non-fatal): {_arb_e}")
         logger.info(
             f"[parallel_handoff] SmartRouter: {source} route -> {route} "
             f"(conf={conf:.2f}, thr={self._router_threshold()}, "

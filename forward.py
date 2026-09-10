@@ -13,6 +13,12 @@ from astrbot.api.event import AstrMessageEvent
 from astrbot.core.message.components import Plain
 from astrbot.core.message.message_event_result import MessageChain, ResultContentType
 
+# 读空气·段五：主代理虚拟发言人标记（双分支导入，对齐 main.py try/except 哲学）
+try:
+    from .arbitrate import MAIN_SPEAKER
+except ImportError:
+    from arbitrate import MAIN_SPEAKER
+
 # 怀孕插件文本自动识别接入（可选依赖：baby 插件未加载时静默跳过）
 # 运行时插件挂载在 data.plugins 前缀下；顶层包名仅作兼容兜底
 # 懒加载：首次实际分发时才探测 import，规避插件/热重载加载顺序不可控
@@ -944,6 +950,26 @@ class ForwardMixin:
             return f"【{display_name}】\n{message}"
         return message
 
+    # ── 读空气·段五：主代理发言入册（复活 R1/R4 两条死规则）─────
+    def _presence_mark_main(self, event: AstrMessageEvent, text: str = "") -> None:
+        """记录「主代理刚说过话」到在场状态（读空气 R1/R4 的唯一数据来源）。
+
+        [段五 2026-09-10] 根因：_presence_update 全库只在 dispatch 子代理转发后
+        被调用一次，主代理回复从未入册 → MAIN_SPEAKER("__main__") 从未写入 ——
+        R1（last_speaker 是主代理→倾向克制）恒为 False，R4（旧怨组密集互抛）
+        c_main 恒为 0，两条规则写了但从未生效过。
+
+        本方法挂在 on_decorating_result 出口（主代理消息发出前唯一必经点）补齐记录。
+        异常一律吞掉：状态记录绝不能影响发送主流程（安全优先）。
+        """
+        try:
+            updater = getattr(self, "_presence_update", None)
+            if updater is None:  # 单模块测试场景（ArbitrationMixin 未混入）静默跳过
+                return
+            updater(event, MAIN_SPEAKER, "main", text or "")
+        except Exception as e:
+            logger.debug(f"[read_air] mark main presence failed (non-fatal): {e}")
+
     # ── 主代理前缀自动注入（on_decorating_result 钩子实现）───
     async def _inject_mainagent_prefix(self, event: AstrMessageEvent):
         """在主代理消息发出前自动加【名字】前缀
@@ -960,6 +986,29 @@ class ForwardMixin:
         让流式那句作为唯一最终结果。子代理直发走独立链路（dispatch 直调
         _forward_segmented），不经本钩子，故不受流式影响仍完美工作。
         """
+        # [读空气·段五 2026-09-10] 主代理发言入册（复活 R1/R4，详见 _presence_mark_main）。
+        # 必须在流式守卫之前——流式终态会 early return，那之后就没机会记了。
+        # 主代理静默场景（分段转发已直发+链将被清空）不入册，避免污染 last_speaker。
+        try:
+            _pa_result = event.get_result()
+            _pa_text = ""
+            if _pa_result is not None and hasattr(_pa_result, "chain") and _pa_result.chain:
+                _pa_text = " ".join(
+                    getattr(_c, "text", "") or "" for _c in _pa_result.chain
+                )
+            _pa_stream = (
+                _pa_result is not None
+                and getattr(_pa_result, "result_content_type", None)
+                == ResultContentType.STREAMING_FINISH
+            )
+            _pa_suppressed_silent = (
+                getattr(self, "_suppress_mainagent_prefix", False)
+                and not self._cfg("allow_mainagent_after_direct", True)
+            )
+            if not _pa_suppressed_silent and (_pa_text.strip() or _pa_stream):
+                self._presence_mark_main(event, _pa_text)
+        except Exception as _pa_e:
+            logger.debug(f"[read_air] main presence hook skipped (non-fatal): {_pa_e}")
         # [流式守卫 2026-08-20] 流式终态必须让位：流式通道已把整段文本吐给用户，
         # 钩子此刻若再 event.send 分段重发，必然与流式已发内容重复/乱序。
         # 直接 return（既不 event.send 也不改 chain），把发送权完整交还流式通道。

@@ -179,6 +179,12 @@
         "default": 120,
         "hint": "压缩时保留原文开头和结尾各 N 个字符，中间用摘要衔接，兼顾剧情连贯与上下文压缩。"
     },
+    "enable_chain_memory_persist": {
+        "description": "3P/4P 接龙整场记忆沉淀开关",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，接龙模式（3P/4P）结束时把整场剧情按各角色各自视角沉淀进各角色 livingmemory（每人一份主观视角，可自由回忆，日常不跳脸）。关闭则 3P 剧情不留长期记忆，仅当场临时上下文（仍不污染日常）。"
+    },
     "enable_route_directive": {
         "description": "启用路由强制指令注入（OnLLMRequestEvent 钩子）",
         "type": "bool",
@@ -232,6 +238,12 @@
         "type": "bool",
         "default": false,
         "hint": "开启后在自动路由犹豫点做「宁静权」克制（群聊杂谈/弱路由时让主代理自然接住，而非逢消息就抢派子代理）。默认关=零行为变化。绝不拦顾主明确点名的人（点名神圣不可侵）。"
+    },
+    "read_air_enforce": {
+        "description": "读空气·真实拦截开关（宁静权落地闸门）",
+        "type": "bool",
+        "default": false,
+        "hint": "二级闸门，仅在总开关 enable_read_air_arbitrate 开启后才有意义。false=段二观察模式，只打「想不想克制」日志、绝不改路由（零行为变化）；true=宁静权真实拦截：读空气倾向克制时放行主代理自然接住，并同步清掉承接记忆（防 T0.5 粘滞把同组续上）。回退只需置回 false，无需改码。"
     },
     "enable_daily_random_life": {
         "description": "子代理今日随机生活状态注入",
