@@ -622,6 +622,56 @@ class DispatchMixin:
             }
 
     # ── 核心 tool 实现（装饰器 @llm_tool 在 main.py 壳方法上） ──
+    # ── 接龙长回复精简（2026-09-10 补实现） ──
+    async def _summarize_chain_reply(
+        self, display_name: str, text: str, provider_id: str, timeout: float = 120
+    ) -> str:
+        """把接龙中上一位的长回复压成「开头 + 中段摘要 + 结尾」。
+
+        与 _conf_schema 的 chain_summary_* 四项配置配套：中段交模型摘要，首尾各
+        保留 chain_summary_keep_head_tail 字符保剧情连贯（语气、动作、话头都在
+        尾部，砍掉下一位接不住）。两级降级：模型不可用/超时 → 纯首尾截断；
+        文本本身够短 → 原样返回。任何情况都返回可用文本，不向调用方抛异常
+        （旧版只有调用点没有实现，接龙每轮打一条 WARN 后原样注入，开关形同虚设）。
+        """
+        try:
+            keep = int(self._cfg("chain_summary_keep_head_tail", 120) or 120)
+        except Exception:
+            keep = 120
+        keep = max(0, keep)
+        body = str(text or "")
+        # 首尾保留之后剩不下多少中段 → 压缩收益为负，原样返回
+        if keep * 2 >= len(body) - 40:
+            return body
+
+        head, mid, tail = body[:keep], body[keep:-keep], body[-keep:]
+        summary = ""
+        if provider_id and mid.strip():
+            try:
+                resp = await asyncio.wait_for(
+                    self.context.llm_generate(
+                        chat_provider_id=provider_id,
+                        prompt=(
+                            f"压缩下面这段【{display_name}】的发言，不超过"
+                            f"{max(80, len(mid) // 4)}字，只保留剧情走向、情绪和"
+                            f"对方必须接住的信息。不要评价，不要扩写，直接输出梗概：\n\n{mid}"
+                        ),
+                        system_prompt=(
+                            "你是剧情压缩器。只做无损要点提炼，"
+                            "不添加原文没有的信息，不输出任何解释。"
+                        ),
+                    ),
+                    timeout=min(float(timeout or 60), 60),
+                )
+                summary = (getattr(resp, "completion_text", "") or "").strip()
+            except Exception as e:
+                logger.debug(
+                    f"[parallel_handoff] 接龙摘要调用失败，降级首尾截断: {e}"
+                )
+        if summary:
+            return f"{head}\n……（中段 {len(mid)} 字，压缩为）{summary}……\n{tail}"
+        return f"{head}\n……（中段 {len(mid)} 字略）……\n{tail}"
+
     async def parallel_handoff(
         self,
         event: AstrMessageEvent,
@@ -757,44 +807,70 @@ Args:
             # 流式转发：每条完成后立刻发送（direct 直接发/失败立刻通知），
             # 无需等整条链跑完；失败的子代理在链上标注，下一个能看到谁掉队。
             results = []
+            # ── 跨轮 3P 续接：首发者防失忆（2026-09-08 博士实测）──────
+            # 上一轮 chained 结束把「在场者+各自发言」按 session 存入 _chain_round_ctx。
+            # 本轮若与上轮在场者有交集（续接场景），把上轮脉络注入首发者 input，
+            # 让她知道「年上轮说了什么、年还在场」——否则首发者只凭自己记忆召回，
+            # 会把不在场的人叫进来（实测：夕把阿米娅拉来、年变局外人）。
+            _sess = event.unified_msg_origin
+            _prev_note = self._build_prev_round_note(
+                _sess, [c.get("agent_name") for c in calls]
+            )
+            # ── 全场剧情脉络（2026-09-07 修复3P/4P自说自话）──────────
+            # 原 chained 只把上一位回复注入下一位（results[-1]），多人联动时
+            # 丙只看乙、丁只看丙，看不见博士原话和更早的发言 → 各编各的。
+            # 这里维护 transcript：博士原话(首行) + 到目前为止所有成功发言，
+            # 每轮注入"全场脉络"而非只见上家，让每个角色接得住全场的话茬。
+            # 变量是本方法局部作用域：一场 parallel_handoff 结束即销毁，
+            # 3P 结束后绝无残留注入（配合 memory.py _strip_chain_injection 剥离）。
+            transcript_blocks = []
+            if message and str(message).strip():
+                transcript_blocks.append(f"▍博士：{str(message).strip()}")
             for i, c in enumerate(calls):
-                if i > 0 and results:
-                    prev = results[-1]
+                # ── 跨轮续接：首发者（i==0）也要看上一轮脉络 ──
+                # chained 默认只把前面人的回复注入后面人，i==0 的首发者无注入；
+                # 多P续接场景（第二轮继续做爱）她必须知道上轮每个人的发言，
+                # 否则只能凭长期记忆瞎召回 → 拉错人（阿米娅乱入、年被晾）。
+                if i == 0 and _prev_note:
                     c = dict(c)
-                    prev_display = self._display_name(prev.get("agent_name", ""))
-                    if prev.get("success"):
-                        prev_text = prev.get('response', '')
-                        chain_note = (
-                            f"（接龙·上一位）【{prev_display}】的回复：\n"
-                            f"{prev_text}\n\n"
-                            f"请接续上文，现在轮到你回应："
-                        )
-                        # ── 接龙长回复精简：开关开启且超阈值 → 摘要+首尾 ──
-                        summary_enabled = bool(self._cfg("chain_summary_enabled", True))
-                        threshold = int(self._cfg("chain_summary_threshold", 600))
-                        if summary_enabled and len(prev_text) > threshold:
-                            try:
-                                summary_prov = str(self._cfg("chain_summary_model", "") or "").strip()
-                                if not summary_prov:
-                                    summary_prov = await self.context.get_current_chat_provider_id(
-                                        event.unified_msg_origin
+                    c["input"] = _prev_note + (c.get("input") or "")
+                if i > 0 and results:
+                    c = dict(c)
+                    # 重建全场：博士原话 + 当前角色前所有成功/失败发言（每人标注是谁说的）
+                    transcript_blocks_cur = list(transcript_blocks)
+                    for prev in results:
+                        prev_display = self._display_name(prev.get("agent_name", ""))
+                        if prev.get("success"):
+                            prev_text = prev.get('response', '')
+                            # ── 接龙长回复精简：开关开启且超阈值 → 摘要+首尾 ──
+                            summary_enabled = bool(self._cfg("chain_summary_enabled", True))
+                            threshold = int(self._cfg("chain_summary_threshold", 600))
+                            if summary_enabled and len(prev_text) > threshold:
+                                try:
+                                    summary_prov = str(self._cfg("chain_summary_model", "") or "").strip()
+                                    if not summary_prov:
+                                        summary_prov = await self.context.get_current_chat_provider_id(
+                                            event.unified_msg_origin
+                                        )
+                                    summarized = await self._summarize_chain_reply(
+                                        prev_display, prev_text, summary_prov, timeout
                                     )
-                                summarized = await self._summarize_chain_reply(
-                                    prev_display, prev_text, summary_prov, timeout
-                                )
-                                if summarized:
-                                    chain_note = summarized
-                            except Exception as e:
-                                logger.warning(
-                                    f"[parallel_handoff] 接龙精简准备失败，降级原样注入: {e}"
-                                )
-                    else:
-                        # 失败留痕：链上标注谁掉队了，下一个子代理能看到
-                        chain_note = (
-                            f"（接龙·上一位）【{prev_display}】超时未接：\n"
-                            f"（无回复）\n\n"
-                            f"请接续上文，现在轮到你回应："
-                        )
+                                    if summarized:
+                                        prev_text = summarized
+                                except Exception as e:
+                                    logger.warning(
+                                        f"[parallel_handoff] 接龙精简准备失败，降级原样注入: {e}"
+                                    )
+                            transcript_blocks_cur.append(f"【{prev_display}】{prev_text}")
+                        else:
+                            transcript_blocks_cur.append(f"【{prev_display}】（未接/超时）")
+                    # 拼接注入块：全场脉络 包裹在当前角色的 [决策注入] 之前
+                    cur_name = self._display_name(c.get("agent_name", ""))
+                    chain_note = (
+                        "（接龙·全场脉络，到目前为止）：\n"
+                        + "\n".join(transcript_blocks_cur)
+                        + f"\n\n请接续上文，现在轮到你（【{cur_name}】）回应，顺着全场的话茬自然往下："
+                    )
                     c["input"] = chain_note + (c.get("input") or "")
                 r = await self._call_one(
                     c,
@@ -818,6 +894,58 @@ Args:
                         await self._send_failure_notify(r, event)
                     # 非 direct 且成功：不打 _sent，
                     # 交由统一转发阶段收集进 return_agent_results 返回完整回复
+            # ── 接龙结束：3P/4P 整场沉淀进各角色 livingmemory（可选，默认开）──
+            # 博士拍板（2026-09-07）：3P 可以留长期记忆——记整场剧情脉络、
+            # 落各角色 livingmemory、且每人存各自主观视角（不共享一份上帝视角）。
+            # 但必须是"可自由回忆起"而非"日常强制浮现"：低 importance + 检索式召回，
+            # 她主动检索/语境触及才捞到，日常对话不跳脸、不污染正常调情。
+            # 开关 enable_chain_memory_persist 默认开，博士任何时刻可一键关。
+            if self._cfg("enable_chain_memory_persist", True):
+                try:
+                    await self._persist_chain_memories(
+                        message or "",
+                        results,
+                        livingmemory_plugin,
+                        event,
+                    )
+                except Exception as _persist_e:
+                    logger.warning(
+                        f"[parallel_handoff] 3P 整场记忆沉淀失败（非致命，不影响回复）: {_persist_e}"
+                    )
+            # ── 接龙结束：本场脉络写入会话级缓存（跨轮续接用）────────
+            # 2026-09-08 博士实测：夕+年3P 第二轮「继续做爱」时首发者夕失忆，
+            # 把阿米娅叫来、年成局外人——根因是 chained 全场脉络是单次调用局部变量。
+            # 这里把「在场者组+每人发言」按 session 存下来，下一轮 chained 续接时
+            # 注入给首发者（_build_prev_round_note），让她记得上一轮谁说过什么。
+            try:
+                _round_ctx = getattr(self, "_chain_round_ctx", None)
+                if _round_ctx is None:
+                    _round_ctx = self._chain_round_ctx = {}
+                _round_ctx[_sess] = {
+                    "ts": time.time(),
+                    "agents": [
+                        r.get("agent_name")
+                        for r in results
+                        if r.get("success") and r.get("agent_name")
+                    ],
+                    "speeches": [
+                        {
+                            "agent": r.get("agent_name"),
+                            "display": self._display_name(r.get("agent_name", "")),
+                            "text": (r.get("response", "") or "")[:600],
+                        }
+                        for r in results
+                        if r.get("success") and r.get("response")
+                    ],
+                }
+                logger.info(
+                    f"[parallel_handoff] 跨轮脉络缓存 OK session={_sess} "
+                    f"agents={_round_ctx[_sess]['agents']}"
+                )
+            except Exception as _ctx_e:
+                logger.warning(
+                    f"[parallel_handoff] 跨轮脉络缓存写入失败（非致命）: {_ctx_e}"
+                )
             # 接龙模式保持调用顺序发送，不按 order 重排（order 仅对并行模式生效）
         else:
             # ── 并行模式（默认）──
@@ -948,6 +1076,107 @@ Args:
         )
 
     # ── 跨轮上下文已迁至 ctx_engine.ContextEngine ──
+
+    # ── 3P/4P 整场记忆沉淀（2026-09-07 博士拍板）──────────────────
+    # 博士：3P 可以留长期记忆——记整场剧情脉络、落各角色 livingmemory，
+    # 且"她可以自由决定是否回忆起这段记忆，不能剥夺她们回忆 3P 记忆的权利"。
+    # 实现：每个参与角色各存各自主观视角（不共享一份上帝视角剧本），
+    # 落进她本人专属会话桩 persona 隔离，importance 由 livingmemory 检索式
+    # 召回——日常不跳脸，语境触及才捞到，满足"自由决定回忆权"。
+    async def _persist_chain_memories(
+        self, message, results, livingmemory_plugin, event
+    ):
+        """3P/4P 接龙结束后，把整场剧情按各角色视角沉淀进各自 livingmemory。
+
+        只对成功发言的角色落库；每人只存"我"视角的脉络（我在场、我说了什么、
+        谁回了我、博士怎么逗我），不共享一份上帝视角总剧本。落进
+        {原会话}:subagent:{agent} 专属会话桩，persona 隔离，不串味。
+        失败非致命，只记日志不影响回复。
+        """
+        if not livingmemory_plugin or not results:
+            return
+        # 博士原话
+        user_line = (str(message) or "").strip()
+        # 收集所有在场的角色视角。对每个成功角色：构造"我"视角脉络。
+        success_names = [
+            r.get("agent_name", "")
+            for r in results
+            if r.get("success") and r.get("agent_name")
+        ]
+        if not success_names:
+            return
+        # 一次写一个角色的视角，各自独立
+        for agent_name in success_names:
+            try:
+                display = self._display_name(agent_name)
+                lines = []
+                if user_line:
+                    lines.append(f"这一天博士把我们凑到一块儿，他先起了个头：{user_line}")
+                # 按发生顺序补全已发言的其他人（不含自己），拼成"我听到的"脉络
+                others = []
+                for r in results:
+                    if not r.get("agent_name") or r.get("agent_name") == agent_name:
+                        continue
+                    if r.get("success"):
+                        others.append(
+                            f"{self._display_name(r['agent_name'])}对我说：{r.get('response','')}"
+                        )
+                if others:
+                    lines.append("我还听到另一边：" + "；".join(others))
+                if not lines:
+                    continue
+                pov_text = "\n".join(lines)
+                # 结尾标记这是一段共同的剧情回顾（提醒提炼时归入剧情类而非日常事实）
+                pov_text += (
+                    "\n\n（这是我们一起经历过的一段，我记得它，日子照常过着。）"
+                )
+                await self._memory_store(
+                    livingmemory_plugin,
+                    event,
+                    agent_name,
+                    pov_text,
+                    f"（{display} 记住了这一场）",
+                )
+                logger.info(
+                    f"[parallel_handoff] 3P 整场视角沉淀 OK [{display}] -> "
+                    f"persona={agent_name}，共 {len(lines)} 段"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[parallel_handoff] 3P 视角沉淀失败 [{agent_name}]: {e}"
+                )
+
+    # ── 跨轮脉络注入块构造（2026-09-08 博士实测：3P续接首发者失忆）────────
+    def _build_prev_round_note(self, session_id: str, cur_agents: list) -> str:
+        """上一轮 chained 结束后，为新一轮续接构造「上一场脉络」注入块。
+
+        多P场次第二轮起，首发者（i==0）在 chained 里默认看不到任何前情
+        （脉络是单次调用局部变量），只能凭长期记忆召回 → 拉错人。
+        本方法把会话级缓存 _chain_round_ctx[session] 里的上轮在场者发言
+        拼成注入块，返回给 parallel_handoff 拼到首发者 input 前。
+        仅在：缓存存在 && 时间窗内（≤5min）&& 本轮名单与上轮在场者
+        有交集（同一场次续接）时返回非空——避免串场污染。
+        注入块以 _strip_chain_injection 可识别的 marker 包裹，用完即烧，
+        不污染子代理长期记忆（memory.py markers 需同步）。
+        """
+        ctx = getattr(self, "_chain_round_ctx", None)
+        if not ctx or session_id not in ctx:
+            return ""
+        round_info = ctx.get(session_id) or {}
+        if not round_info.get("speeches"):
+            return ""
+        # 时间窗：超过 5 分钟视为旧场，不续接
+        if time.time() - float(round_info.get("ts") or 0) > 300:
+            return ""
+        prev_agents = set(round_info.get("agents") or [])
+        cur_set = {a for a in (cur_agents or []) if a}
+        if not prev_agents or not (prev_agents & cur_set):
+            return ""
+        lines = ["（接龙·上一场脉络，你们还没散场）："]
+        for sp in round_info.get("speeches", []):
+            lines.append(f"【{sp.get('display', sp.get('agent', ''))}】{sp.get('text', '')}")
+        lines.append("顺着上一场的话茬自然往下：")
+        return "\n".join(lines)
 
     # ── 统一单代理路由实现（装饰器 @llm_tool 在 main.py 壳方法上） ──
     async def call_subagent(

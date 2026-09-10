@@ -99,6 +99,18 @@ class ArbitrationMixin:
         """读空气仲裁总开关（默认 False）。开启前零行为变化。"""
         return bool(self._cfg("enable_read_air_arbitrate", False))
 
+    def _read_air_enforce(self) -> bool:
+        """读空气【真实拦截】二级开关（默认 False）。
+
+        [段五 2026-09-10] 段二落地时只做 observe 日志、绝不拦路由；本开关是
+        「观察」到「执行」的唯一闸门，与总开关分离，便于博士灰度验收：
+            enable_read_air_arbitrate=False                → 整套零开销（总闸）
+            enable_read_air_arbitrate=True + 本开关 False   → 段二行为，仅日志
+            enable_read_air_arbitrate=True + 本开关 True    → 宁静权真实拦截
+        回退只需置 False，无需改码。
+        """
+        return bool(self._cfg("read_air_enforce", False))
+
     def _presence_window(self) -> int:
         """发言窗口宽度，可配，默认 6。"""
         try:
@@ -214,9 +226,13 @@ class ArbitrationMixin:
                     route,
                     affinity,
                 )
+            # [段五 2026-09-10] 二级开关：read_air_enforce=True 时把「想克制」落成
+            # 真实拦截。默认 False 保持段二 observe-only，行为零变化。
+            if quiet and self._read_air_enforce():
+                return "main"
         except Exception as e:
-            _logger.warning("[read_air] arbitrate observe failed (non-fatal): %s", e)
-        # 段二不返 'main'：绝不实际拦截路由，只留日志供观察
+            _logger.warning("[read_air] arbitrate failed (non-fatal): %s", e)
+        # 默认不返 'main'：只在 read_air_enforce 开启时才拦路由，其余仅留日志供观察
         return None
 
     # ── 读空气是否倾向克制（纯规则，零 LLM，可被 _arbitrate_directive 调用） ──
@@ -232,23 +248,29 @@ class ArbitrationMixin:
         返回 True=倾向克制落主代理，False=可让子代理接。
         段二仅作日志信号，不实际干预。
         """
+        recent_agents = [r["agent"] for r in presence.recent]
+        # R4 旧怨组密集互抛 → 主代理兜住。
+        # 定性（博士 2026-09-03）：旧怨只体现为贫嘴（刀子嘴豆腐心），绝不作对抗性
+        # 仲裁判据。故本规则只产出「让主代理兜住」这一收敛信号，绝不判定谁不能说话。
+        # [段五 2026-09-10 修复] 旧实现有两处致命伤，导致 R4 从未生效过：
+        #   ① 它嵌在 R2 的 if 块内、且位于 R2 无条件 return True 之前 —— 两条 return
+        #      结果相同，R4 的判定白算，是死代码；
+        #   ② 判据键名 "presis" / "普瑞赛斯" 与主代理真实记录键 MAIN_SPEAKER("__main__")
+        #      不一致，c1 恒为 0，条件永不成立。
+        # 修法：提到 R2 之前独立判定 + 键名对齐 MAIN_SPEAKER。
+        c_main = sum(1 for a in recent_agents if a == MAIN_SPEAKER or a == "presis")
+        c_kaltsit = sum(1 for a in recent_agents if a in ("kaltsit", "凯尔希"))
+        if c_main >= 2 and c_kaltsit >= 2:
+            return True
         # R1 主代理刚回过话 → 倾向让主代理继续，别抢
+        # [段五 2026-09-10 修复] R1 依赖 last_speaker == MAIN_SPEAKER，而旧代码里
+        # _presence_update 全库只在子代理转发时被调用（dispatch 单点），主代理回复从无
+        # 记录 —— MAIN_SPEAKER 从未写入过一次，R1 同样是死规则。已在 forward.py 的
+        # on_decorating_result 出口补记主代理发言（_presence_mark_main）。
         if presence.last_speaker == MAIN_SPEAKER:
             return True
-        # R2 连续承接链已确立，主代理疑似被晾着 → 若消息短且无技术特征倾向克制
-        # step1: 承接链很深（最近都在子代理之间互抛）→ 倾向主代理收尾
+        # R2 连续承接链已确立，主代理疑似被晾着 → 倾向主代理收尾
         if presence.active_chain and len(presence.recent) >= 2:
-            # R4 旧怨组：普瑞赛斯/凯尔希近条密集互抛 → 强烈倾向主代理兜，避免针锋相对
-            grp = {
-                "presis": ["presis", "普瑞赛斯"],
-                "kaltsit": ["kaltsit", "凯尔希"],
-            }
-            recent_agents = [r["agent"] for r in presence.recent]
-            for g1, g2 in [("presis", "kaltsit")]:
-                c1 = sum(1 for a in recent_agents if a in grp[g1])
-                c2 = sum(1 for a in recent_agents if a in grp[g2])
-                if c1 >= 2 and c2 >= 2:
-                    return True  # 旧怨组互抛 → 主代理兜住，避免针锋相对
             return True
         # 其余默认让子代理按现有规则走
         return False

@@ -1480,7 +1480,7 @@ class TestRouteSuggestionHandoff(unittest.TestCase):
 class TestReadAirArbitrate(unittest.TestCase):
     """[读空气·段二 2026-09-03] 宁静权观察逻辑：默认关零行为变化，观察仅日志不拦截"""
 
-    def _fresh_plugin(self, read_air=False):
+    def _fresh_plugin(self, read_air=False, enforce=False):
         from arbitrate import ArbitrationMixin, ConversationPresence
 
         cfg = {
@@ -1491,9 +1491,16 @@ class TestReadAirArbitrate(unittest.TestCase):
             }),
             "direct_delivery_agents": "amiya,closure,theresia",
             "enable_read_air_arbitrate": read_air,
+            "read_air_enforce": enforce,
             "read_air_presence_window": 6,
         }
         p = _load_plugin_class()(context=MagicMock(), config=cfg)
+        # [段五 2026-09-10 测试隔离治本] _presences 是 ArbitrationMixin 的类属性（跨实例
+        # 共享），而本类所有测试共用同一 session key "sess-readair" —— 前一个测试记录的
+        # 发言会污染后一个测试的最近窗口，使断言结果依赖执行顺序（脆弱测试：新增测试改变
+        # 字母序后，test_read_air_not_quiet_when_subagent_owns_floor 即被污染失败）。
+        # 每个测试从干净状态起步，消除执行顺序依赖。
+        p._presences.clear()
         # 断言 mixin 已混入 MRO
         assert isinstance(p, ArbitrationMixin)
         return p
@@ -1542,6 +1549,84 @@ class TestReadAirArbitrate(unittest.TestCase):
         ev = self._plain_event("阿米娅帮我查报错")
         # 命中 T1 -> amiya 且 mode 放行短路
         assert p._arbitrate_directive(ev, "阿米娅帮我查报错", "amiya", True) is None
+
+    # ── 段五·宁静权落地与两条死规则修复（2026-09-10） ──────────
+    # 背景：段二落地后，R1/R4 两条规则实际从未生效过——
+    #   R1 依赖 last_speaker == MAIN_SPEAKER，而主代理回复从不入册；
+    #   R4 嵌在 R2 的无条件 return True 之前（同效，白算），且键名与真实记录键不符。
+    def test_read_air_r1_fires_via_presence_mark_main(self):
+        """R1 复活：主代理经 forward 钩子入册后，读空气倾向克制（旧代码恒 False）"""
+        from arbitrate import MAIN_SPEAKER
+
+        p = self._fresh_plugin(read_air=True)
+        ev = self._plain_event("今天就先这样吧")
+        p._presence_mark_main(ev, "好，那我陪你")
+        pp = p._presence_get(ev)
+        assert pp.last_speaker == MAIN_SPEAKER
+        assert p._read_air_wants_quiet("今天就先这样吧", pp)
+
+    def test_read_air_r4_fires_with_real_main_key(self):
+        """R4 修复：主代理用真实记录键 MAIN_SPEAKER（而非测试专用的 'presis'）也能触发旧怨收敛
+
+        回归背景：生产代码永远不写 'presis'（主代理记录键是 '__main__'），
+        旧测试用手工 record('presis') 造数据掩盖了该缺陷——测试绿、功能死。
+        """
+        from arbitrate import MAIN_SPEAKER
+
+        p = self._fresh_plugin()
+        pp = p._presence_get(self._plain_event("两位在争什么"))
+        pp.record(MAIN_SPEAKER, "main", "主一句")
+        pp.record("kaltsit", "forward", "凯一句")
+        # 让 R1 不成立（最后一条不是主代理）且 R4 成立，单独坐实旧怨判据
+        pp.record(MAIN_SPEAKER, "main", "主二句")
+        pp.record("kaltsit", "forward", "凯二句")
+        assert pp.last_speaker == "kaltsit"
+        assert p._read_air_wants_quiet("两位在争什么", pp)
+
+    def test_presence_mark_main_resets_active_chain(self):
+        """主代理发言视为「断开接管」：active_chain 置 False，last_speaker 落 MAIN_SPEAKER
+
+        说明：R1/R2/R4 三条规则都返回 True（信号同值），无法用返回值区分是哪条命中，
+        故不为 R4 设反向用例（会是个假测试）；此处改验证主代理入册路径的真实状态语义。
+        """
+        from arbitrate import MAIN_SPEAKER
+
+        p = self._fresh_plugin(read_air=True)
+        ev = self._plain_event("x")
+        pp = p._presence_get(ev)
+        pp.record("amiya", "forward", "阿米娅接话")
+        assert pp.active_chain is True
+        p._presence_mark_main(ev, "我插一句")
+        assert pp.active_chain is False
+        assert pp.last_speaker == MAIN_SPEAKER
+
+    def test_arbitrate_directive_enforce_returns_main(self):
+        """段五：read_air_enforce=True 时「想克制」落成真实拦截（返回 'main'）"""
+        from arbitrate import MAIN_SPEAKER
+
+        p = self._fresh_plugin(read_air=True, enforce=True)
+        ev = self._plain_event("阿米娅帮我查报错")
+        p._presence_get(ev).record(MAIN_SPEAKER, "main", "我刚说过话")
+        assert p._arbitrate_directive(ev, "阿米娅帮我查报错", "amiya", True) == "main"
+
+    def test_arbitrate_directive_enforce_off_behaves_like_observe(self):
+        """段五：enforce 默认关时与段二行为完全一致——只观察、返回 None、绝不拦截"""
+        from arbitrate import MAIN_SPEAKER
+
+        p = self._fresh_plugin(read_air=True, enforce=False)
+        ev = self._plain_event("阿米娅帮我查报错")
+        p._presence_get(ev).record(MAIN_SPEAKER, "main", "我刚说过话")
+        assert p._arbitrate_directive(ev, "阿米娅帮我查报错", "amiya", True) is None
+
+    def test_presence_mark_main_safe_when_updater_missing(self):
+        """_presence_mark_main 在缺 _presence_update 时静默返回，绝不影响发送主流程"""
+        from forward import ForwardMixin
+
+        class _Bare(ForwardMixin):
+            def _cfg(self, k, d=None):
+                return d
+
+        _Bare()._presence_mark_main(MagicMock(), "文本")  # 不抛即通过
 
     # ── 段三·工具侧收敛（2026-09-03） ─────────────────────────
     def _tool_event(self, msg):
@@ -1954,6 +2039,84 @@ class TestContextEngine:
         )
         asyncio.run(m._maybe_reflect_subagent(broken, stub, "amiya"))
         assert added == []
+
+class TestChainSummary(unittest.TestCase):
+    """2026-09-10 接龙精简补实现（原为「有调用点、无实现」的空壳）。
+
+    dispatch.parallel_handoff 里调用了 self._summarize_chain_reply，但全插件
+    含 git 历史都没有该方法定义 → 接龙中上一位回复超阈值时每轮抛
+    AttributeError 被 except 吞掉，打一条 WARN 后原样注入，chain_summary_*
+    四项配置形同虚设。本类锁死修复后的三级行为。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.PluginClass = _load_plugin_class()
+
+    def _make_plugin(self, config: dict = None, llm_generate=None):
+        mock_context = MagicMock()
+        if llm_generate is not None:
+            mock_context.llm_generate = llm_generate
+        plugin = self.PluginClass(context=mock_context, config=config or {})
+        plugin.context = mock_context  # mock Star.__init__ 不存 context，手动补
+        return plugin
+
+    def test_method_actually_defined(self):
+        """方法必须真实存在且可调用（旧版只有调用点）。"""
+        plugin = self._make_plugin()
+        self.assertTrue(callable(getattr(plugin, "_summarize_chain_reply", None)))
+
+    def test_short_text_returned_as_is(self):
+        """首尾保留量已覆盖全文 → 原样返回，不调用模型。"""
+        plugin = self._make_plugin({"chain_summary_keep_head_tail": 120})
+        text = "博士今天想喝哪一种咖啡" * 3
+        out = asyncio.run(plugin._summarize_chain_reply("阿米娅", text, "", 30))
+        self.assertEqual(out, text)
+
+    def test_model_failure_falls_back_to_head_tail(self):
+        """模型通道异常 → 降级首尾截断，绝不抛异常（旧版在此抛 AttributeError）。"""
+        plugin = self._make_plugin(
+            {"chain_summary_keep_head_tail": 50},
+            llm_generate=AsyncMock(side_effect=RuntimeError("provider down")),
+        )
+        text = "头" * 50 + "中" * 400 + "尾" * 50
+        out = asyncio.run(plugin._summarize_chain_reply("夕", text, "bad-provider", 30))
+        self.assertIn("头" * 50, out)
+        self.assertIn("尾" * 50, out)
+        self.assertIn("中段 400 字略", out)
+        self.assertLess(len(out), len(text))
+
+    def test_model_summary_used_when_available(self):
+        """模型可用 → 中段换成摘要，首尾原样保留。"""
+        resp = MagicMock()
+        resp.completion_text = "她把刀递过来，气氛软了下来"
+        plugin = self._make_plugin(
+            {"chain_summary_keep_head_tail": 50},
+            llm_generate=AsyncMock(return_value=resp),
+        )
+        text = "头" * 50 + "中" * 400 + "尾" * 50
+        out = asyncio.run(plugin._summarize_chain_reply("可露希尔", text, "prov", 30))
+        self.assertIn("她把刀递过来", out)
+        self.assertIn("头" * 50, out)
+        self.assertIn("尾" * 50, out)
+        self.assertNotIn("中" * 100, out)
+
+    def test_config_defaults_in_schema(self):
+        """chain_summary 四项配置齐备且默认值如设计。"""
+        schema_path = os.path.join(PLUGIN_DIR, "_conf_schema.json")
+        with open(schema_path, "r", encoding="utf-8") as f:
+            schema = json.load(f)
+        for key in (
+            "chain_summary_enabled",
+            "chain_summary_model",
+            "chain_summary_threshold",
+            "chain_summary_keep_head_tail",
+        ):
+            self.assertIn(key, schema)
+        self.assertTrue(schema["chain_summary_enabled"]["default"])
+        self.assertEqual(schema["chain_summary_threshold"]["default"], 600)
+        self.assertEqual(schema["chain_summary_keep_head_tail"]["default"], 120)
+
 
 class TestChainMemoryPersist(unittest.TestCase):
     """2026-09-07 3P/4P 接龙修复：
