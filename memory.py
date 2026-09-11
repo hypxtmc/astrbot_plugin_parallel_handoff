@@ -322,8 +322,16 @@ class MemoryMixin:
             return []
 
     # ── 构建子代理工具集（记忆工具过滤） ──
+    # 只读工具白名单（2026-09-11 顾主定：先给子代理「读」的手，写权留在主代理；
+    # 配合 dispatch 的 tool_loop_agent 才真正可执行）
+    _READONLY_TOOL_NAMES = (
+        "safe_read", "dir_list", "dir_tree", "es_search", "rg_search",
+        "text_filter", "code_explore", "code_index", "code_status",
+        "file_hash", "file_diff", "safe_backups", "astr_kb_search",
+    )
+
     def _build_memory_tools(self, agent_name: str):
-        """为子代理构建记忆工具集（仅含 recall/memorize 两个工具）。
+        """为子代理构建工具集（记忆工具 + 只读代码工具）。
 
         排除逻辑收敛为单一 exclude_agents 集合：由配置直接控制（默认空 = 全部子代理可召回），
         配置（subagent_memory.exclude_agents 或扁平 exclude_agents）决定集合内容。
@@ -344,15 +352,17 @@ class MemoryMixin:
                     self.context.provider_manager, "llm_tools", None
                 )
                 if global_tools and not global_tools.empty():
-                    memory_tools = []
-                    for tool in global_tools.func_list:
-                        if tool.name in (
-                            "recall_long_term_memory",
-                            "memorize_long_term_memory",
-                        ):
-                            memory_tools.append(tool)
-                    if memory_tools:
-                        subagent_tools = ToolSet(tools=memory_tools)
+                    wanted = {
+                        "recall_long_term_memory",
+                        "memorize_long_term_memory",
+                    } | set(self._READONLY_TOOL_NAMES)
+                    picked = [t for t in global_tools.func_list if t.name in wanted]
+                    if picked:
+                        subagent_tools = ToolSet(tools=picked)
+                        logger.info(
+                            f"[parallel_handoff] 子代理工具集 [{agent_name}]: "
+                            f"{sorted(t.name for t in picked)}（只读档）"
+                        )
         except Exception as e:
             logger.warning(
                 f"[parallel_handoff] Failed to build agent tools for "
