@@ -363,6 +363,15 @@ class MemoryMixin:
                             f"[parallel_handoff] 子代理工具集 [{agent_name}]: "
                             f"{sorted(t.name for t in picked)}（只读档）"
                         )
+                    else:
+                        logger.warning(
+                            f"[parallel_handoff] 只读白名单零命中 [{agent_name}]，"
+                            f"全局工具名：{sorted(t.name for t in global_tools.func_list)}"
+                        )
+                else:
+                    logger.warning(
+                        f"[parallel_handoff] 全局工具集为空 [{agent_name}]"
+                    )
         except Exception as e:
             logger.warning(
                 f"[parallel_handoff] Failed to build agent tools for "

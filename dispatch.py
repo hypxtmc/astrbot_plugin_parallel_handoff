@@ -465,7 +465,7 @@ class DispatchMixin:
         except Exception as _e:
             logger.warning(f"[parallel_handoff] 今日状态注入失败 [{agent_name}]: {_e}")
 
-        # ── 构建子代理工具集（memory.py 记忆工具过滤） ──
+        # ── 构建子代理工具集（memory.py 记忆工具 + 只读白名单） ──
         subagent_tools = self._build_memory_tools(agent_name)
 
         t0 = time.perf_counter()
