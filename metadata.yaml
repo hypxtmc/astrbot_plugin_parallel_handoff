@@ -1,5 +1,5 @@
 name: parallel_handoff
-version: 2.9.0
+version: 2.9.1
 author: hypxtmc
 desc: 多声部并行调度插件 — 主代理执棒，子代理各为声部：parallel 复调齐奏、chained 卡农轮唱、relay 指挥收谱、direct 独唱直出。双模式配置（技术干活/日常贴贴）、消息消歧、路由强制指令、跨轮上下文引擎、读空气仲裁、个体状态随机演化、离线心情注入、家庭旁轨（她们有自己的小日子）。原
   parallel_handoff，v2.9.0

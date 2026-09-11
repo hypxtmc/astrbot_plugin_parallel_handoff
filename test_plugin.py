@@ -4029,13 +4029,56 @@ class TestStickyMultiGroup(unittest.TestCase):
         self.assertEqual(sticky, "theresia")
 
     def test_new_mention_releases_sticky(self):
-        """本条出现新的子代理名 → 不沿用旧锁（多点名覆盖旧组置空）"""
+        """[2026-09-11 新口径] 显式点名（句首点名 / 呼叫词）→ 释放粘滞交给 T1 换人。"""
         p = self._fresh_router()
         ev = self._ev("sess-mention")
         p._record_route_hits(ev, ["amiya", "skadi"])
-        # 新消息点了别的人（theresia）→ 粘滞释放，交给 T1 重新点名
+        # 句首点名且后接分隔标点 → 显式转移，粘滞释放
         sticky = p._t1_sticky_route(ev, "特蕾西娅，你来接")
         self.assertIsNone(sticky)
+        # 呼叫词点名 → 同样是显式转移
+        p._record_route_hits(ev, ["amiya", "skadi"])
+        sticky2 = p._t1_sticky_route(ev, "叫特蕾西娅过来")
+        self.assertIsNone(sticky2)
+
+    def test_narrative_mention_keeps_sticky(self):
+        """[2026-09-11 博士口径] 长句叙述里顺带提及他名 → 不夺锁，仍按原组续接。"""
+        p = self._fresh_router()
+        ev = self._ev("sess-narrate")
+        p._record_route_hits(ev, ["amiya", "skadi"])
+        sticky = p._t1_sticky_route(ev, "特蕾西娅那个方案我觉得还得改改，你们先继续")
+        self.assertIsInstance(sticky, list)
+        self.assertEqual(set(sticky), {"amiya", "skadi"})
+
+    def test_is_explicit_transfer_matrix(self):
+        """显式转移判定矩阵（2026-09-11 口径：命令/呼叫词/短名/句首点名算，叙述提及不算）。"""
+        p = self._fresh_router()
+        self.assertTrue(p._is_explicit_transfer("/阿米娅"))
+        self.assertTrue(p._is_explicit_transfer("#特蕾西娅"))
+        self.assertTrue(p._is_explicit_transfer("！斯卡蒂"))
+        self.assertTrue(p._is_explicit_transfer("叫斯卡蒂过来"))
+        self.assertTrue(p._is_explicit_transfer("特蕾西娅"))
+        self.assertFalse(p._is_explicit_transfer("特蕾西娅那个方案还得改改再发我"))
+
+    def test_raw_command_text_restores_stripped_prefix(self):
+        """唤醒层剥掉 '/' 后，从消息段拼回原文，T0 命令式照常识别。"""
+        p = self._fresh_router()
+        seg = MagicMock()
+        seg.text = "/阿米娅"
+        ev = MagicMock()
+        ev.get_messages = lambda: [seg]
+        self.assertEqual(p._raw_command_text(ev), "/阿米娅")
+        agents, presis = p._parse_agent_command("/阿米娅")
+        self.assertEqual(agents, ["amiya"])
+        self.assertFalse(presis)
+
+    def test_sticky_group_of_reports_live_members(self):
+        """锁仲裁取锁组：无锁返回空，锁后返回池内成员。"""
+        p = self._fresh_router()
+        ev = self._ev("sess-lock")
+        self.assertEqual(p._sticky_group_of(ev), [])
+        p._record_route_hits(ev, ["amiya", "skadi"])
+        self.assertEqual(set(p._sticky_group_of(ev)), {"amiya", "skadi"})
 
     def test_presis_token_higher_priority_clears_group(self):
         """「普瑞赛斯」最高级令牌：清空在场者组（上层已清锁）"""
