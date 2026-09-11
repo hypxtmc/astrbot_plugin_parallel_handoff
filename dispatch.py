@@ -500,13 +500,27 @@ class DispatchMixin:
             # 超时上限：博士硬性设定永久 120 秒（2026-08-20）
             # 子代理生成长文经常超 30s 被跳，现恒定置 120，彻底解决“次次超时”
             llm_timeout = 120
+            # [工具循环 2026-09-11 博士定] 子代理改走 tool_loop_agent：
+            # llm_generate 是一次性调用、不执行 tool_call（官方 docstring 明示），
+            # 子代理伸手抓工具永远抓空 → 空回复 → 降级无工具重试，工具形同虚设。
+            # tool_loop_agent 不设 ProviderRequest.extra_user_content_parts，
+            # 故把旁轨记忆/状态注入文本直接并进 prompt。
+            _extra_text = "\n".join(
+                (getattr(p, "text", "") or "").strip()
+                for p in (memory_extra_parts or [])
+            ).strip()
+            prompt_with_extra = (
+                f"{final_input}\n\n{_extra_text}" if _extra_text else final_input
+            )
             llm_resp = await asyncio.wait_for(
-                self.context.llm_generate(
+                self.context.tool_loop_agent(
+                    event=event,
                     chat_provider_id=prov_id,
-                    prompt=final_input,
+                    prompt=prompt_with_extra,
                     system_prompt=handoff.agent.instructions or "",
                     tools=subagent_tools,
-                    extra_user_content_parts=memory_extra_parts,
+                    max_steps=5,
+                    tool_call_timeout=45,
                 ),
                 timeout=llm_timeout,
             )

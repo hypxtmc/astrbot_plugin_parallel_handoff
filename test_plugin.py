@@ -743,6 +743,8 @@ class TestHandoffBlacklist(unittest.TestCase):
             completion_text = "阿米娅的回复"
         from unittest.mock import AsyncMock
         mock_context.llm_generate = AsyncMock(return_value=_FakeLLMResp())
+        # 2026-09-11：子代理调用改走 tool_loop_agent（带工具循环），mock 同步跟进
+        mock_context.tool_loop_agent = AsyncMock(return_value=_FakeLLMResp())
         mock_context.get_current_chat_provider_id = AsyncMock(return_value="prov")
         plugin = self.PluginClass(context=mock_context, config={
             "enable_scene_inject": False,
@@ -798,6 +800,8 @@ class TestBaselineIsolation(unittest.TestCase):
         class _FakeLLMResp:
             completion_text = "阿米娅的回复"
         mock_context.llm_generate = AsyncMock(return_value=_FakeLLMResp())
+        # 2026-09-11：子代理调用改走 tool_loop_agent（带工具循环），mock 同步跟进
+        mock_context.tool_loop_agent = AsyncMock(return_value=_FakeLLMResp())
         mock_context.get_current_chat_provider_id = AsyncMock(return_value="prov")
         base_cfg = {
             "enable_scene_inject": True,
@@ -837,7 +841,7 @@ class TestBaselineIsolation(unittest.TestCase):
         ))
         data = json.loads(raw)
         self.assertEqual(data["results"][0]["success"], True)
-        prompt = mock_context.llm_generate.call_args.kwargs["prompt"]
+        prompt = mock_context.tool_loop_agent.call_args.kwargs["prompt"]
         self.assertIn("【共用剧情场景基线】", prompt)
         self.assertIn("这里是罗德岛", prompt)
 
@@ -852,7 +856,7 @@ class TestBaselineIsolation(unittest.TestCase):
             ev,
             calls=[{"agent_name": "amiya", "input": "你好"}],
         ))
-        prompt = mock_context.llm_generate.call_args.kwargs["prompt"]
+        prompt = mock_context.tool_loop_agent.call_args.kwargs["prompt"]
         self.assertNotIn("【共用剧情场景基线】", prompt)
 
     def test_baseline_empty_no_inject(self):
@@ -866,7 +870,7 @@ class TestBaselineIsolation(unittest.TestCase):
             ev,
             calls=[{"agent_name": "amiya", "input": "你好"}],
         ))
-        prompt = mock_context.llm_generate.call_args.kwargs["prompt"]
+        prompt = mock_context.tool_loop_agent.call_args.kwargs["prompt"]
         self.assertNotIn("【共用剧情场景基线】", prompt)
 
     def test_baseline_does_not_leak_to_blacklist(self):
@@ -886,8 +890,8 @@ class TestBaselineIsolation(unittest.TestCase):
         self.assertIn("强制直连黑名单", data["results"][0]["response"])
         # 黑名单拦截发生在基线注入之前，响应中不应出现基线内容
         self.assertNotIn("这里是罗德岛", data["results"][0]["response"])
-        # llm_generate 不应被调用（黑名单直接拦截，不进入生成流程）
-        mock_context.llm_generate.assert_not_called()
+        # 生成器不应被调用（黑名单直接拦截，不进入生成流程）
+        mock_context.tool_loop_agent.assert_not_called()
 
     def test_blacklist_custom_blocked(self):
         """自定义黑名单子代理被拦截，提示 transfer_to 直连"""
@@ -2659,9 +2663,10 @@ class TestDailyLifeInjectToDispatch(unittest.TestCase):
             completion_text = "阿米娅的回复"
         captured = {}
         async def _fake_generate(**kwargs):
-            captured["extra"] = kwargs.get("extra_user_content_parts")
+            # 2026-09-11：子代理改走 tool_loop_agent，旁轨注入文本并入 prompt
+            captured["prompt"] = kwargs.get("prompt", "")
             return _FakeLLMResp()
-        mock_context.llm_generate = _fake_generate
+        mock_context.tool_loop_agent = _fake_generate
         mock_context.get_current_chat_provider_id = AsyncMock(return_value="prov")
         plugin = self.PluginClass(context=mock_context, config={
             "enable_scene_inject": False,
@@ -2682,8 +2687,7 @@ class TestDailyLifeInjectToDispatch(unittest.TestCase):
         ))
         data = json.loads(raw)
         assert data["results"][0]["success"] is True
-        extra = captured.get("extra") or []
-        joined = self._text_of(extra)
+        joined = captured.get("prompt") or ""
         assert "今日日常" in joined
 
 
