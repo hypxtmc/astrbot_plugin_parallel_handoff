@@ -187,9 +187,75 @@ class RouterMixin:
     # 格式：/黍 · /黍+年 · /助手C+助手A+助手D · /主代理+助手A+助手C
     # 不设上限，点名几个就锁定几个；命令持续生效（写入粘滞锁，之后无需再发命令）。
     # Python 同款命令见系统提示「以 / 开头指定」，与下方实现保持一致。
+    # 2026-09-11 顾主报 bug 治本：AstrBot 唤醒层命中全局 wake_prefix（默认 ["/"]）后
+    # 会把前缀从 event.message_str 里剥掉（waking_check/stage.py:123），所以 T0 判定
+    # 不能只看 message_str——统一改用 _raw_command_text(event) 从消息段拼回原文。
+    # 同时把可用前缀扩成一组（/ 全角／ # ！ ! 、），顾主在 QQ 上发哪个都能锁。
+    _CMD_PREFIXES = ("/", "／", "#", "！", "!", "、")
     _CMD_RE = re.compile(
-        r"^/([^\s/]+(?:[/+、，,，][^\s/]+)*)\s*$", re.M
+        r"^[/／#！!、]([^\s/／#！!、]+(?:[/+、，,，][^\s/／#！!、]+)*)\s*$", re.M
     )
+
+    def _raw_command_text(self, event: AstrMessageEvent) -> str:
+        """还原含前缀的原始用户消息文本（2026-09-11 顾主报 bug 治本）。
+
+        bug 复现：顾主发「/助手A」，插件里 message_str 却是「助手A」，T0 命令式
+        (startswith("/")) 永远不成立 → 命令强锁形同虚设，消息落回 T1 猜名字。
+        根因：AstrBot 唤醒层命中全局 wake_prefix（["/"]）后执行
+        `event.message_str = event.message_str[len(wake_prefix):].strip()`
+        （astrbot/core/pipeline/waking_check/stage.py:123），前缀被剥掉；
+        而消息段列表（event.get_messages()）未被改写，原文还在里面。
+        所以这里从段里把纯文本拼回来，供 T0 识别与去重豁免使用。
+        """
+        try:
+            segs = event.get_messages()
+        except Exception:
+            return ""
+        buf = []
+        for seg in segs or []:
+            txt = getattr(seg, "text", None)
+            if isinstance(txt, str) and txt:
+                buf.append(txt)
+        return "".join(buf).strip()
+
+    # 呼叫词（锁仲裁用：锁在场时，只有「前缀命令」或「呼叫词 + 已知名字」才算换人）
+    _TRANSFER_WORDS = ("换", "找", "叫", "让", "请", "喊", "召", "切到", "换成", "过来")
+
+    def _is_explicit_transfer(self, message: str) -> bool:
+        """本条是否构成「显式转移」（换人意图）——2026-09-11 顾主口径。
+
+        是：前缀命令（/、#、！、全角／…）、呼叫短语（换 X / 找 X / 叫 X 过来）、
+            极短消息且只含一个已知代理名（≤6 字）
+        不是：长句叙述里顺带出现名字（这正是过去把锁带跑的元凶）
+        """
+        m = (message or "").strip()
+        if not m:
+            return False
+        if m.startswith(self._CMD_PREFIXES):
+            return True
+        if len(m) <= 6 and self._t1_route(m):
+            return True
+        hits = self._t1_route(m) or self._t1_route_multi(m)
+        if not hits:
+            return False
+        if any(w in m for w in self._TRANSFER_WORDS):
+            return True
+        # 句首点名：名字/爱称出现在开头且后接分隔标点（如「助手C，你来接」）；
+        # 名字作主语的长句叙述（「助手D刚才说的那个 bug…」）不算。
+        for sep in ("，", "、", ",", "：", ":", " "):
+            idx = m.find(sep)
+            if 0 < idx <= 8 and self._t1_mentions(m[:idx]):
+                return True
+        return False
+
+    def _sticky_group_of(self, event: AstrMessageEvent):
+        """取当前会话粘滞在册组（池内有效成员），用于锁仲裁；无锁返回 []。"""
+        last, _ = self._route_mem()
+        group = last.get(event.unified_msg_origin) or {}
+        if not group:
+            return []
+        pool = self._router_agent_pool()
+        return [aid for aid in group if aid in pool]
 
     def _parse_agent_command(self, message: str):
         """解析命令式触发。返回 (agents_list, has_main)。
@@ -199,7 +265,7 @@ class RouterMixin:
                     其余点名子代理由主代理并行调度（relay 汇总或直发按 mode））。
         非命令 / 全未知 → (None, False)。
         """
-        if not message or not message.startswith("/"):
+        if not message or not message.startswith(self._CMD_PREFIXES):
             return None, False
         m = self._CMD_RE.match(message)
         if not m:
@@ -535,7 +601,9 @@ class RouterMixin:
             buf = msgs[sid] = deque(maxlen=6)
         buf.append(message)
 
-    def _dedup_shortcircuit(self, event: AstrMessageEvent, message: str) -> bool:
+    def _dedup_shortcircuit(
+        self, event: AstrMessageEvent, message: str, raw_message: str = ""
+    ) -> bool:
         """会话级消息去重屏障（2026-09-09 顾主 bug 治本）。
 
         bug 复现：/<名A>+<名B> 命令锁 → 发"继续做爱"，T0.5 粘滞命中 nian+xi chained，
@@ -550,7 +618,12 @@ class RouterMixin:
         默认 12s）内对同一 session 第二次出现，直接 stop_event 吞掉，绝不重复
         路由。覆盖所有短路路径的通用屏障。
         返回 True = 已吞（去重），False = 正常放行。
+
+        2026-09-11：显式命令豁免——顾主连发两条相同前缀命令（如 /助手A）时，
+        第二条必须照常执行，不能被去重窗口吃掉。
         """
+        if (raw_message or message or "").lstrip().startswith(self._CMD_PREFIXES):
+            return False
         if not hasattr(self, "_shortcircuit_last"):
             self._shortcircuit_last = {}  # session -> (hash, ts)
         sid = event.unified_msg_origin
@@ -607,8 +680,9 @@ class RouterMixin:
                 live[aid] = ts
         if not live:
             return None
-        # 3) 本条出现新的子代理名 → 不沿用旧锁，交给 T1 重新点名覆盖
-        if self._t1_mentions(message):
+        # 3) 本条出现新的子代理名 → 仅当构成「显式转移」才让位给 T1 重新点名；
+        #    长句里顺带提及则继续沿用旧锁（2026-09-11 顾主口径：锁不被 T1 夺走）
+        if self._t1_mentions(message) and self._is_explicit_transfer(message):
             return None
         # 4) 未点名 → 按在场者组粘滞
         if len(live) >= 2:
@@ -861,9 +935,11 @@ class RouterMixin:
         message = (event.get_message_str() or "").strip()
         if not message:
             return False
+        # [唤醒来路 2026-09-11] 唤醒层剥掉 "/"，从消息段拼回原文供 T0 识别
+        raw_message = self._raw_command_text(event) or message
         # [T0 命令式触发 2026-09-08 顾主指定] busy 场景同样启用 / 命令：
         # 主代理正干活时，/<名A>、/<名A>+<名B> 等显式命令仍锁定并短路，不被 follow-up 吞。
-        cmd_agents, cmd_main = self._parse_agent_command(message)
+        cmd_agents, cmd_main = self._parse_agent_command(raw_message)
         if cmd_agents and not cmd_main:
             logger.info(
                 f"[parallel_handoff] BusyBypass: T0 命令式 {cmd_agents} → "
@@ -1055,15 +1131,18 @@ class RouterMixin:
         message = (event.get_message_str() or "").strip()
         if not message:
             return False
+        # [唤醒来路 2026-09-11] 唤醒层会剥掉 "/"，从消息段拼回原文供 T0 识别
+        raw_message = self._raw_command_text(event) or message
         self._record_user_msg(event, message)
         # [去重屏障 2026-09-09 顾主 bug 治本] 同消息二次触发（OnWaitingLLMRequestEvent
         # 可能对同一消息顺序跑两次）→ 直接吞掉，杜绝子代理重复回话。
-        if self._dedup_shortcircuit(event, message):
+        # 2026-09-11：显式命令豁免（连发两条 /助手A，第二条必须照常执行）
+        if self._dedup_shortcircuit(event, message, raw_message):
             return True
         # [T0 命令式触发 2026-09-08 顾主指定] 以 / 开头的显式命令（如 /<名A>、/<名A>+<名B>、
         # /助手C+助手A+助手D、/主代理+助手A）→ 直接锁定目标，最高优先级短路，
         # 彻底跳过 T1 关键词猜测 / T0.5 粘滞 / T2 小模型。命令持续生效（写粘滞锁）。
-        cmd_agents, cmd_main = self._parse_agent_command(message)
+        cmd_agents, cmd_main = self._parse_agent_command(raw_message)
         if cmd_agents or cmd_main:
             if cmd_agents and not cmd_main:
                 # 纯子代理命令：短路调度（单人或多人 chained），并写命令强制锁。
@@ -1118,9 +1197,10 @@ class RouterMixin:
             logger.info(
                 "[parallel_handoff] SmartRouter: 消息含「主代理」→ 最高优先级放行主代理（不路由子代理）"
             )
-            # 清掉该会话的续接记忆与命令锁，避免后续承接句被 T1.5 续给错误子代理
-            if getattr(self, "_cmd_lock", None):
-                self._cmd_lock.pop(event.unified_msg_origin, None)
+            # 清掉该会话的续接记忆，避免后续承接句被 T1.5 续给错误子代理。
+            # [2026-09-11 顾主口径修正] 这里**不再**清命令锁：过去对话里只要提到
+            # 「主代理」四个字就把命令强锁拆了，是「锁莫名其妙失效」的元凶之一。
+            # 现在令牌只放行本轮；要解绑请发 /主代理（走 T0 命令路径显式解锁）。
             last, _ = self._route_mem()
             last.pop(event.unified_msg_origin, None)
             return False
@@ -1181,6 +1261,17 @@ class RouterMixin:
             return True
         # T1 点名 / 领域词
         route = self._t1_route(message)
+        # [锁仲裁 2026-09-11 顾主口径] 粘滞在册组存在时，T1 只有提名权、没有转移权：
+        # 命中项在组外且不构成显式转移 → 判为叙述提及，丢弃 T1 结果，落回 T0.5 按原组
+        # 续接。效果：锁定了就一路是 TA，除非你明确喊人（呼叫词/前缀命令/短名消息）。
+        if route:
+            _locked = self._sticky_group_of(event)
+            if _locked and route not in _locked and not self._is_explicit_transfer(message):
+                logger.info(
+                    f"[parallel_handoff] SmartRouter: 锁仲裁 → T1 提名 {route} 属叙述提及，"
+                    f"保持粘滞组 {_locked}（T1 不得夺锁）"
+                )
+                route = None
         conf = 1.0 if route else 0.0
         source = "T1"
         # T0.5 会话粘滞锁定（零成本，纯规则；2026-09-07 方案A 取代旧 T1.5 弱续接）
