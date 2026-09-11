@@ -47,6 +47,18 @@
         "default": 45,
         "hint": "单步工具执行的等待上限。官方默认 120，需低于总超时才有意义。"
     },
+    "metrics_enabled": {
+        "description": "子代理效率实验 · token 计量开关",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后每次 LLM 调用落一行 JSONL，用于测通信税。实验期开，实验完可关。"
+    },
+    "metrics_path": {
+        "description": "token 计量落盘路径（留空用默认）",
+        "type": "string",
+        "default": "",
+        "hint": "默认 /root/AstrBot/data/experiments/subagent_efficiency/metrics.jsonl"
+    },
     "min_fragment_length": {
         "description": "最小分段长度（字符）",
         "type": "int",

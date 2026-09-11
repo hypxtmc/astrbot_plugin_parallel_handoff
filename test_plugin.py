@@ -4464,3 +4464,119 @@ class TestReadonlyToolWhitelistConfig(unittest.TestCase):
         p = self._plugin({"subagent_max_steps": 9, "subagent_tool_call_timeout": 30})
         self.assertEqual(p._cfg("subagent_max_steps", 5), 9)
         self.assertEqual(p._cfg("subagent_tool_call_timeout", 45), 30)
+
+
+class TestTokenMetrics(unittest.TestCase):
+    """2026-09-11 C 步：token 计量落盘（H3 通信税可测的前提）"""
+
+    @classmethod
+    def setUpClass(cls):
+        import os as _os
+
+        cls.PluginClass = _load_plugin_class()
+        # 计量测试需真实落盘：绕过 pytest 环境自动禁用
+        _os.environ["PH_METRICS_FORCE"] = "1"
+        cls._os = _os
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._os.environ.pop("PH_METRICS_FORCE", None)
+
+    def _plugin(self, cfg):
+        mock_context = MagicMock()
+        mock_context.provider_manager = MagicMock()
+        mock_context.provider_manager.llm_tools = None
+        return self.PluginClass(context=mock_context, config=cfg)
+
+    @staticmethod
+    def _usage():
+        class _U:
+            input_other = 100
+            input_cached = 20
+            output = 30
+            total = 150
+
+        return _U()
+
+    def test_record_writes_jsonl(self):
+        """一次记录落一行，字段完整"""
+        import json as _json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "m.jsonl")
+            p = self._plugin({"metrics_path": path})
+            p._metrics_record("sub", agent="closure", usage=self._usage(), latency_ms=1234)
+            with open(path, encoding="utf-8") as f:
+                rows = [_json.loads(x) for x in f if x.strip()]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "sub")
+        self.assertEqual(rows[0]["agent"], "closure")
+        self.assertEqual(rows[0]["total"], 150)
+        self.assertEqual(rows[0]["out"], 30)
+        self.assertEqual(rows[0]["latency_ms"], 1234)
+
+    def test_record_appends_multiple(self):
+        """多次记录追加，不覆盖"""
+        import json as _json
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "m.jsonl")
+            p = self._plugin({"metrics_path": path})
+            p._metrics_record("main", agent="__main__", usage=self._usage())
+            p._metrics_record("sub", agent="closure", usage=self._usage())
+            with open(path, encoding="utf-8") as f:
+                rows = [_json.loads(x) for x in f if x.strip()]
+        self.assertEqual([r["kind"] for r in rows], ["main", "sub"])
+
+    def test_disabled_skips_write(self):
+        """生产环境（无 pytest 变量）下：配置关不落盘、配置开落盘"""
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "m.jsonl")
+            saved_force = os.environ.pop("PH_METRICS_FORCE", None)
+            saved_test = os.environ.pop("PYTEST_CURRENT_TEST", None)
+            try:
+                p_off = self._plugin({"metrics_path": path, "metrics_enabled": False})
+                p_off._metrics_record("sub", agent="closure", usage=self._usage())
+                self.assertFalse(os.path.exists(path))
+
+                p_on = self._plugin({"metrics_path": path, "metrics_enabled": True})
+                p_on._metrics_record("sub", agent="closure", usage=self._usage())
+                self.assertTrue(os.path.exists(path))
+            finally:
+                if saved_force is not None:
+                    os.environ["PH_METRICS_FORCE"] = saved_force
+                if saved_test is not None:
+                    os.environ["PYTEST_CURRENT_TEST"] = saved_test
+
+    def test_bad_usage_swallowed(self):
+        """usage 异常值不抛异常（计量是旁路）"""
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "m.jsonl")
+            p = self._plugin({"metrics_path": path})
+            p._metrics_record("sub", agent="closure", usage=object())
+            self.assertTrue(os.path.exists(path))
+
+    def test_pytest_env_skips_write(self):
+        """pytest 环境默认不落盘（防测试污染真实计量文件）"""
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "m.jsonl")
+            os.environ.pop("PH_METRICS_FORCE", None)
+            try:
+                p = self._plugin({"metrics_path": path})
+                p._metrics_record("sub", agent="amiya", usage=self._usage())
+                self.assertFalse(os.path.exists(path))
+            finally:
+                os.environ["PH_METRICS_FORCE"] = "1"
