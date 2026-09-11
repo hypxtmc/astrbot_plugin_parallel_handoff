@@ -4421,3 +4421,46 @@ class TestSwitchLockOnNewMention(unittest.TestCase):
         p._record_route_hit(ev2, "skadi")
         sticky = p._t1_sticky_route(ev2, "继续聊")
         self.assertEqual(sticky, "skadi")
+
+
+class TestReadonlyToolWhitelistConfig(unittest.TestCase):
+    """2026-09-11：只读工具白名单抽成配置项 subagent_readonly_tools"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.PluginClass = _load_plugin_class()
+
+    def _plugin(self, cfg):
+        mock_context = MagicMock()
+        mock_context.provider_manager = MagicMock()
+        mock_context.provider_manager.llm_tools = None
+        return self.PluginClass(context=mock_context, config=cfg)
+
+    def test_default_when_config_empty(self):
+        """配置留空 → 回落内置默认 13 项"""
+        p = self._plugin({})
+        names = p._readonly_tool_names()
+        self.assertEqual(names, p._READONLY_TOOL_NAMES_DEFAULT)
+        self.assertEqual(len(names), 13)
+        self.assertIn("safe_read", names)
+
+    def test_config_override_comma_string(self):
+        """配置为逗号分隔字符串 → 按分隔解析"""
+        p = self._plugin({"subagent_readonly_tools": "safe_read, rg_search"})
+        self.assertEqual(p._readonly_tool_names(), ("safe_read", "rg_search"))
+
+    def test_config_override_list(self):
+        """配置为列表 → 直接采用"""
+        p = self._plugin({"subagent_readonly_tools": ["dir_list", "file_hash"]})
+        self.assertEqual(p._readonly_tool_names(), ("dir_list", "file_hash"))
+
+    def test_blank_config_falls_back(self):
+        """配置为空白串 → 回落默认，不产生空白名单"""
+        p = self._plugin({"subagent_readonly_tools": "  ,  "})
+        self.assertEqual(p._readonly_tool_names(), p._READONLY_TOOL_NAMES_DEFAULT)
+
+    def test_tool_loop_params_read_from_config(self):
+        """工具循环参数从配置读取（不再硬编码 5 / 45）"""
+        p = self._plugin({"subagent_max_steps": 9, "subagent_tool_call_timeout": 30})
+        self.assertEqual(p._cfg("subagent_max_steps", 5), 9)
+        self.assertEqual(p._cfg("subagent_tool_call_timeout", 45), 30)

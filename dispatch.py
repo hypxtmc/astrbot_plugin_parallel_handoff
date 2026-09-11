@@ -519,8 +519,8 @@ class DispatchMixin:
                     prompt=prompt_with_extra,
                     system_prompt=handoff.agent.instructions or "",
                     tools=subagent_tools,
-                    max_steps=5,
-                    tool_call_timeout=45,
+                    max_steps=self._cfg("subagent_max_steps", 5),
+                    tool_call_timeout=self._cfg("subagent_tool_call_timeout", 45),
                 ),
                 timeout=llm_timeout,
             )
