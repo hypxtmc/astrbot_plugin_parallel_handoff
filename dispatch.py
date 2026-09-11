@@ -512,6 +512,7 @@ class DispatchMixin:
             prompt_with_extra = (
                 f"{final_input}\n\n{_extra_text}" if _extra_text else final_input
             )
+            _m_t0 = time.monotonic()
             llm_resp = await asyncio.wait_for(
                 self.context.tool_loop_agent(
                     event=event,
@@ -523,6 +524,13 @@ class DispatchMixin:
                     tool_call_timeout=self._cfg("subagent_tool_call_timeout", 45),
                 ),
                 timeout=llm_timeout,
+            )
+            # token 计量（2026-09-11 C 步）：usage 取循环末轮值，总轮次需实测校准
+            self._metrics_record(
+                "sub",
+                agent=agent_name,
+                usage=getattr(llm_resp, "usage", None),
+                latency_ms=int((time.monotonic() - _m_t0) * 1000),
             )
             latency_ms = int((time.perf_counter() - t0) * 1000)
             raw_response = llm_resp.completion_text or ""

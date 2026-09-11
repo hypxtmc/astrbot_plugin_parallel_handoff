@@ -38,6 +38,7 @@ try:
     from . import router as _router_mod
     from . import arbitrate as _arbitrate_mod
     from . import side_pulse as _side_pulse_mod
+    from . import metrics as _metrics_mod
 except ImportError:
     import config as _config_mod
     import directive as _directive_mod
@@ -49,6 +50,7 @@ except ImportError:
     import router as _router_mod
     import arbitrate as _arbitrate_mod
     import side_pulse as _side_pulse_mod
+    import metrics as _metrics_mod
 
 
 @register(
@@ -67,9 +69,15 @@ class ParallelHandoffPlugin(
     _router_mod.RouterMixin,
     _arbitrate_mod.ArbitrationMixin,
     _side_pulse_mod.FamilyPulseMixin,
+    _metrics_mod.MetricsMixin,
     Star,
 ):
     """并行子代理调用插件"""
+
+    @filter.on_llm_response()
+    async def metrics_on_llm_response(self, event, response):
+        """主代理侧 token 计量（子代理走 llm_generate/tool_loop_agent，不触发本事件）"""
+        await self.on_llm_response_metrics(event, response)
 
     # agent_name -> 中文显示名 映射表
     AGENT_DISPLAY_NAME = {
