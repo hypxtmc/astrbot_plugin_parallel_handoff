@@ -29,6 +29,24 @@
         "default": 10,
         "hint": "召回条数的硬上限，防止一次注入过多记忆"
     },
+    "subagent_readonly_tools": {
+        "description": "子代理只读工具白名单（逗号分隔，留空用默认 13 项）",
+        "type": "string",
+        "default": "",
+        "hint": "子代理在工具循环里能调用的只读工具，留空则用内置默认：safe_read/dir_list/dir_tree/es_search/rg_search/text_filter/code_explore/code_index/code_status/file_hash/file_diff/safe_backups/astr_kb_search。写权工具不在此列（仅主代理持有）。"
+    },
+    "subagent_max_steps": {
+        "description": "子代理工具循环最大步数",
+        "type": "int",
+        "default": 5,
+        "hint": "子代理单次任务内最多执行几轮工具调用。官方默认 30，过高容易在 120 秒总超时内跑不完。"
+    },
+    "subagent_tool_call_timeout": {
+        "description": "子代理单次工具调用超时（秒）",
+        "type": "int",
+        "default": 45,
+        "hint": "单步工具执行的等待上限。官方默认 120，需低于总超时才有意义。"
+    },
     "min_fragment_length": {
         "description": "最小分段长度（字符）",
         "type": "int",

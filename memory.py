@@ -322,13 +322,24 @@ class MemoryMixin:
             return []
 
     # ── 构建子代理工具集（记忆工具过滤） ──
-    # 只读工具白名单（2026-09-11 顾主定：先给子代理「读」的手，写权留在主代理；
-    # 配合 dispatch 的 tool_loop_agent 才真正可执行）
-    _READONLY_TOOL_NAMES = (
+    # 只读工具白名单默认值（2026-09-11 顾主定：先给子代理「读」的手，写权留在主代理；
+    # 配合 dispatch 的 tool_loop_agent 才真正可执行）。
+    # 可被配置项 subagent_readonly_tools 覆盖。
+    _READONLY_TOOL_NAMES_DEFAULT = (
         "safe_read", "dir_list", "dir_tree", "es_search", "rg_search",
         "text_filter", "code_explore", "code_index", "code_status",
         "file_hash", "file_diff", "safe_backups", "astr_kb_search",
     )
+
+    def _readonly_tool_names(self):
+        """只读白名单：优先取配置 subagent_readonly_tools（逗号分隔字符串或列表），
+        空值回落 _READONLY_TOOL_NAMES_DEFAULT。"""
+        raw = self._cfg("subagent_readonly_tools", "")
+        if isinstance(raw, (list, tuple)):
+            names = [str(x).strip() for x in raw if str(x).strip()]
+        else:
+            names = [x.strip() for x in str(raw or "").split(",") if x.strip()]
+        return tuple(names) if names else self._READONLY_TOOL_NAMES_DEFAULT
 
     def _build_memory_tools(self, agent_name: str):
         """为子代理构建工具集（记忆工具 + 只读代码工具）。
@@ -355,7 +366,7 @@ class MemoryMixin:
                     wanted = {
                         "recall_long_term_memory",
                         "memorize_long_term_memory",
-                    } | set(self._READONLY_TOOL_NAMES)
+                    } | set(self._readonly_tool_names())
                     picked = [t for t in global_tools.func_list if t.name in wanted]
                     if picked:
                         subagent_tools = ToolSet(tools=picked)
