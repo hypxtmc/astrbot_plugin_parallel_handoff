@@ -4580,3 +4580,132 @@ class TestTokenMetrics(unittest.TestCase):
                 self.assertFalse(os.path.exists(path))
             finally:
                 os.environ["PH_METRICS_FORCE"] = "1"
+
+
+class TestCallOneFailurePaths(unittest.TestCase):
+    """2026-09-11 审查发现的三条修复回归
+
+    ①空回复兜底失败仍按 success=True 返回 → 空串进长期记忆 + 空段转发
+    ②超时文案引用了未赋值的 timeout 变量（应为 llm_timeout）
+    ③CancelledError 走不到 except Exception（BaseException），persona 标记残留
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.PluginClass = _load_plugin_class()
+
+    def _build(self, llm_side_effect):
+        # 容器用 AsyncMock：该插件的 context 上大量方法都是 await 点，
+        # 裸 MagicMock 会在 await 处抛「object can't be awaited」，污染断言
+        mock_context = AsyncMock()
+
+        class _FakeAgent:
+            name = "amiya"
+            instructions = ""
+            tools = None
+            begin_dialogs = None
+
+        class _FakeHandoff:
+            agent = _FakeAgent()
+            provider_id = "prov-test"
+            name = "transfer_to_amiya"
+
+        mock_context.subagent_orchestrator.handoffs = [_FakeHandoff()]
+        mock_context.get_all_stars.return_value = []
+        mock_context.llm_generate = AsyncMock(side_effect=llm_side_effect)
+        # 主调用走 tool_loop_agent（带工具循环），只有空回复兑底重试才走 llm_generate，两者都要挂
+        mock_context.tool_loop_agent = AsyncMock(side_effect=llm_side_effect)
+        mock_context.get_current_chat_provider_id.return_value = "prov-test"
+        mock_context.provider_manager.get_provider_by_id.return_value = None
+        plugin = self.PluginClass(
+            context=mock_context,
+            config={
+                "enable_scene_inject": False,
+                "enable_segmented_forward": False,
+                "enable_disambiguation": False,
+                "enable_subagent_name_prefix": False,
+                "subagent_context_enabled": False,
+            },
+        )
+        plugin.context = mock_context
+        # 隔离与本次修复无关的前置链路（记忆召回 / 每日状态注入）：
+        # mock 不全会以「MagicMock object can't be awaited」污染断言
+        plugin._memory_recall = AsyncMock(return_value=[])
+        plugin._daily_life_refresh_once = AsyncMock()
+        # 前缀装饰走真实实现即可，这里固定成恒等函数，避免污染 response 类型
+        plugin._maybe_prefix = lambda agent_name, text, flag: text
+        ev = MagicMock()
+        ev.unified_msg_origin = "session-test"
+        ev.message_obj.message_id = "msg-failpath-test"
+        return plugin, ev
+
+    def test_empty_reply_short_circuits_without_memory_write(self):
+        """空回复兜底失败 → success=False，且不写长期记忆、不追加跨轮上下文"""
+
+        def _empty(**kwargs):
+            from types import SimpleNamespace
+
+            return SimpleNamespace(
+                completion_text="", tools_call_name=[], reasoning_content=""
+            )
+
+        plugin, ev = self._build(_empty)
+        plugin._memory_store = AsyncMock()
+        plugin._ctx_engine = MagicMock()
+        plugin._ctx_engine.inject = AsyncMock(return_value="在吗")
+        ev = MagicMock()
+        raw = asyncio.run(
+            plugin.parallel_handoff(ev, calls=[{"agent_name": "amiya", "input": "在吗"}])
+        )
+        r0 = json.loads(raw)["results"][0]
+        self.assertFalse(r0["success"], "空回复必须判失败，不能报 success=True")
+        self.assertEqual(
+            r0["response"],
+            "",
+            f"空回复不应产出可转发文本（实际类型 {type(r0['response'])}）",
+        )
+        plugin._memory_store.assert_not_awaited()
+        plugin._ctx_engine.append.assert_not_called()
+
+    def test_timeout_message_uses_llm_timeout_value(self):
+        """超时文案必须落在实际生效的 llm_timeout 上（旧代码引用了不存在的 timeout）"""
+
+        def _timeout(**kwargs):
+            raise asyncio.TimeoutError()
+
+        plugin, ev = self._build(_timeout)
+        plugin._memory_store = AsyncMock()
+        plugin._ctx_engine = MagicMock()
+        plugin._ctx_engine.inject = AsyncMock(return_value="在吗")
+        raw = asyncio.run(
+            plugin.parallel_handoff(ev, calls=[{"agent_name": "amiya", "input": "在吗"}])
+        )
+        r0 = json.loads(raw)["results"][0]
+        self.assertFalse(r0["success"])
+        self.assertIn("Timeout after", r0["response"])
+        self.assertRegex(r0["response"], r"\d+s", "超时文案必须带具体秒数")
+        self.assertNotIn("{timeout}", r0["response"])
+
+    def test_cancelled_error_cleans_persona_marker(self):
+        """取消路径必须清 persona 标记，否则残留会污染下一位子代理调用"""
+
+        def _cancel(**kwargs):
+            raise asyncio.CancelledError()
+
+        plugin, ev = self._build(_cancel)
+        plugin._memory_store = AsyncMock()
+        plugin._ctx_engine = MagicMock()
+        plugin._ctx_engine.inject = AsyncMock(return_value="在吗")
+        try:
+            asyncio.run(
+                plugin.parallel_handoff(
+                    ev, calls=[{"agent_name": "amiya", "input": "在吗"}]
+                )
+            )
+        except asyncio.CancelledError:
+            # 是否上抛取决于外层 gather 策略，两条路径都算通过
+            pass
+        self.assertFalse(getattr(ev, "persona_id", None), "取消后 persona_id 必须清空")
+        self.assertFalse(
+            getattr(ev, "_subagent_persona", None), "取消后 _subagent_persona 必须清空"
+        )

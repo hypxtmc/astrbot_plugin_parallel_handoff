@@ -576,6 +576,27 @@ class DispatchMixin:
                         f"[parallel_handoff] 空回复重试失败 [{agent_name}]: {retry_e}"
                     )
 
+            # ── 空回复兑底失败 → 短路返回失败（2026-09-11 审查发现修复） ──
+            # 原逻辑：重试仍空也照样存记忆、追加上下文、返回 success=True，导致
+            #   ①空串进长期记忆 = 垃圾记录，下次召回可能当有效内容命中
+            #   ②空白回合占跨轮注入位，污染下一位子代理
+            #   ③调用方按 success=True 分段转发，用户端看到一条空消息
+            if not raw_response.strip():
+                for _attr in ("persona_id", "_subagent_persona"):
+                    if hasattr(event, _attr):
+                        delattr(event, _attr)
+                latency_ms = int((time.perf_counter() - t0) * 1000)
+                logger.warning(
+                    f"[parallel_handoff] 空回复兑底失败，已跳过记忆与上下文写入 [{agent_name}]"
+                )
+                return {
+                    "agent_name": agent_name,
+                    "success": False,
+                    "response": "",
+                    "latency_ms": latency_ms,
+                    "order": order,
+                }
+
             # ── 记忆存储：存入长期记忆（memory.py） ──
             await self._memory_store(
                 livingmemory_plugin, event, agent_name, final_input, raw_response
@@ -611,12 +632,12 @@ class DispatchMixin:
         except asyncio.TimeoutError:
             latency_ms = int((time.perf_counter() - t0) * 1000)
             logger.warning(
-                f"[parallel_handoff] Subagent '{agent_name}' timed out after {timeout}s"
+                f"[parallel_handoff] Subagent '{agent_name}' timed out after {llm_timeout}s"
             )
             for _attr in ("persona_id", "_subagent_persona"):
                 if hasattr(event, _attr):
                     delattr(event, _attr)
-            err_text = f"Timeout after {timeout}s"
+            err_text = f"Timeout after {llm_timeout}s"
             err_text = self._maybe_prefix(agent_name, err_text, enable_name_prefix)
             return {
                 "agent_name": agent_name,
@@ -625,6 +646,16 @@ class DispatchMixin:
                 "latency_ms": latency_ms,
                 "order": order,
             }
+        except asyncio.CancelledError:
+            # 取消路径不落 except Exception（CancelledError 自 Py3.8 起是 BaseException），
+            # 必须自己清理 persona 标记，否则残留会污染下轮调用（2026-09-11 审查发现）
+            for _attr in ("persona_id", "_subagent_persona"):
+                if hasattr(event, _attr):
+                    delattr(event, _attr)
+            logger.info(
+                f"[parallel_handoff] Subagent '{agent_name}' 被取消，已清理 persona 标记"
+            )
+            raise
         except Exception as e:
             for _attr in ("persona_id", "_subagent_persona"):
                 if hasattr(event, _attr):
