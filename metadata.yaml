@@ -3,6 +3,6 @@ version: 2.10.0
 author: hypxtmc
 desc: 多声部并行调度插件 — 主代理执棒，子代理各为声部：parallel 复调齐奏、chained 卡农轮唱、relay 指挥收谱、direct 独唱直出。双模式配置（技术干活/日常贴贴）、消息消歧、命令式点名强锁、路由强制指令、跨轮上下文引擎、常驻会话落盘、后台任务、读空气仲裁、个体状态随机演化、离线心情注入、家庭旁轨（子代理之间有自己的小日常）。原名
   parallel_handoff
-repo: https://github.com/hypxtmc/parallel_handoff
+repo: https://github.com/hypxtmc/astrbot_plugin_parallel_handoff
 require_astrbot_version: '>= 4.26.0'
 display_name: polyphony · 复调
