@@ -765,7 +765,7 @@ class FamilyPulseMixin:
         """用户私聊 UMO（拉人推送目标 + 接回检测匹配对象）。"""
         return self._cfg(
             "side_pulse_digest_umo",
-            "default_1000000000:FriendMessage:TESTUSER00000000000000000000000000",
+            "",
         )
 
     def _pulse_is_doctor_private(self, event) -> bool:
@@ -776,8 +776,9 @@ class FamilyPulseMixin:
             mt_s = str(mt).lower()
             if not (mt_s == "1" or "friend" in mt_s):
                 return False
-            sid = str(event.get_sender_id() or "")
-            return sid == "TESTUSER00000000000000000000000000"
+            # 统一（发布版）：私聊消息即视为“用户私聊”（群聊已在上方排除），
+            # 不再绑定特定用户 ID——拉人推送/接回检测对任意部署者生效。
+            return True
         except Exception:  # noqa: BLE001
             return False
 
@@ -1242,7 +1243,7 @@ class FamilyPulseMixin:
             msg = self._build_digest_text(logs, day)
             umo = self._cfg(
                 "side_pulse_digest_umo",
-                "default_1000000000:FriendMessage:TESTUSER00000000000000000000000000",
+                "",
             )
             if not umo:
                 return
