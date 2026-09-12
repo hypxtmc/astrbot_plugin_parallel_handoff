@@ -78,6 +78,41 @@ def _load_router_tables() -> dict:
         return {}
 
 
+# ── 主代理锁持久化（2026-09-12 用户 bug 治本）─────────────────
+# 背景：主代理锁此前是纯内存态，每次热重载/重启即丢失，用户看到「刚锁上又被
+# T1 抢走」。根因不是锁逻辑，而是锁没落盘。此处加写穿持久化：建锁/解锁即时
+# 写 data/main_lock.json，实例重启或热重载后首次访问时懒加载恢复。
+_MAIN_LOCK_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "data", "main_lock.json"
+)
+
+
+def _load_main_lock_file() -> dict:
+    """从磁盘加载主代理锁（热重载/重启后恢复）。缺文件返回空 dict。"""
+    try:
+        with open(_MAIN_LOCK_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return {str(k): float(v) for k, v in data.items() if isinstance(v, (int, float))}
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        logger.warning("[router] 主代理锁文件加载失败（按空锁继续）: %s", exc)
+    return {}
+
+
+def _save_main_lock_file(lock: dict) -> None:
+    """把主代理锁写盘（原子替换，杜绝热重载丢失）。"""
+    try:
+        os.makedirs(os.path.dirname(_MAIN_LOCK_PATH), exist_ok=True)
+        tmp = _MAIN_LOCK_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(lock, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, _MAIN_LOCK_PATH)
+    except Exception as exc:
+        logger.warning("[router] 主代理锁写盘失败（内存依旧生效）: %s", exc)
+
+
 _ROUTER_TABLES = _load_router_tables()
 # [发布泛化 2026-09-12 用户指定] "主代理"是全体部署者通用的强锁入口词，不依赖
 # 各自部署的主代理名（如"普瑞赛斯"）；两者并存，重复去重。别的用户装插件直接用
@@ -692,25 +727,35 @@ class RouterMixin:
         /主代理（或 /普瑞赛斯）一经建立，整个会话直通主代理；
         仅新命令（/子代理名）或 /复位 能解除。与子代理命令锁互斥。
         """
-        if not hasattr(self, "_main_lock"):
-            self._main_lock = {}       # session -> ts（主代理强锁）
-        self._main_lock[event.unified_msg_origin] = time.time()
+        lock = self._main_lock_data()
+        lock[event.unified_msg_origin] = time.time()
+        _save_main_lock_file(lock)   # [持久化 2026-09-12] 建锁即时落盘，热重载/重启不丢
         # 与子代理锁互斥：清掉旧的子代理命令锁 / 粘滞锁
         if getattr(self, "_cmd_lock", None):
             self._cmd_lock.pop(event.unified_msg_origin, None)
         last, _ = self._route_mem()
         last.pop(event.unified_msg_origin, None)
 
+    def _main_lock_data(self) -> dict:
+        """懒加载主代理锁（首次访问从盘恢复；热重载/重启后依旧有效）。"""
+        if not hasattr(self, "_main_lock"):
+            self._main_lock = _load_main_lock_file()
+            if self._main_lock:
+                logger.info(
+                    "[router] 主代理锁已从磁盘恢复（%d 条）", len(self._main_lock)
+                )
+        return self._main_lock
+
     def _main_locked(self, event) -> bool:
         """该会话是否被主代理锁锁定（锁定后非命令消息直通主代理）。"""
-        if not hasattr(self, "_main_lock"):
-            return False
-        return event.unified_msg_origin in self._main_lock
+        return event.unified_msg_origin in self._main_lock_data()
 
     def _clear_main_lock(self, event):
-        """解除主代理锁（/复位 或建立新子代理命令锁时调用）。"""
-        if getattr(self, "_main_lock", None):
-            self._main_lock.pop(event.unified_msg_origin, None)
+        """解除主代理锁（/复位 或建立新子代理命令锁时调用）。同步落盘。"""
+        lock = self._main_lock_data()
+        if event.unified_msg_origin in lock:
+            lock.pop(event.unified_msg_origin, None)
+            _save_main_lock_file(lock)
 
     def _record_direct_reply(self, session_id: str, agent_name: str, reply_text: str):
         """记录该 session 最近一次子代理直发回复尾部（供 T2 剧情参照，避免承接句判失）。"""

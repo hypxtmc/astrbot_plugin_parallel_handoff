@@ -4237,6 +4237,35 @@ class TestAgentCommand(unittest.TestCase):
     取代自然语言关键词猜测。/黍 · /黍+年 · /特蕾西娅+阿米娅+斯卡蒂 ·
     /普瑞赛斯+阿米娅+特蕾西娅，不设上限，命令持续生效（写粘滞锁）。"""
 
+    def setUp(self):
+        # [测试卫生 2026-09-12] 主代理锁持久化会写真实 data/main_lock.json。
+        # 插件实例经 spec_from_file_location 独立加载，测试进程 `import router`
+        # 拿到的模块对象与实例内部引用的可能不是同一个，模块属性 patch 不可靠。
+        # 改为「备份 → 清空 → 测试后恢复」真实文件，任何模块路径都无法绕过。
+        import os as _os
+        self._lock_file = _os.path.join(PLUGIN_DIR, "data", "main_lock.json")
+        self._lock_backup = None
+        try:
+            with open(self._lock_file, encoding="utf-8") as f:
+                self._lock_backup = f.read()
+        except FileNotFoundError:
+            self._lock_backup = None
+        with open(self._lock_file, "w", encoding="utf-8") as f:
+            f.write("{}")
+
+    def tearDown(self):
+        import os as _os
+        if self._lock_backup is not None:
+            # 恢复测试前内容（含空 {} 或真实锁），保证生产状态不被测试破坏
+            with open(self._lock_file, "w", encoding="utf-8") as f:
+                f.write(self._lock_backup)
+        else:
+            # 测试前无文件 → 测试后删除，恢复原始状态
+            try:
+                _os.remove(self._lock_file)
+            except FileNotFoundError:
+                pass
+
     def _fresh_router(self):
         p = _load_plugin_class()(
             context=MagicMock(),
@@ -4371,6 +4400,31 @@ class TestCmdLockHardGroup(unittest.TestCase):
     关键：锁定组内消息提及其他子代理名（如「你对阿米娅的看法」）绝不触发切换，
     T1/T0.5/T2 全失效。这是博士抓到的核心 bug 的治本回归测试。"""
 
+    def setUp(self):
+        # [测试卫生 2026-09-12] 同 TestAgentCommand：备份→清空→恢复真实锁文件，
+        # 防止主代理锁持久化测试写脏生产 data/main_lock.json。
+        import os as _os
+        self._lock_file = _os.path.join(PLUGIN_DIR, "data", "main_lock.json")
+        self._lock_backup = None
+        try:
+            with open(self._lock_file, encoding="utf-8") as f:
+                self._lock_backup = f.read()
+        except FileNotFoundError:
+            self._lock_backup = None
+        with open(self._lock_file, "w", encoding="utf-8") as f:
+            f.write("{}")
+
+    def tearDown(self):
+        import os as _os
+        if self._lock_backup is not None:
+            with open(self._lock_file, "w", encoding="utf-8") as f:
+                f.write(self._lock_backup)
+        else:
+            try:
+                _os.remove(self._lock_file)
+            except FileNotFoundError:
+                pass
+
     def _fresh(self):
         p = TestAgentCommand()._fresh_router()
         p._cmd_lock = {}
@@ -4454,6 +4508,48 @@ class TestCmdLockHardGroup(unittest.TestCase):
         p._record_main_lock(ev1)
         self.assertTrue(p._main_locked(ev1))
         self.assertFalse(p._main_locked(ev2))
+
+    def test_main_lock_persists_across_reload(self):
+        """[主代理锁 2026-09-12 bug 治本] 锁写盘持久化：模拟热重载（新实例）后仍生效"""
+        import router as router_mod
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as td:
+            base = os.path.join(td, "main_lock.json")
+            old_path = router_mod._MAIN_LOCK_PATH
+            try:
+                router_mod._MAIN_LOCK_PATH = base
+                p = self._fresh()
+                ev = MagicMock()
+                ev.unified_msg_origin = "sess-persist"
+                p._record_main_lock(ev)
+                self.assertTrue(os.path.exists(base), "锁文件应已写盘")
+                p2 = self._fresh()   # 新实例 = 模拟热重载后内存全空
+                if hasattr(p2, "_main_lock"):
+                    del p2._main_lock
+                self.assertTrue(p2._main_locked(ev), "新实例应从盘恢复锁")
+            finally:
+                router_mod._MAIN_LOCK_PATH = old_path
+
+    def test_main_lock_clear_persists(self):
+        """[主代理锁] /复位 清锁同步落盘，重载后不会复活"""
+        import router as router_mod
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as td:
+            base = os.path.join(td, "main_lock.json")
+            old_path = router_mod._MAIN_LOCK_PATH
+            try:
+                router_mod._MAIN_LOCK_PATH = base
+                p = self._fresh()
+                ev = MagicMock()
+                ev.unified_msg_origin = "sess-clear-persist"
+                p._record_main_lock(ev)
+                p._clear_main_lock(ev)
+                p2 = self._fresh()
+                if hasattr(p2, "_main_lock"):
+                    del p2._main_lock
+                self.assertFalse(p2._main_locked(ev), "解锁后重载不应复活")
+            finally:
+                router_mod._MAIN_LOCK_PATH = old_path
 
     def test_main_token_generic_entry(self):
         """[发布泛化 2026-09-12] /主代理 通用词即可命中主代理令牌（无需知道部署者名字）"""
