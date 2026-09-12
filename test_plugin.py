@@ -141,8 +141,8 @@ class TestSchema(unittest.TestCase):
         # 验证 main_agent_name 默认值
         self.assertEqual(
             self.schema["main_agent_name"]["default"],
-            "普瑞赛斯",
-            "main_agent_name default 应为 普瑞赛斯",
+            "主代理",
+            "main_agent_name default 应为 主代理",
         )
 
 
@@ -265,7 +265,7 @@ class TestMainagentPrefix(unittest.TestCase):
         plugin = self._make_plugin({
             "enable_mainagent_name_prefix": False,
         })
-        result = plugin.format_mainagent_message("你好", "普瑞赛斯")
+        result = plugin.format_mainagent_message("你好", "主代理")
         self.assertEqual(result, "你好")
 
     def test_format_mainagent_enabled(self):
@@ -273,8 +273,8 @@ class TestMainagentPrefix(unittest.TestCase):
         plugin = self._make_plugin({
             "enable_mainagent_name_prefix": True,
         })
-        result = plugin.format_mainagent_message("你好", "普瑞赛斯")
-        self.assertEqual(result, "【普瑞赛斯】\n你好")
+        result = plugin.format_mainagent_message("你好", "主代理")
+        self.assertEqual(result, "【主代理】\n你好")
 
     def test_format_mainagent_custom_name(self):
         """使用 main_agent_name 配置自定义名"""
@@ -289,11 +289,11 @@ class TestMainagentPrefix(unittest.TestCase):
         """name_display_map 中的主代理名优先生效"""
         plugin = self._make_plugin({
             "enable_mainagent_name_prefix": True,
-            "main_agent_name": "普瑞赛斯",
-            "name_display_map": json.dumps({"普瑞赛斯": "主控"}),
+            "main_agent_name": "主名",
+            "name_display_map": json.dumps({"主名": "映射名"}),
         })
-        result = plugin.format_mainagent_message("内容", "普瑞赛斯")
-        self.assertEqual(result, "【主控】\n内容")
+        result = plugin.format_mainagent_message("内容", "主名")
+        self.assertEqual(result, "【映射名】\n内容")
 
 
 class TestPrefixDedup(unittest.TestCase):
@@ -770,8 +770,8 @@ class TestHandoffBlacklist(unittest.TestCase):
 
 
 
-class TestBaselineIsolation(unittest.TestCase):
-    """测试剧情基线注入隔离（enable_baseline_inject / shared_scene_baseline）"""
+class TestBlacklistIsolation(unittest.TestCase):
+    """测试黑名单隔离（handoff_blacklist_agents：拦截、直连提示、不进入生成流程）"""
 
     @classmethod
     def setUpClass(cls):
@@ -828,57 +828,10 @@ class TestBaselineIsolation(unittest.TestCase):
         ev.get_message_type.return_value = mt
         return ev
 
-    def test_baseline_injected_to_subagent(self):
-        """enable_baseline_inject=true + 基线配置：非黑名单子代理 prompt 含基线"""
+    def test_blacklist_blocked_before_generation(self):
+        """黑名单代理在 _call_one 入口被拦截：进入生成流程前即返回"""
         plugin, mock_context = self._make_plugin({
-            "enable_baseline_inject": True,
-            "shared_scene_baseline": "这里是罗德岛，大家都在为未来努力。",
-        })
-        ev = self._make_event()
-        raw = asyncio.run(plugin.parallel_handoff(
-            ev,
-            calls=[{"agent_name": "amiya", "input": "你好"}],
-        ))
-        data = json.loads(raw)
-        self.assertEqual(data["results"][0]["success"], True)
-        prompt = mock_context.tool_loop_agent.call_args.kwargs["prompt"]
-        self.assertIn("【共用剧情场景基线】", prompt)
-        self.assertIn("这里是罗德岛", prompt)
-
-    def test_baseline_disabled_no_inject(self):
-        """enable_baseline_inject=false：prompt 不含基线"""
-        plugin, mock_context = self._make_plugin({
-            "enable_baseline_inject": False,
-            "shared_scene_baseline": "这里是罗德岛，大家都在为未来努力。",
-        })
-        ev = self._make_event()
-        asyncio.run(plugin.parallel_handoff(
-            ev,
-            calls=[{"agent_name": "amiya", "input": "你好"}],
-        ))
-        prompt = mock_context.tool_loop_agent.call_args.kwargs["prompt"]
-        self.assertNotIn("【共用剧情场景基线】", prompt)
-
-    def test_baseline_empty_no_inject(self):
-        """shared_scene_baseline 为空：prompt 不含基线"""
-        plugin, mock_context = self._make_plugin({
-            "enable_baseline_inject": True,
-            "shared_scene_baseline": "",
-        })
-        ev = self._make_event()
-        asyncio.run(plugin.parallel_handoff(
-            ev,
-            calls=[{"agent_name": "amiya", "input": "你好"}],
-        ))
-        prompt = mock_context.tool_loop_agent.call_args.kwargs["prompt"]
-        self.assertNotIn("【共用剧情场景基线】", prompt)
-
-    def test_baseline_does_not_leak_to_blacklist(self):
-        """黑名单代理在 _call_one 入口被拦截，碰不到基线注入代码：响应不含基线"""
-        plugin, mock_context = self._make_plugin({
-            "enable_baseline_inject": True,
-
-            "handoff_blacklist_agents": "demo",            "shared_scene_baseline": "这里是罗德岛，大家都在为未来努力。",
+            "handoff_blacklist_agents": "demo",
         })
         ev = self._make_event()
         raw = asyncio.run(plugin.parallel_handoff(
@@ -888,16 +841,12 @@ class TestBaselineIsolation(unittest.TestCase):
         data = json.loads(raw)
         self.assertEqual(data["results"][0]["success"], False)
         self.assertIn("强制直连黑名单", data["results"][0]["response"])
-        # 黑名单拦截发生在基线注入之前，响应中不应出现基线内容
-        self.assertNotIn("这里是罗德岛", data["results"][0]["response"])
         # 生成器不应被调用（黑名单直接拦截，不进入生成流程）
         mock_context.tool_loop_agent.assert_not_called()
 
     def test_blacklist_custom_blocked(self):
         """自定义黑名单子代理被拦截，提示 transfer_to 直连"""
         plugin, mock_context = self._make_plugin({
-            "enable_baseline_inject": True,
-            "shared_scene_baseline": "这里是罗德岛，大家都在为未来努力。",
             "handoff_blacklist_agents": "bb",
         }, handoff_names=("amiya", "bb"))
         ev = self._make_event()
@@ -913,7 +862,7 @@ class TestBaselineIsolation(unittest.TestCase):
 
 
 class TestBuildScenePrefix(unittest.TestCase):
-    """测试 _build_scene_prefix 场景 + 剧情基线前缀构建（scene.py）"""
+    """测试 _build_scene_prefix 场景前缀构建（scene.py）"""
 
     @classmethod
     def setUpClass(cls):
@@ -934,70 +883,19 @@ class TestBuildScenePrefix(unittest.TestCase):
         return ev
 
     def test_scene_only(self):
-        """仅场景注入：无基线"""
-        plugin = self._make_plugin({
-            "enable_baseline_inject": True,
-            "shared_scene_baseline": "",
-        })
+        """场景注入：前缀含场景信息"""
+        plugin = self._make_plugin({})
         prefix = plugin._build_scene_prefix(self._make_event(), True)
         self.assertIn("[场景信息]", prefix)
-        self.assertNotIn("【共用剧情场景基线】", prefix)
-
-    def test_scene_plus_baseline(self):
-        """场景 + 基线拼接"""
-        plugin = self._make_plugin({
-            "enable_baseline_inject": True,
-            "shared_scene_baseline": "罗德岛",
-        })
-        prefix = plugin._build_scene_prefix(self._make_event(), True)
-        self.assertIn("[场景信息]", prefix)
-        self.assertIn("【共用剧情场景基线】", prefix)
-        self.assertIn("罗德岛", prefix)
-
-    def test_baseline_only_no_scene(self):
-        """enable_scene_inject=false 时 _build_scene_prefix 仍组装基线（消费点 _apply_scene_prefix 直接使用，不再被场景开关短路）"""
-        plugin = self._make_plugin({
-            "enable_baseline_inject": True,
-            "shared_scene_baseline": "罗德岛",
-        })
-        prefix = plugin._build_scene_prefix(self._make_event(), False)
-        self.assertNotIn("[场景信息]", prefix)
-        self.assertIn("【共用剧情场景基线】", prefix)
-        self.assertIn("罗德岛", prefix)
-
-    def test_baseline_disabled(self):
-        """enable_baseline_inject=false：无基线"""
-        plugin = self._make_plugin({
-            "enable_baseline_inject": False,
-            "shared_scene_baseline": "罗德岛",
-        })
-        prefix = plugin._build_scene_prefix(self._make_event(), True)
-        self.assertIn("[场景信息]", prefix)
-        self.assertNotIn("【共用剧情场景基线】", prefix)
-
-    def test_apply_scene_prefix_consumes_baseline_when_scene_off(self):
-        """Bug#1 回归：基线消费点不再被 enable_scene_inject 短路（博士 2026-08-17 实锤）"""
-        plugin = self._make_plugin({
-            "enable_baseline_inject": True,
-            "shared_scene_baseline": "罗德岛",
-        })
-        prefix = plugin._build_scene_prefix(self._make_event(), False)
-        self.assertIn("【共用剧情场景基线】", prefix)
-        final = plugin._apply_scene_prefix("早上好", prefix)
-        self.assertIn("罗德岛", final)
-        self.assertIn("早上好", final)
 
     def test_apply_scene_prefix_empty_noop(self):
         """scene_prefix 空串：原样返回，不拼接"""
         plugin = self._make_plugin({})
         self.assertEqual(plugin._apply_scene_prefix("嗨", ""), "嗨")
 
-    def test_all_disabled(self):
-        """场景与基线均关闭：返回空串"""
-        plugin = self._make_plugin({
-            "enable_baseline_inject": False,
-            "shared_scene_baseline": "",
-        })
+    def test_scene_disabled(self):
+        """场景关闭：返回空串"""
+        plugin = self._make_plugin({})
         self.assertEqual(plugin._build_scene_prefix(self._make_event(), False), "")
 
 
@@ -1750,7 +1648,7 @@ class TestBuildRouteDirectiveMode(unittest.TestCase):
         cfg = {"direct_delivery_agents": "amiya,closure"}
         inst = self._make_plugin(cfg)
         d = inst._build_route_directive("affection")
-        assert "后宫贴贴" in d
+        assert "日常贴贴" in d
         assert "mode=\"affection\"" in d
         assert "direct" in d
 
@@ -2753,6 +2651,8 @@ class TestFamilyPulse(unittest.TestCase):
             "family_pulse_host_chance": 0,
             "family_pulse_host_max": 0,
             "family_pulse_draft_enable": False,
+            # 显式声明常驻池（代码侧不再内置默认名单，测试自备样本池）
+            "family_pulse_members": '["amiya","shu","closure","xi","theresia","skadi","ling","nian","liino","m3","kaltsit"]',
         }
         if config:
             base.update(config)
@@ -2771,15 +2671,12 @@ class TestFamilyPulse(unittest.TestCase):
         return r
 
     # ── 配置解析 ──
-    def test_members_default_on_invalid_json(self):
-        """常驻池非法 JSON / 缺员 → 回退默认 11 人全家池（博士 2026-09-04 拍板扩至所有子代理）"""
+    def test_members_invalid_or_insufficient_returns_empty(self):
+        """常驻池非法 JSON / 不足 2 人 → 返回空列表（代码侧不内置名单）"""
         p = self._make({"family_pulse_members": "{bad json"})
-        self.assertEqual(
-            p._pulse_members(),
-            ["amiya", "shu", "closure", "xi", "theresia", "skadi", "ling", "nian", "liino", "m3", "kaltsit"],
-        )
+        self.assertEqual(p._pulse_members(), [])
         p2 = self._make({"family_pulse_members": '["amiya"]'})
-        self.assertEqual(len(p2._pulse_members()), 11)
+        self.assertEqual(len(p2._pulse_members()), 0)
 
     def test_members_custom(self):
         p = self._make({"family_pulse_members": '["amiya","shu","closure"]'})
@@ -4180,6 +4077,97 @@ class TestStickyMultiGroup(unittest.TestCase):
         p._router_agent_pool = lambda: {"amiya": "阿米娅", "theresia": "特蕾西娅"}
         sticky = p._t1_sticky_route(ev, "继续")
         self.assertEqual(sticky, "amiya")
+class TestAdminCommand(unittest.TestCase):
+    """[软入口·A 方案 2026-09-12 博士指定] 柜台三件套：/谁在 /复位 /列表。
+    查锁、放锁、看名单；整句判定，带尾巴不拦截。纯逻辑测试（解析+文案+清锁）。"""
+
+    def _fresh_router(self):
+        p = _load_plugin_class()(
+            context=MagicMock(),
+            config={
+                "enable_smart_router": True,
+                "router_continue_window_sec": 300,
+            },
+        )
+        p._router_agent_pool = lambda: {
+            "amiya": "阿米娅",
+            "closure": "可露希尔",
+            "xi": "夕",
+        }
+        p._get_name_display_map = lambda: {
+            "amiya": "阿米娅",
+            "closure": "可露希尔",
+            "xi": "夕",
+        }
+        return p
+
+    def _ev(self, sid="sess-admin"):
+        ev = MagicMock()
+        ev.unified_msg_origin = sid
+        return ev
+
+    # ── 解析（_parse_admin_command）────────────────────
+    def test_parse_status(self):
+        p = self._fresh_router()
+        self.assertEqual(p._parse_admin_command("/谁在"), "status")
+        self.assertEqual(p._parse_admin_command("／状态"), "status")
+
+    def test_parse_reset(self):
+        p = self._fresh_router()
+        self.assertEqual(p._parse_admin_command("/复位"), "reset")
+        self.assertEqual(p._parse_admin_command("#解除"), "reset")
+
+    def test_parse_list(self):
+        p = self._fresh_router()
+        self.assertEqual(p._parse_admin_command("/列表"), "list")
+        self.assertEqual(p._parse_admin_command("！名单"), "list")
+
+    def test_parse_rejects_with_tail(self):
+        p = self._fresh_router()
+        self.assertEqual(p._parse_admin_command("/谁在 顺便说个事"), "")
+        self.assertEqual(p._parse_admin_command("/复位一下"), "")
+
+    def test_parse_rejects_agent_name(self):
+        p = self._fresh_router()
+        self.assertEqual(p._parse_admin_command("/阿米娅"), "")
+        self.assertEqual(p._parse_admin_command("/可露希尔"), "")
+
+    # ── 回执文案与清锁 ─────────────────────────────────
+    def test_status_reports_locked(self):
+        p = self._fresh_router()
+        ev = self._ev()
+        p._record_cmd_lock(ev, ["closure"])
+        text = p._admin_reply_text(ev, "status")
+        self.assertIn("可露希尔", text)
+        self.assertIn("锁着", text)
+
+    def test_status_reports_free(self):
+        p = self._fresh_router()
+        ev = self._ev()
+        text = p._admin_reply_text(ev, "status")
+        self.assertIn("自动分派", text)
+
+    def test_reset_clears_all_locks(self):
+        p = self._fresh_router()
+        ev = self._ev()
+        p._record_cmd_lock(ev, ["closure", "xi"])
+        last, _ = p._route_mem()
+        last[ev.unified_msg_origin] = {"closure": 1.0}
+        p._record_direct_reply(ev.unified_msg_origin, "closure", "在呢")
+        text = p._admin_reply_text(ev, "reset")
+        self.assertIsNone(p._cmd_locked_group(ev))
+        self.assertIsNone(last.get(ev.unified_msg_origin))
+        self.assertNotIn(ev.unified_msg_origin, p._route_reply)
+        self.assertIn("放开", text)
+
+    def test_list_contains_display_names(self):
+        p = self._fresh_router()
+        ev = self._ev()
+        text = p._admin_reply_text(ev, "list")
+        self.assertIn("阿米娅", text)
+        self.assertIn("可露希尔", text)
+
+
 class TestAgentCommand(unittest.TestCase):
     """[T0 命令式触发 2026-09-08 博士指定] 以 / 开头显式命令锁定子代理/主代理，
     取代自然语言关键词猜测。/黍 · /黍+年 · /特蕾西娅+阿米娅+斯卡蒂 ·
@@ -4737,122 +4725,6 @@ class TestSubagentResponsePreview(unittest.TestCase):
         )
         self.assertIn("_preview_chars", src)
         self.assertIn("response_truncated", src)
-
-
-class TestTokenMetrics(unittest.TestCase):
-    """2026-09-11 C 步：token 计量落盘（H3 通信税可测的前提）"""
-
-    @classmethod
-    def setUpClass(cls):
-        import os as _os
-
-        cls.PluginClass = _load_plugin_class()
-        # 计量测试需真实落盘：绕过 pytest 环境自动禁用
-        _os.environ["PH_METRICS_FORCE"] = "1"
-        cls._os = _os
-
-    @classmethod
-    def tearDownClass(cls):
-        cls._os.environ.pop("PH_METRICS_FORCE", None)
-
-    def _plugin(self, cfg):
-        mock_context = MagicMock()
-        mock_context.provider_manager = MagicMock()
-        mock_context.provider_manager.llm_tools = None
-        return self.PluginClass(context=mock_context, config=cfg)
-
-    @staticmethod
-    def _usage():
-        class _U:
-            input_other = 100
-            input_cached = 20
-            output = 30
-            total = 150
-
-        return _U()
-
-    def test_record_writes_jsonl(self):
-        """一次记录落一行，字段完整"""
-        import json as _json
-        import os
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as d:
-            path = os.path.join(d, "m.jsonl")
-            p = self._plugin({"metrics_path": path})
-            p._metrics_record("sub", agent="closure", usage=self._usage(), latency_ms=1234)
-            with open(path, encoding="utf-8") as f:
-                rows = [_json.loads(x) for x in f if x.strip()]
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["kind"], "sub")
-        self.assertEqual(rows[0]["agent"], "closure")
-        self.assertEqual(rows[0]["total"], 150)
-        self.assertEqual(rows[0]["out"], 30)
-        self.assertEqual(rows[0]["latency_ms"], 1234)
-
-    def test_record_appends_multiple(self):
-        """多次记录追加，不覆盖"""
-        import json as _json
-        import os
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as d:
-            path = os.path.join(d, "m.jsonl")
-            p = self._plugin({"metrics_path": path})
-            p._metrics_record("main", agent="__main__", usage=self._usage())
-            p._metrics_record("sub", agent="closure", usage=self._usage())
-            with open(path, encoding="utf-8") as f:
-                rows = [_json.loads(x) for x in f if x.strip()]
-        self.assertEqual([r["kind"] for r in rows], ["main", "sub"])
-
-    def test_disabled_skips_write(self):
-        """生产环境（无 pytest 变量）下：配置关不落盘、配置开落盘"""
-        import os
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as d:
-            path = os.path.join(d, "m.jsonl")
-            saved_force = os.environ.pop("PH_METRICS_FORCE", None)
-            saved_test = os.environ.pop("PYTEST_CURRENT_TEST", None)
-            try:
-                p_off = self._plugin({"metrics_path": path, "metrics_enabled": False})
-                p_off._metrics_record("sub", agent="closure", usage=self._usage())
-                self.assertFalse(os.path.exists(path))
-
-                p_on = self._plugin({"metrics_path": path, "metrics_enabled": True})
-                p_on._metrics_record("sub", agent="closure", usage=self._usage())
-                self.assertTrue(os.path.exists(path))
-            finally:
-                if saved_force is not None:
-                    os.environ["PH_METRICS_FORCE"] = saved_force
-                if saved_test is not None:
-                    os.environ["PYTEST_CURRENT_TEST"] = saved_test
-
-    def test_bad_usage_swallowed(self):
-        """usage 异常值不抛异常（计量是旁路）"""
-        import os
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as d:
-            path = os.path.join(d, "m.jsonl")
-            p = self._plugin({"metrics_path": path})
-            p._metrics_record("sub", agent="closure", usage=object())
-            self.assertTrue(os.path.exists(path))
-
-    def test_pytest_env_skips_write(self):
-        """pytest 环境默认不落盘（防测试污染真实计量文件）"""
-        import os
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as d:
-            path = os.path.join(d, "m.jsonl")
-            os.environ.pop("PH_METRICS_FORCE", None)
-            try:
-                p = self._plugin({"metrics_path": path})
-                p._metrics_record("sub", agent="amiya", usage=self._usage())
-                self.assertFalse(os.path.exists(path))
-            finally:
-                os.environ["PH_METRICS_FORCE"] = "1"
 
 
 class TestCallOneFailurePaths(unittest.TestCase):

@@ -29,17 +29,23 @@
         "default": 10,
         "hint": "召回条数的硬上限，防止一次注入过多记忆"
     },
-    "subagent_readonly_tools": {
-        "description": "子代理只读工具白名单（逗号分隔，留空用默认 13 项）",
+    "subagent_tools": {
+        "description": "子代理工具白名单（逗号分隔，留空用默认读写档 37 项）",
         "type": "string",
         "default": "",
-        "hint": "子代理在工具循环里能调用的只读工具，留空则用内置默认：safe_read/dir_list/dir_tree/es_search/rg_search/text_filter/code_explore/code_index/code_status/file_hash/file_diff/safe_backups/astr_kb_search。写权工具不在此列（仅主代理持有）。"
+        "hint": "默认集含文件读写（safe_edit/safe_write/multi_edit/file_patch/file_preview/safe_rollback/file_remove/file_move/file_zip/file_unzip/config_diff/symbol_rename）、门禁（syntax_check/lint_runner/test_runner）、本地 git（status/diff/log/commit/branch/remote/changelog）、读工具与原 read 集。高风险工具（shell_exec / astrbot_execute_shell / hot_reload_plugin / git_push / gh_*）刻意不在默认集，需单独授权后写进本项。"
+    },
+    "subagent_readonly_tools": {
+        "description": "【旧键·兼容保留】子代理工具白名单，已被 subagent_tools 取代",
+        "type": "string",
+        "default": "",
+        "hint": "优先读 subagent_tools；本键仅在 subagent_tools 为空时生效，留空回落内置默认（读写档）。"
     },
     "subagent_max_steps": {
         "description": "子代理工具循环最大步数",
         "type": "int",
-        "default": 5,
-        "hint": "子代理单次任务内最多执行几轮工具调用。官方默认 30，过高容易在 120 秒总超时内跑不完。"
+        "default": 10,
+        "hint": "子代理单次任务内最多执行几轮工具调用。官方默认 30，过高容易在 120 秒总超时内跑不完。实测 8 步对「4 问 / 3 文件」的检索刚好卡边界，提到 10 留出余量。"
     },
     "subagent_tool_call_timeout": {
         "description": "子代理单次工具调用超时（秒）",
@@ -47,17 +53,11 @@
         "default": 45,
         "hint": "单步工具执行的等待上限。官方默认 120，需低于总超时才有意义。"
     },
-    "metrics_enabled": {
-        "description": "子代理效率实验 · token 计量开关",
-        "type": "bool",
-        "default": true,
-        "hint": "开启后每次 LLM 调用落一行 JSONL，用于测通信税。实验期开，实验完可关。"
-    },
-    "metrics_path": {
-        "description": "token 计量落盘路径（留空用默认）",
-        "type": "string",
-        "default": "",
-        "hint": "默认 /root/AstrBot/data/experiments/subagent_efficiency/metrics.jsonl"
+    "subagent_response_preview_chars": {
+        "description": "返回主代理的子代理回复预览长度（字符）",
+        "type": "int",
+        "default": 800,
+        "hint": "分段转发模式下子代理回复直发用户，返回给主代理的是预览。原为硬编码 120 字，主代理无法据此做汇总复核（2026-09-11 实测撞三次）。提到 800 并新增 response_chars / response_truncated 字段，被吞多少一眼可见。"
     },
     "min_fragment_length": {
         "description": "最小分段长度（字符）",
@@ -98,8 +98,14 @@
     "main_agent_name": {
         "description": "主代理显示名",
         "type": "string",
-        "default": "普瑞赛斯",
-        "hint": "启用主代理姓名前缀时使用的中文显示名。默认为「普瑞赛斯」。"
+        "default": "主代理",
+        "hint": "启用主代理姓名前缀时使用的中文显示名。"
+    },
+    "user_address": {
+        "description": "主对话者称呼（系统文本用）",
+        "type": "string",
+        "default": "用户",
+        "hint": "多人共享记录（如「▍称呼：」）、记忆沉淀模板等系统生成文本中，对主对话者的称呼。子代理在对话里怎么称呼用户（如「主人」「宝宝」）由各子代理自身人格设定决定，与该项无关。"
     },
     "enable_scene_inject": {
         "description": "启用场景注入",
@@ -123,7 +129,7 @@
         "description": "子代理显示名映射",
         "type": "string",
         "default": "{}",
-        "hint": "留空即可：自动使用内置中文显示名（阿米娅/特蕾西娅/可露希尔/斯卡蒂/夕/黍/年/令/技术Agent 等）。仅当需要自定义显示名时才填，JSON格式：{\"amiya\": \"阿米娅酱\"}"
+        "hint": "留空即可：自动使用内置显示名。仅当需要自定义显示名时才填，JSON 格式：{\"agent_a\": \"自定义名\"}"
     },
     "direct_delivery_agents": {
         "description": "直接发送到用户的子代理列表",
@@ -136,6 +142,36 @@
         "type": "string",
         "default": "tech,技术Agent",
         "hint": "逗号分隔的子代理名。列出的子代理（如 tech/技术Agent）永远不走 parallel_handoff 插件的 relay 中转，必须由主代理直接调用 transfer_to_xxx 工具直连；parallel_handoff / call_subagent 调用这些代理会被拦截并提示改用 transfer_to_*。"
+    },
+    "subagent_session_persist": {
+      "description": "会话落盘（跨重启保留子代理对话历史）",
+      "type": "bool",
+      "default": true,
+      "hint": "开启后子代理的对话历史写入磁盘，主代理重启后历史仍在——这是子代理从『临时工』变成『常驻同事』的关键。关闭则回落纯内存（与改造前行为完全一致），重启即失忆。落盘失败自动降级并记日志，绝不阻断对话。"
+    },
+    "subagent_session_retention_days": {
+      "description": "会话历史保留天数",
+      "type": "int",
+      "default": 30,
+      "hint": "超过此天数的会话文件会被清理（清理是手动的，本参数只定阈值）。注意：内存窗口 subagent_context_max_turns 截断的是内存，磁盘保留全量——所以把窗口调小不会永久丢历史。"
+    },
+    "subagent_task_max_concurrent": {
+      "description": "后台任务全局并发上限",
+      "type": "int",
+      "default": 20,
+      "hint": "二期后台任务（parallel_handoff 传 background=true 时生效）：同时运行的任务数上限，超过则拒绝新任务并返回错误（不排队）。"
+    },
+    "subagent_task_max_per_session": {
+      "description": "后台任务单会话并发上限",
+      "type": "int",
+      "default": 5,
+      "hint": "二期后台任务：同一个会话最多同时跑几个任务，防止单个会话把全局额度吃光。"
+    },
+    "subagent_task_turn_timeout": {
+      "description": "后台任务单任务超时（秒）",
+      "type": "int",
+      "default": 900,
+      "hint": "二期后台任务：看门狗。单个任务超过此时长会被强杀并标记为 interrupted，避免卡死的任务永远占着并发额度。"
     },
     "subagent_context_enabled": {
         "description": "启用跨轮对话上下文",
@@ -172,18 +208,6 @@
         "type": "string",
         "default": "parallel",
         "hint": "parallel=并行调用所有子代理（快，各说各话）；chained=接龙式串行调用（慢，前一个子代理的回复自动传给下一个作为上下文，剧情连贯）。direct/relay 路由模式不受影响，接龙时两者均正常工作。"
-    },
-    "shared_scene_baseline": {
-        "description": "共用剧情场景基线（多行文本，所有子代理共享的世界设定锚点，仅放静态内容）",
-        "type": "text",
-        "default": "",
-        "hint": "世界/居所/成员/岁相/规则等静态设定；动态剧情（怀孕/大事）不写入，由普瑞赛斯动态传达"
-    },
-    "enable_baseline_inject": {
-        "description": "是否向子代理注入共用剧情基线",
-        "type": "bool",
-        "default": true,
-        "hint": "关闭后子代理不再接收基线内容"
     },
     "chain_summary_enabled": {
         "description": "接龙长回复精简开关",
@@ -237,7 +261,7 @@
         "description": "T2小模型路由置信度阈值",
         "type": "float",
         "default": 0.8,
-        "hint": ">= 该值才直连子代理，低于则落回主代理。阈值越高越保守（宁可多过主代理），博士设定 0.8。"
+        "hint": ">= 该值才直连子代理，低于则落回主代理。阈值越高越保守（宁可多过主代理），推荐 0.8。"
     },
     "router_provider_id": {
         "description": "T2路由小模型 Provider ID",
@@ -255,19 +279,19 @@
         "description": "技术干活模式调度配置（JSON）",
         "type": "string",
         "default": "{\"route_mode\": \"relay\", \"call_mode\": \"parallel\", \"timeout\": 120}",
-        "hint": "博士自定义技术模式调度方式，JSON格式：{\"route_mode\": \"relay|direct\", \"call_mode\": \"parallel|chained\", \"timeout\": 秒数}。route_mode=relay 子代理回复返回主代理汇总（统帅收卷），direct 直接发用户端；call_mode=parallel 并行调度，chained 接龙串行。博士配置永远优先（2026-08-31 博士指定）：mode命中时此配置无条件覆盖模型显式传参。改动即时生效。"
+        "hint": "自定义技术模式调度方式，JSON格式：{\"route_mode\": \"relay|direct\", \"call_mode\": \"parallel|chained\", \"timeout\": 秒数}。route_mode=relay 子代理回复返回主代理汇总（统帅收卷），direct 直接发用户端；call_mode=parallel 并行调度，chained 接龙串行。配置永远优先：mode命中时此配置无条件覆盖模型显式传参。改动即时生效。"
     },
     "affection_mode_config": {
-        "description": "后宫贴贴模式调度配置（JSON）",
+        "description": "日常贴贴模式调度配置（JSON）",
         "type": "string",
         "default": "{\"route_mode\": \"direct\", \"call_mode\": \"chained\", \"timeout\": 120}",
-        "hint": "博士自定义后宫贴贴模式调度方式，JSON格式：{\"route_mode\": \"relay|direct\", \"call_mode\": \"parallel|chained\", \"timeout\": 秒数}。route_mode=direct 子代理回复直接分段转发用户端（主代理隐身），relay 返回主代理；call_mode=chained 接龙串行，parallel 并行。博士配置永远优先（2026-08-31 博士指定）：mode命中时此配置无条件覆盖模型显式传参。改动即时生效。"
+        "hint": "自定义日常贴贴模式调度方式，JSON格式：{\"route_mode\": \"relay|direct\", \"call_mode\": \"parallel|chained\", \"timeout\": 秒数}。route_mode=direct 子代理回复直接分段转发用户端（主代理隐身），relay 返回主代理；call_mode=chained 接龙串行，parallel 并行。配置永远优先：mode命中时此配置无条件覆盖模型显式传参。改动即时生效。"
     },
     "enable_read_air_arbitrate": {
         "description": "读空气仲裁总开关",
         "type": "bool",
         "default": false,
-        "hint": "开启后在自动路由犹豫点做「宁静权」克制（群聊杂谈/弱路由时让主代理自然接住，而非逢消息就抢派子代理）。默认关=零行为变化。绝不拦博士明确点名的人（点名神圣不可侵）。"
+        "hint": "开启后在自动路由犹豫点做「宁静权」克制（群聊杂谈/弱路由时让主代理自然接住，而非逢消息就抢派子代理）。默认关=零行为变化。绝不拦用户明确点名的人（点名神圣不可侵）。"
     },
     "read_air_enforce": {
         "description": "读空气·真实拦截开关（宁静权落地闸门）",
@@ -291,13 +315,13 @@
         "description": "家庭旁轨（她们之间的小日子）",
         "type": "bool",
         "default": false,
-        "hint": "开启后：每小时一次心跳让常驻池里 2 人按今日状态闲聊两句（内部转，不打扰博士），每晚推送一条「家里动静」摘要到博士私聊。关闭=零注册零行为。"
+        "hint": "开启后：每小时一次心跳让常驻池里 2 人按今日状态闲聊两句（内部转，不打扰用户），每晚推送一条「家里动静」摘要到用户私聊。关闭=零注册零行为。"
     },
     "family_pulse_members": {
-        "description": "家庭旁轨常驻池（JSON 数组，已扩至全家）",
+        "description": "家庭旁轨常驻池（JSON 数组，子代理英文 id）",
         "type": "string",
-        "default": "[\"amiya\",\"shu\",\"closure\",\"xi\",\"theresia\",\"skadi\",\"ling\",\"nian\",\"liino\",\"m3\",\"kaltsit\"]",
-        "hint": "全家 11 人常驻（2026-09-04 扩至所有子代理）：阿米娅/黍/可露希尔/夕/特蕾西娅/斯卡蒂/令/年/梨诺/M3/凯尔希。JSON 数组格式，非法值回退默认。"
+        "default": "[]",
+        "hint": "填入参与旁轨的子代理英文 id，JSON 数组格式，如 [\"agent_a\",\"agent_b\"]；至少 2 个才生效，非法值回退默认。"
     },
     "family_pulse_cron": {
         "description": "家庭旁轨心跳 cron",
@@ -309,7 +333,7 @@
         "description": "家里动静摘要推送 cron",
         "type": "string",
         "default": "50 21 * * *",
-        "hint": "每晚 21:50 把当天旁轨对话原样汇成一条推给博士。无日志不发送。"
+        "hint": "每晚 21:50 把当天旁轨对话原样汇成一条推给用户。无日志不发送。"
     },
     "family_pulse_provider_id": {
         "description": "家庭旁轨 LLM Provider ID",
@@ -320,11 +344,11 @@
     "family_pulse_digest_umo": {
         "description": "摘要推送目标会话 UMO",
         "type": "string",
-        "default": "default_1000000000:FriendMessage:TESTUSER00000000000000000000000000",
-        "hint": "博士私聊（与 biliread 晚报同目标）。留空则不推送。"
+        "default": "",
+        "hint": "推送目标私聊的会话 UMO。留空则不推送。"
     },
     "family_pulse_interlope_chance": {
-        "description": "自由插话概率（路线B，博士 2026-09-04 拍板）",
+        "description": "自由插话概率（路线 B）",
         "type": "float",
         "default": 0.45,
         "hint": "围坐主链之外，未入座的人每轮冒话的概率 0~1。0=关掉插话（纯围坐）；调高=爱接话的人更多。"
@@ -336,10 +360,10 @@
         "hint": "一场心跳最多让旁观者插几次话，防止插话刷屏盖过主链。"
     },
     "family_pulse_host_chance": {
-        "description": "主代理（普瑞赛斯）参与旁轨插话概率",
+        "description": "主代理参与旁轨插话概率",
         "type": "float",
         "default": 0.3,
-        "hint": "围坐闲聊时主代理以自己身份插话的概率 0~1。0=主代理不参与（默认纯子代理围坐）；调高=女主人更常冒话。博士 2026-09-04 拍板要参与。"
+        "hint": "围坐闲聊时主代理以自己身份插话的概率 0~1。0=主代理不参与（默认纯子代理围坐）；调高=主代理更常冒话。"
     },
     "family_pulse_host_max": {
         "description": "主代理一场最多插话次数",
@@ -348,46 +372,46 @@
         "hint": "一场心跳里主代理最多插几次话，防止喧宾夺主。"
     },
     "family_pulse_draft_enable": {
-        "description": "拉博士进旁轨总开关",
+        "description": "拉用户进旁轨总开关",
         "type": "bool",
         "default": false,
-        "hint": "围坐聊到兴头把博士拉进来一起聊（2026-09-04 博士拍板）。默认关，开启后生效。"
+        "hint": "围坐聊到兴头把用户拉进来一起聊。默认关，开启后生效。"
     },
     "family_pulse_draft_chance_workday": {
-        "description": "工作日拉博士概率",
+        "description": "工作日拉用户概率",
         "type": "float",
         "default": 0.1,
-        "hint": "工作日聊到兴头把博士拉进来的概率 0~1，拉得少。"
+        "hint": "工作日聊到兴头把用户拉进来的概率 0~1，拉得少。"
     },
     "family_pulse_draft_chance_holiday": {
-        "description": "节假日（含双休）拉博士概率",
+        "description": "节假日（含双休）拉用户概率",
         "type": "float",
         "default": 0.3,
-        "hint": "节假日/双休把博士拉进来的概率 0~1，拉得多。"
+        "hint": "节假日/双休把用户拉进来的概率 0~1，拉得多。"
     },
     "family_pulse_draft_quota_workday": {
-        "description": "工作日每日拉博士次数上限",
+        "description": "工作日每日拉用户次数上限",
         "type": "int",
         "default": 2,
-        "hint": "工作日一天最多拉博士几次，防骚扰。"
+        "hint": "工作日一天最多拉用户几次，防骚扰。"
     },
     "family_pulse_draft_quota_holiday": {
-        "description": "节假日每日拉博士次数上限",
+        "description": "节假日每日拉用户次数上限",
         "type": "int",
         "default": 5,
-        "hint": "节假日/双休一天最多拉博士几次。"
+        "hint": "节假日/双休一天最多拉用户几次。"
     },
     "family_pulse_recent_hours": {
         "description": "「家里动静」查看窗口（小时）",
         "type": "int",
         "default": 6,
-        "hint": "博士私聊问子代理「你们聊了什么」时，只注入最近 N 小时的旁轨家常原文（2026-09-05 博士拍板，替代全量累积注入）。更早的生活线由子代理 recall 工具按需自查。"
+        "hint": "用户私聊问子代理「你们聊了什么」时，只注入最近 N 小时的旁轨家常原文（替代全量累积注入）。更早的生活线由子代理 recall 工具按需自查。"
     },
     "family_pulse_window_start": {
         "description": "心跳活跃窗起点（CST）",
         "type": "string",
         "default": "06:17",
-        "hint": "作息式心跳：每天这个时间开始活跃（2026-09-05 博士拍板）"
+        "hint": "作息式心跳：每天这个时间开始活跃"
     },
     "family_pulse_window_end": {
         "description": "心跳活跃窗终点（CST，跨零点）",

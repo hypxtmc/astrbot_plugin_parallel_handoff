@@ -5,11 +5,11 @@
 - 本文件当前只做【状态记录】，绝不碰任何路由行为（质量/安全优先的最低侵入原则）
 - 仲裁判定方法 _arbitrate_directive / _arbitrate_tool 先留空壳，段二再填逻辑
 
-设计核心（博士 2026-09-03 定性）：
+设计核心（用户 2026-09-03 定性）：
 ① 随机性是三期任务，一期只做「宁静权」克制、不引入子代理日常随机演化；
 ② 旧怨只体现为贫嘴（刀子嘴豆腐心），不针锋相对，绝不作对抗性仲裁判据；
 ③ 读空气仲裁 = 在自动路由「该不该派子代理」的犹豫点追加宁静权克制，
-   绝不比 _mode_shortcut_decision 更激进、绝不拦博士明确点名的人。
+   绝不比 _mode_shortcut_decision 更激进、绝不拦用户明确点名的人。
 """
 
 import logging
@@ -103,7 +103,7 @@ class ArbitrationMixin:
         """读空气【真实拦截】二级开关（默认 False）。
 
         [段五 2026-09-10] 段二落地时只做 observe 日志、绝不拦路由；本开关是
-        「观察」到「执行」的唯一闸门，与总开关分离，便于博士灰度验收：
+        「观察」到「执行」的唯一闸门，与总开关分离，便于用户灰度验收：
             enable_read_air_arbitrate=False                → 整套零开销（总闸）
             enable_read_air_arbitrate=True + 本开关 False   → 段二行为，仅日志
             enable_read_air_arbitrate=True + 本开关 True    → 宁静权真实拦截
@@ -139,7 +139,7 @@ class ArbitrationMixin:
         """M3 今日状态契合度封装：agent 今日话题域对当前消息的命中数。
 
         纯关键词、零 LLM；状态/异常一律归零，绝不因数据缺失炸调用方。
-        供观察日志 + 未来接话权重叠加使用（真实拦截仍待博士验收后开启）。
+        供观察日志 + 未来接话权重叠加使用（真实拦截仍待用户验收后开启）。
         """
         try:
             scene = getattr(event, "unified_msg_origin", None) or "default"
@@ -190,7 +190,7 @@ class ArbitrationMixin:
             None   不介入（保持现有路由行为）
             'main' 建议克制落主代理（不短路、不抢派）
 
-        段二节奏（博士 2026-09-03 12:31 拍板）：
+        段二节奏（用户 2026-09-03 12:31 拍板）：
             - 当前只做【低侵入日志提示】：在自动路由要短路抢派子代理之前，输出
               Read-Air 判断日志（它想不想克制），但【绝不实际拦截】路由结果。
             - 等【三期】的随机性日常演化补齐后，再实验性开启真实克制干预。
@@ -200,7 +200,7 @@ class ArbitrationMixin:
             return None
 
         # 沉默权/最后切底线（无论开不开都该守住，但段二也只做日志）：
-        # 博士明确点名的人，读空气绝不建议抢它的派（点名神圣不可侵原则）。
+        # 用户明确点名的人，读空气绝不建议抢它的派（点名神圣不可侵原则）。
         # 仍在读空气自己动手的路径上不拦——这里仅在自动路由犹豫点给提示。
         if not route or not mode_decision:
             # 无候选或 mode 已放行主代理 → 读空气无克制建议（本来就不短路）
@@ -250,16 +250,16 @@ class ArbitrationMixin:
         """
         recent_agents = [r["agent"] for r in presence.recent]
         # R4 旧怨组密集互抛 → 主代理兜住。
-        # 定性（博士 2026-09-03）：旧怨只体现为贫嘴（刀子嘴豆腐心），绝不作对抗性
+        # 定性（用户 2026-09-03）：旧怨只体现为贫嘴（刀子嘴豆腐心），绝不作对抗性
         # 仲裁判据。故本规则只产出「让主代理兜住」这一收敛信号，绝不判定谁不能说话。
         # [段五 2026-09-10 修复] 旧实现有两处致命伤，导致 R4 从未生效过：
         #   ① 它嵌在 R2 的 if 块内、且位于 R2 无条件 return True 之前 —— 两条 return
         #      结果相同，R4 的判定白算，是死代码；
-        #   ② 判据键名 "presis" / "普瑞赛斯" 与主代理真实记录键 MAIN_SPEAKER("__main__")
+        #   ② 判据键名 "presis" / "主代理" 与主代理真实记录键 MAIN_SPEAKER("__main__")
         #      不一致，c1 恒为 0，条件永不成立。
         # 修法：提到 R2 之前独立判定 + 键名对齐 MAIN_SPEAKER。
         c_main = sum(1 for a in recent_agents if a == MAIN_SPEAKER or a == "presis")
-        c_kaltsit = sum(1 for a in recent_agents if a in ("kaltsit", "凯尔希"))
+        c_kaltsit = sum(1 for a in recent_agents if a == "kaltsit" or a == self._display_name("kaltsit"))
         if c_main >= 2 and c_kaltsit >= 2:
             return True
         # R1 主代理刚回过话 → 倾向让主代理继续，别抢
@@ -282,7 +282,7 @@ class ArbitrationMixin:
         返回：原 calls（绝不过滤；「不砍 calls」是 V2 关键约束，多人并行是主代理显式意图。
         段三只做两件事，均不改变路由结果：
             1. 更新 pending_batch，记录本批 candidate，供路径 A 下轮「读空气」参考。
-            2. 温和收敛建议：当博士 UI 只点名一人、但本批 calls 却误带多人时，
+            2. 温和收敛建议：当用户 UI 只点名一人、但本批 calls 却误带多人时，
                打日志提示主代理「本批是否只需某人」——仅建议，绝不强制。
         """
         if not self._read_air_enabled():
@@ -295,7 +295,7 @@ class ArbitrationMixin:
         except Exception as e:
             _logger.warning("[read_air] pending_batch update failed (non-fatal): %s", e)
 
-        # 2) 温和收敛建议：博士只点名一人、但 calls 误带多人 → 日志提示是否只需某人
+        # 2) 温和收敛建议：用户只点名一人、但 calls 误带多人 → 日志提示是否只需某人
         # （复用 RouterMixin._t1_mentions，零重复造轮子；仅提示不砍 calls）
         try:
             if len(canonical_calls) > 1 and hasattr(self, "_t1_mentions"):
@@ -304,7 +304,7 @@ class ArbitrationMixin:
                 if len(mentions) == 1:
                     named = next(iter(mentions))
                     _logger.info(
-                        "[read_air][converge] 博士本轮只点名 %s，但 parallel_handoff 本批 calls 带了 %d 人"
+                        "[read_air][converge] 用户本轮只点名 %s，但 parallel_handoff 本批 calls 带了 %d 人"
                         "（%s）。是否只需 %s ？建议核对，不强制过滤。",
                         named,
                         len(canonical_calls),

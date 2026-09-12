@@ -49,7 +49,7 @@ class ForwardMixin:
         try:
             prefix = ""
             content = text
-            # [2026-08-30 普瑞赛斯] 子代理转发走 send_message 直发，
+            # [2026-08-30 主代理] 子代理转发走 send_message 直发，
             # 不经过 on_decorating_result（那里只覆盖主代理回复），
             # 表格分隔行居中必须在此兜底，否则子代理表格全部左对齐。
             content = self._force_table_center(content)
@@ -57,7 +57,7 @@ class ForwardMixin:
             if prefix_match:
                 prefix = prefix_match.group(1)
                 content = text[prefix_match.end():]
-            # [2026-08-30 普瑞赛斯 v2] 代码块完整性（冻结-恢复）：分段前把 ``` 代码块
+            # [2026-08-30 主代理 v2] 代码块完整性（冻结-恢复）：分段前把 ``` 代码块
             # 冻结为哨兵 token，分段后还原——纯文本保持原叙述分段节奏（括号/空行/换行），
             # 代码块整块不被切断。
             _fences = []
@@ -125,7 +125,7 @@ class ForwardMixin:
             segments = [_thaw_fence(s) for s in segments]
             if not segments:
                 # 2026-09-05 修复：子代理返回空串（如 livingmemory 无记忆 + LLM 空输出）
-                # 时此前静默跳过，博士端「Completed 但收不到」。改为发一条兜底提示。
+                # 时此前静默跳过，用户端「Completed 但收不到」。改为发一条兜底提示。
                 await self.context.send_message(
                     event.unified_msg_origin,
                     MessageChain([Plain("（她沉默了一会儿，没说出话来）")]),
@@ -358,7 +358,7 @@ class ForwardMixin:
         prev_type = None
         for seg_type, seg in merged:
             if prev_type is not None:
-                # [2026-08-29 博士定规] markdown 渲染消息内每个分段之间无条件插分割线,
+                # [2026-08-29 用户定规] markdown 渲染消息内每个分段之间无条件插分割线,
                 # 不再限定类型变化处;同类型相邻段也插,看消息更整齐。纯文本消息不走本函数。
                 new_parts.append("---")
             new_parts.append(seg)
@@ -404,7 +404,7 @@ class ForwardMixin:
         return merged
 
     def _is_document_style(self, full_text: str) -> bool:
-        """[2026-08-28 普瑞赛斯] 完整文档型消息判定。
+        """[2026-08-28 主代理] 完整文档型消息判定。
 
         类型拆条的本意是"叙述+独立代码块"的闲聊式回复（像人发消息）；
         但结构化文档（多级标题/标题+表格+代码块）是排版整体，拆成
@@ -435,7 +435,7 @@ class ForwardMixin:
         不适用(纯叙述/纯块/仅表格)时返回 False，交回 _send_md_split_sections 等旧逻辑。
         """
         try:
-            # [2026-08-28 普瑞赛斯] 完整文档型消息豁免类型拆条：
+            # [2026-08-28 主代理] 完整文档型消息豁免类型拆条：
             # 多级标题/标题+表格+代码块的结构化文档走整条渲染，避免碎条失渲染
             if self._is_document_style(full_text):
                 return False
@@ -699,7 +699,7 @@ class ForwardMixin:
             if not messages:
                 return False
             total = len(messages)
-            # 进度前缀（2026-08-27 起默认关）：博士嫌 ▍续 N/M 打头傻。
+            # 进度前缀（2026-08-27 起默认关）：用户嫌 ▍续 N/M 打头傻。
             # 配置 mainagent_md_split_progress=True 可恢复旧行为。
             if self.config.get("mainagent_md_split_progress", False):
                 for i in range(1, total):
@@ -742,7 +742,7 @@ class ForwardMixin:
         full_text = self._extract_chain_text(result)
         if not full_text:
             return False
-        # [普瑞赛斯亲修 03:08] 剥离首部【名字】前缀，防止与下方 add_prefix 叠加成双前缀
+        # [主代理亲修 03:08] 剥离首部【名字】前缀，防止与下方 add_prefix 叠加成双前缀
         full_text = re.sub(r"^\s*【[^】]*】\s*\n?", "", full_text, count=1)
         # [美化 2026-08-19] 状态符号简约化：emoji → 几何符号，简约风格统一
         normalized = (full_text
@@ -760,7 +760,7 @@ class ForwardMixin:
         #   2) 不适合时回退结构边界分段直发(_send_md_split_sections,拆出>=2条才走);
         #   3) 再不行回退 _inject_section_dividers 整条渲染,保持旧行为。
         if self._looks_like_markdown(full_text) or self._looks_like_latex(full_text):
-            # [2026-08-28 普瑞赛斯] 文档型消息（多级标题/标题+表格+代码块）——
+            # [2026-08-28 主代理] 文档型消息（多级标题/标题+表格+代码块）——
             # 完整排版整体，不参与任何拆条，直接整条渲染（类型拆条/900字分段都不碰）
             if self._is_document_style(full_text):
                 self._inject_section_dividers(result, full_text)
@@ -771,7 +771,7 @@ class ForwardMixin:
                 return True
             self._inject_section_dividers(result, full_text)
             return False
-        # [2026-08-20 01:46 重写] 分段规则（博士定稿）：按行扫描，横线行即分段信号——
+        # [2026-08-20 01:46 重写] 分段规则（用户定稿）：按行扫描，横线行即分段信号——
         # 单行横线=软分隔（并入当前段，两句不拆，横线保留为普通文本）；
         # 连续两行及以上横线=硬分隔（当前段落盘，横线丢弃，前后拆开）。
         # 无横线行时退回按空行分段（原逻辑）。
@@ -836,7 +836,7 @@ class ForwardMixin:
             add_prefix = self._cfg("enable_mainagent_name_prefix", False)
             prefix_str = ""
             if add_prefix:
-                prefix_str = f"【{self._cfg('main_agent_name', '普瑞赛斯')}】\n"
+                prefix_str = f"【{self._cfg('main_agent_name', '主代理')}】\n"
             sent_any = False
             fixed_iv = self.config.get("fragment_interval", None)
             for idx, seg_text in enumerate(segments):
@@ -918,7 +918,7 @@ class ForwardMixin:
         return self.AGENT_DISPLAY_NAME.get(agent_name, agent_name)
 
     def _resolve_agent_name(self, agent_name: str) -> str:
-        """规范化子代理名称：兼容中文名（阿米娅->amiya）和大小写（Amiya->amiya）。
+        """规范化子代理名称：兼容中文名（中文名->英文 id）和大小写（大写->小写）。
 
         优先级：中文显示名反查（硬编码 AGENT_NAME_REVERSE + name_display_map 配置）
         > 小写归一。找不到则返回小写后的原名（由调用方报错兜底）。
@@ -1072,7 +1072,7 @@ class ForwardMixin:
                 self._suppress_mainagent_prefix = False
                 return
             if self._cfg("enable_mainagent_name_prefix", False):
-                main_agent_name = self._cfg("main_agent_name", "普瑞赛斯")
+                main_agent_name = self._cfg("main_agent_name", "主代理")
                 prefix_str = f"【{main_agent_name}】\n"
                 for comp in result.chain:
                     text = getattr(comp, "text", None)
@@ -1097,7 +1097,7 @@ class ForwardMixin:
         if not (hasattr(result, "chain") and result.chain):
             return
 
-        main_agent_name = self._cfg("main_agent_name", "普瑞赛斯")
+        main_agent_name = self._cfg("main_agent_name", "主代理")
         prefix_str = f"【{main_agent_name}】\n"
 
         for comp in result.chain:
