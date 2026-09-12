@@ -4455,6 +4455,22 @@ class TestCmdLockHardGroup(unittest.TestCase):
         self.assertTrue(p._main_locked(ev1))
         self.assertFalse(p._main_locked(ev2))
 
+    def test_main_token_generic_entry(self):
+        """[发布泛化 2026-09-12] /主代理 通用词即可命中主代理令牌（无需知道部署者名字）"""
+        from router import _MAIN_TOKEN_SET
+        self.assertIn("主代理", _MAIN_TOKEN_SET)
+        p = self._fresh()
+        agents, has_presis = p._parse_agent_command("/主代理")
+        self.assertTrue(has_presis)
+        self.assertFalse(agents)
+
+    def test_presis_regex_includes_generic(self):
+        """[发布泛化] 主代理令牌正则包含通用词"""
+        p = self._fresh()
+        self.assertIsNotNone(p._PRESIS_TOKEN_RE)
+        self.assertTrue(p._PRESIS_TOKEN_RE.search("让主代理看看这个bug"))
+        self.assertTrue(p._PRESIS_TOKEN_RE.search("请主代理来接」"))
+
     def test_cmd_lock_new_command_overrides(self):
         p = self._fresh()
         ev = MagicMock()

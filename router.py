@@ -79,7 +79,13 @@ def _load_router_tables() -> dict:
 
 
 _ROUTER_TABLES = _load_router_tables()
-_MAIN_TOKEN_SET = tuple(_ROUTER_TABLES.get("main_token_set", []))
+# [发布泛化 2026-09-12 用户指定] "主代理"是全体部署者通用的强锁入口词，不依赖
+# 各自部署的主代理名（如"普瑞赛斯"）；两者并存，重复去重。别的用户装插件直接用
+# /主代理 即可建锁，无需知道部署者的主代理叫什么。
+_GENERIC_MAIN_TOKENS = ("主代理", "主agent")
+_MAIN_TOKEN_SET = tuple(
+    dict.fromkeys([*_ROUTER_TABLES.get("main_token_set", []), *_GENERIC_MAIN_TOKENS])
+)
 
 
 
@@ -99,7 +105,13 @@ class RouterMixin:
     # 最高优先级令牌（2026-09-03 用户指定）：只要消息含主代理的专属令牌词，
     # 无论 T1 点名 / T1.5 续接 / T2 小模型判定结果如何，一律放行主代理。
     # 放在路由链最前，任何子代理都不允许接管主代理。
-    _PRESIS_TOKEN_RE = re.compile(_ROUTER_TABLES["main_token"]) if _ROUTER_TABLES.get("main_token") else None
+    # [发布泛化 2026-09-12] 正则 = 部署者主代理名 + 通用入口词（"主代理"），
+    # 任何部署环境都能用通用词强锁主代理；未配置 main_token 时仅通用词生效。
+    _PRESIS_TOKEN_RE = (
+        re.compile(f"({_ROUTER_TABLES['main_token']}|主代理|主agent)")
+        if _ROUTER_TABLES.get("main_token")
+        else re.compile(r"(主代理|主agent)")
+    )
     # T2 判向时给模型看的子代理职责简介（简写，不涉及人格机密）
     T2_AGENT_BRIEF = _ROUTER_TABLES.get("t2_brief", {})
 
