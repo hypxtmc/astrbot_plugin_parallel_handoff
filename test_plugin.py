@@ -2839,16 +2839,99 @@ class TestFamilyPulse(unittest.TestCase):
         self.assertEqual(p._pulse_tone("shu", "xi"), "别扭依赖")
         self.assertEqual(p._pulse_tone("amiya", "closure"), "")
 
+    def test_rel_matrix_multi_and_undefined(self):
+        """[2026-09-13] 全桌关系矩阵：有记录→亲近度+基调；无记录→不太熟；自己排除"""
+        p = self._make({})
+        self._write_affinity(p, {
+            "黍<->夕": {"亲密度": 92, "基调": "别扭依赖"},
+            "黍<->可露希尔": {"亲密度": 70},
+        })
+        out = p._pulse_rel_matrix("shu", ["shu", "xi", "closure", "amiya"])
+        self.assertIn("夕：亲近度92", out)
+        self.assertIn("别扭依赖", out)
+        self.assertIn("可露希尔：亲近度70", out)
+        self.assertIn("阿米娅：不太熟，别热络", out)
+        self.assertNotIn("- 黍：", out)  # 自己不在矩阵里
+
+    def test_rel_matrix_empty_group(self):
+        """无其他在场者 → 空串（不注入）"""
+        p = self._make({})
+        self.assertEqual(p._pulse_rel_matrix("shu", ["shu"]), "")
+
+    def test_llm_system_has_mood_and_anti_politeness(self):
+        """[2026-09-13] 情绪行为行 + 反客套规则 + 关系矩阵都进 system prompt"""
+        p = self._make({})
+        p._find_livingmemory_plugin = lambda: None
+        captured = {}
+
+        async def capture(**kw):
+            captured["system"] = kw.get("system_prompt", "")
+            return self._resp("（没接话）")
+
+        p.context.llm_generate = capture
+        import types as _types
+
+        p._pulse_rng = MagicMock()
+        p._pulse_rng.get.return_value = _types.SimpleNamespace(
+            mood="烦躁", summary="烦躁/工坊/修那块电源板"
+        )
+        out = asyncio.run(
+            p._pulse_llm("shu", "测试", rel_matrix="- 夕：亲近度92，基调「别扭依赖」")
+        )
+        self.assertEqual(out, "（没接话）")
+        sys_p = captured.get("system", "")
+        self.assertIn("心情：烦躁", sys_p)
+        self.assertIn("话短、带刺", sys_p)
+        self.assertIn("在场每个人的关系", sys_p)
+        self.assertIn("客套", sys_p)  # 数据或 fallback 必含反客套条款
+
+    def test_mood_style_map_covers_pool(self):
+        """[2026-09-13] 情绪行为映射：覆盖主要情绪，值为非空中文行为描述"""
+        import family_pulse as _fp
+
+        styles = _fp._PULSE_MOOD_STYLE
+        for key in ("烦躁", "低落", "亢奋", "慵懒"):
+            self.assertIn(key, styles)
+        for v in styles.values():
+            self.assertTrue(v)  # 全部非空
+
+    def test_pulse_ensure_skeleton_generates_when_missing(self):
+        """[2026-09-13 泛化] 缺 personas.json → 生成通用骨架；已存在 → 不动"""
+        import family_pulse as _fp
+
+        orig = dict(_fp.FAMILY_PERSONAS)
+        try:
+            p = self._make({"family_pulse_members": '["amiya","shu"]'})
+            p._pulse_data_dir = lambda: self._tmp
+            p._pulse_ensure_skeleton()
+            path = os.path.join(self._tmp, "personas.json")
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            self.assertIn("amiya", data)
+            self.assertIn("shu", data)
+            # 骨架是通用占位：不含本部署家庭成员名
+            self.assertNotIn("普瑞赛斯", json.dumps(data, ensure_ascii=False))
+            # 再跑一次：已有文件不被覆盖
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"amiya": "我的自定义"}, f, ensure_ascii=False)
+            p._pulse_ensure_skeleton()
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(json.load(f), {"amiya": "我的自定义"})
+        finally:
+            _fp.FAMILY_PERSONAS = orig  # 恢复全局，防测试间污染
+
     # ── 手头事线程（半衰不清零） ──
     def test_ensure_thread_creates_and_persists(self):
-        """无线程时弹出新物件，落盘可读回同一件"""
+        """[2026-09-13] 无线程时从素材池弹新物件（stage=0），落盘可读回同一件"""
         p = self._make({})
         with self._tmp_thread_guard(p):
-            t = p._pulse_ensure_thread("shu", {})
+            t, stage = p._pulse_ensure_thread("shu", {})
             self.assertTrue(t)
+            self.assertEqual(stage, 0)
             store = p._pulse_load_threads()
             self.assertEqual(store["shu"]["text"], t)
-            self.assertGreater(store["shu"]["decay"], 0)
+            self.assertEqual(store["shu"]["stage"], 0)
+            self.assertIn(t, set(store.get("_seed_used", [])))  # 轮换标记
 
     def test_ensure_thread_reuses_until_done(self):
         """线程未耗竭：反复取回同一件，不重掷"""
@@ -2859,19 +2942,37 @@ class TestFamilyPulse(unittest.TestCase):
             t2 = p._pulse_ensure_thread("xi", store)
             self.assertEqual(t1, t2)
 
-    def test_advance_decays_and_removes(self):
-        """戳一次 decay-1；归 0 剔除，下次重掷新物件"""
+    def test_advance_stages_and_archives(self):
+        """[2026-09-13] 三态推进：0→1→2，到 2 再戳即归档（下次开新线）"""
         p = self._make({})
         with self._tmp_thread_guard(p):
             p._pulse_ensure_thread("amiya", {})
-            before = p._pulse_load_threads()
-            decay = before["amiya"]["decay"]
-            # 直接推到 -1 以验证剔除
-            store = p._pulse_load_threads()
-            store["amiya"]["decay"] = 1
-            p._pulse_save_threads(store)
             p._pulse_advance_thread("amiya")
-            self.assertNotIn("amiya", p._pulse_load_threads())
+            self.assertEqual(p._pulse_load_threads()["amiya"].get("stage"), 1)
+            p._pulse_advance_thread("amiya")
+            self.assertEqual(p._pulse_load_threads()["amiya"].get("stage"), 2)
+            p._pulse_advance_thread("amiya")
+            self.assertNotIn("amiya", p._pulse_load_threads())  # 收尾已播报 → 归档
+
+    def test_thread_stage_compat_old_decay(self):
+        """[2026-09-13] 旧格式兼容：无 stage 有 decay → 2→0 / 1→1 / 0→2"""
+        p = self._make({})
+        self.assertEqual(p._thread_stage({"text": "x", "decay": 2}), 0)
+        self.assertEqual(p._thread_stage({"text": "x", "decay": 1}), 1)
+        self.assertEqual(p._thread_stage({"text": "x", "decay": 0}), 2)
+        self.assertEqual(p._thread_stage({"text": "x", "stage": 1}), 1)
+
+    def test_seed_pool_recycles_when_exhausted(self):
+        """[2026-09-13] 素材池一圈用尽 → 重置标记后继续可取（不卡死）"""
+        p = self._make({})
+        with self._tmp_thread_guard(p):
+            from family_pulse import THREAD_FLAVORS, LIFE_SEEDS
+
+            full = [row[0] for row in THREAD_FLAVORS.get("xi", [])] + list(LIFE_SEEDS)
+            store = {"_seed_used": list(full)}
+            t, stage = p._pulse_ensure_thread("xi", store)
+            self.assertTrue(t)
+            self.assertEqual(stage, 0)
 
     def test_thread_persists_across_instances(self):
         """不同插件实例共享同一线程文件 → 跨天/重启连续性"""
@@ -2894,31 +2995,33 @@ class TestFamilyPulse(unittest.TestCase):
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-    def test_recent_seed_preferred_over_flavors(self):
-        """有真实念叨日志时，新线程种子取自她的真实话，不用固定文案"""
+    def test_ensure_thread_seed_from_pool_not_dialogue(self):
+        """[2026-09-13 素材外置] 新线只从素材池来；对话日志不得回灌成生活种子"""
         p = self._make({})
         with self._tmp_thread_guard(p):
-            # 先给她一条真实念叨
-            self._write_pulse_log(p, "shu", "腌萝卜那缸又该翻一遍了，坛沿都起沫")
-            # 手动清空线程存储，强制走"重掷"分支
-            rec = {"shu": {"text": "x", "decay": 0}}
-            t = p._pulse_ensure_thread("shu", rec)
-            self.assertEqual(t, "腌萝卜那缸又该翻一遍了，坛沿都起沫")
-            store = p._pulse_load_threads()
-            self.assertEqual(store["shu"]["text"], t)
-            # 种子应来自真实念叨而非固定池
-            from family_pulse import THREAD_FLAVORS
-            pool_texts = {t for t, _ in THREAD_FLAVORS.get("shu", [])}
-            self.assertNotIn(t, pool_texts)
+            # 往日志写一条"对话残渣"——旧实现会把它当种子，新实现必须无视
+            self._write_pulse_log(p, "shu", "哎呀，那碗筷就先放那吧，我待会儿洗")
+            t, stage = p._pulse_ensure_thread("shu", {})
+            self.assertNotEqual(t, "哎呀，那碗筷就先放那吧，我待会儿洗")
+            self.assertEqual(stage, 0)
+            from family_pulse import THREAD_FLAVORS, LIFE_SEEDS
 
-    def test_recent_seed_no_log_falls_back_to_flavors(self):
-        """无真实念叨（冷启动）时才回退固定物件池"""
+            pool_texts = {row[0] for row in THREAD_FLAVORS.get("shu", [])} | set(LIFE_SEEDS)
+            self.assertIn(t, pool_texts)
+            # 未归档的线程要被复用（不重掷）
+            t2, _ = p._pulse_ensure_thread("shu", p._pulse_load_threads())
+            self.assertEqual(t2, t)
+
+    def test_ensure_thread_cold_start_from_pool(self):
+        """[2026-09-13] 冷启动：从素材池（私有+通用合并）取新线，stage=0"""
         p = self._make({})
         with self._tmp_thread_guard(p):
-            from family_pulse import THREAD_FLAVORS
-            t = p._pulse_ensure_thread("amiya", {})
+            from family_pulse import THREAD_FLAVORS, LIFE_SEEDS
+
+            t, stage = p._pulse_ensure_thread("amiya", {})
             self.assertTrue(t)
-            pool_texts = {t for t, _ in THREAD_FLAVORS.get("amiya", [])}
+            self.assertEqual(stage, 0)
+            pool_texts = {row[0] for row in THREAD_FLAVORS.get("amiya", [])} | set(LIFE_SEEDS)
             self.assertIn(t, pool_texts)
 
     def test_recent_seed_across_days(self):
@@ -2952,19 +3055,18 @@ class TestFamilyPulse(unittest.TestCase):
             self.assertIsNotNone(seed)
             self.assertEqual(seed[0], "昨天那幅龙还晾在架上没落款")
 
-    def test_advance_then_reseed_from_life_log(self):
-        """线程耗竭剔除后，下一跳从生活日志长新线，而非回固定池"""
+    def test_advance_then_reseed_from_pool(self):
+        """[2026-09-13] 归档后下一跳从素材池开新线（不再吃对话日志）"""
         p = self._make({})
         with self._tmp_thread_guard(p):
             self._write_pulse_log(p, "closure", "那块电源板又窜出杂讯，拆开重焊")
-            rec = {"closure": {"text": "旧事", "decay": 1}}
-            # 存进存储再 advance，归 0 剔除
+            rec = {"closure": {"text": "旧事", "stage": 2}}
             p._pulse_save_threads(rec)
             p._pulse_advance_thread("closure")
             self.assertNotIn("closure", p._pulse_load_threads())
-            # 重掷：应吃生活日志的种子
-            t = p._pulse_ensure_thread("closure", {})
-            self.assertEqual(t, "那块电源板又窜出杂讯，拆开重焊")
+            t, stage = p._pulse_ensure_thread("closure", {})
+            self.assertNotEqual(t, "那块电源板又窜出杂讯，拆开重焊")
+            self.assertEqual(stage, 0)
 
     # ── 真演化主菜：动态取材升级（2026-09-04 博士拍板：9 成真演化按底色） ──
     def test_recent_seed_excludes_used(self):
@@ -3045,7 +3147,7 @@ class TestFamilyPulse(unittest.TestCase):
         with self._tmp_thread_guard(p):
             p.family_pulse_tick = self._wrap_tick(p, p.family_pulse_tick)
             asyncio.run(p.family_pulse_tick())
-        self.assertIn("手头有件没做完的事", captured.get("prompt", ""))
+        self.assertIn("你手头有件", captured.get("prompt", ""))
 
     def _wrap_tick(self, p, orig):
         """让 tick 视角下的线程根目录也走临时目录"""
