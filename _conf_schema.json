@@ -131,6 +131,12 @@
         "default": true,
         "hint": "开启后插件在每次主代理 LLM 请求时，按 route_mode/call_mode/direct_delivery_agents 自动生成路由路径规范注入 extra_user_content_parts，主代理必须照走；工具全保留不摘除。关闭则纯靠主代理自觉。"
     },
+    "subagent_visibility_inject": {
+        "description": "子代理直发「旁听窗」注入",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，子代理直发回复（如助手B对你说的话）会以「旁听窗」形式附给主代理下一次请求——主代理能看到她说了什么并自然承接（「她说还在看呢，你别急」），实现三方自然对话。10分钟窗口+同条去重。关闭=恢复旧行为。"
+    },
     "directive_inject_mode": {
         "description": "路由指令注入模式",
         "type": "string",
