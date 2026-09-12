@@ -2974,6 +2974,32 @@ class TestFamilyPulse(unittest.TestCase):
             self.assertTrue(t)
             self.assertEqual(stage, 0)
 
+    def test_smoke_fresh_install_path(self):
+        """[2026-09-13 泛化] 干净安装冒烟：无任何数据文件时全链降级不炸。
+
+        覆盖：①骨架能生成 ②无私有素材时线程从通用池取 ③无关系文件时矩阵降级。
+        """
+        p = self._make({"family_pulse_members": '["amiya","shu"]'})
+        p._pulse_data_dir = lambda: self._tmp  # 干净的"新用户"数据目录
+        # ① 骨架生成
+        p._pulse_ensure_skeleton()
+        self.assertTrue(os.path.exists(os.path.join(self._tmp, "personas.json")))
+        # ② 无私有素材 → 通用池兜底
+        import family_pulse as _fp
+
+        orig = _fp.THREAD_FLAVORS
+        try:
+            _fp.THREAD_FLAVORS = {}
+            with self._tmp_thread_guard(p):
+                t, stage = p._pulse_ensure_thread("amiya", {})
+                self.assertIn(t, set(_fp.LIFE_SEEDS))
+                self.assertEqual(stage, 0)
+        finally:
+            _fp.THREAD_FLAVORS = orig
+        # ③ 无关系文件（_make 默认空目录）→ 矩阵降级"不太熟"
+        out = p._pulse_rel_matrix("amiya", ["amiya", "shu"])
+        self.assertIn("不太熟", out)
+
     def test_thread_persists_across_instances(self):
         """不同插件实例共享同一线程文件 → 跨天/重启连续性"""
         p1 = self._make({})
