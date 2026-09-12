@@ -4560,6 +4560,20 @@ class TestCmdLockHardGroup(unittest.TestCase):
         self.assertIn("已锁定", text)
         self.assertIn("主代理", text)
 
+    def test_main_lock_wake_rewrite_not_treated_as_command(self):
+        """[2026-09-12 21:25 治本] 唤醒重写的斜杠普通消息（/你和可露希尔...）
+        必须被识别为「非真命令」——否则主代理锁会把它当命令放行，
+        消息被 T0/T1 扫出子代理名路由走（21:06 实测 bug）"""
+        p = self._fresh()
+        # 唤醒重写形态：带 / 但解析不出任何已知目标 → 非真命令
+        self.assertFalse(
+            p._is_real_command("/你和可露希尔一起去看复调插件代码吧，审查还有没有bug")
+        )
+        # 无前缀普通文本 → 非命令
+        self.assertFalse(p._is_real_command("你和她一起去看代码"))
+        # 裸斜杠其他内容 → 非命令
+        self.assertFalse(p._is_real_command("/随便说点什么"))
+
     def test_main_token_generic_entry(self):
         """[发布泛化 2026-09-12] /主代理 通用词即可命中主代理令牌（无需知道部署者名字）"""
         from router import _MAIN_TOKEN_SET
