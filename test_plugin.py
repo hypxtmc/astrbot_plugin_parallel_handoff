@@ -4551,6 +4551,15 @@ class TestCmdLockHardGroup(unittest.TestCase):
             finally:
                 router_mod._MAIN_LOCK_PATH = old_path
 
+    def test_main_lock_receipt_text(self):
+        """[主代理锁回执 2026-09-12 20:57] lock_main 回执含明确「已锁定」标识"""
+        p = self._fresh()
+        ev = MagicMock()
+        ev.unified_msg_origin = "sess-receipt"
+        text = p._admin_reply_text(ev, "lock_main")
+        self.assertIn("已锁定", text)
+        self.assertIn("主代理", text)
+
     def test_main_token_generic_entry(self):
         """[发布泛化 2026-09-12] /主代理 通用词即可命中主代理令牌（无需知道部署者名字）"""
         from router import _MAIN_TOKEN_SET

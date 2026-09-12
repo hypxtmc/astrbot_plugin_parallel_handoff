@@ -439,6 +439,14 @@ class RouterMixin:
                 self._route_reply.pop(event.unified_msg_origin, None)
             return "✅ 放开了，消息回到自动分派"
 
+        if cmd == "lock_main":
+            # [主代理锁回执 2026-09-12 20:57 博士要求] 发 /主代理 后明确回报已锁定，
+            # 而不是默默放行让消息落进主代理 LLM。
+            return (
+                "🔒 已锁定：主代理\n"
+                "（消息直通主代理，提子代理名也不会切 · 换人：/名字 · 放开：/复位）"
+            )
+
         pool = self._router_agent_pool()
         names = " · ".join(_cn(a) for a in pool)
         return f"📋 可点名：{names}\n（发 /名字 直接锁定）"
@@ -1169,18 +1177,27 @@ class RouterMixin:
             self._record_cmd_lock(event, cmd_agents)
             event.stop_event()
             return True
-        # 含主代理的命令（busy 时主代理在场优先，不短路子代理；记录粘滞后放行主代理）
+        # 含主代理的命令（busy 时主代理在场优先；纯主代理建锁+回执短路，20:57 强化）
         if cmd_presis:
             if getattr(self, "_cmd_lock", None):
                 self._cmd_lock.pop(event.unified_msg_origin, None)
             if cmd_agents:
                 self._record_route_hits(event, cmd_agents)
                 self._record_route_suggestions(cmd_agents)
+                logger.info(
+                    f"[parallel_handoff] BusyBypass: T0 命令式含主代理令牌 → 放行主代理 "
+                    f"(record lock for {cmd_agents})"
+                )
+                return False
+            # 纯 /主代理 → 建锁 + 回执并短路（2026-09-12 20:57 博士要求明确锁定标识）
             logger.info(
-                f"[parallel_handoff] BusyBypass: T0 命令式含主代理令牌 → 放行主代理 "
-                f"(record lock for {cmd_agents})"
+                "[parallel_handoff] BusyBypass: T0 命令式（纯主代理）→ "
+                "建立主代理锁，回执并短路"
             )
-            return False
+            self._record_main_lock(event)
+            await self._send_admin_reply(event, "lock_main")
+            event.stop_event()
+            return True
         # 再次确认活跃 runner（filter 通过后可能已结束，兜底）
         if _ACTIVE_AGENT_RUNNERS is None or event.unified_msg_origin not in _ACTIVE_AGENT_RUNNERS:
             return False
@@ -1414,14 +1431,18 @@ class RouterMixin:
                 self._record_route_hits(event, cmd_agents)
                 self._record_route_suggestions(cmd_agents)
             else:
-                # [主代理锁 2026-09-12 用户指定] 纯 /主代理（/普瑞赛斯）→ 建立会话级
-                # 主代理锁：此后消息直通主代理（含子代理名也不被 T1 抢）。
+                # [主代理锁 2026-09-12 用户指定；回执强化 20:57 博士要求]
+                # 纯 /主代理（/普瑞赛斯）→ 建立会话级主代理锁 + 回执并短路，
+                # 与 /谁在 同款柜台行为：明确回报「已锁定」，不再默默放行让消息
+                # 落进主代理 LLM（博士原话：要报出已锁定 xxx 的标识消息）。
                 logger.info(
                     "[parallel_handoff] SmartRouter: T0 命令式（纯主代理）→ "
-                    "建立主代理锁，会话直通主代理"
+                    "建立主代理锁，回执并短路"
                 )
                 self._record_main_lock(event)
-            return False
+                await self._send_admin_reply(event, "lock_main")
+                event.stop_event()
+                return True
         # [最高优先级 2026-09-03 用户指定] 含连续「主代理」四字 → 无条件放行主代理（=主代理）。
         # 跳过 T1/T1.5/T2 全部判向，任何子代理都不得接管。返回 False 表示不短路、不 stop_event，
         # 消息自然落回主代理路径。登记路由历史防止 T1.5 后续承接接到子代理。
