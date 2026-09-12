@@ -337,7 +337,16 @@ class FamilyPulseMixin:
             return "family_pulse"
 
         def _get_message_type():
-            return 1  # MessageType.FRIEND → 非群聊，走私聊存储
+            # 2026-09-13 审查修复（与 2026-09-12 子代理桩修复同构）：
+            # 原先返回 1（非群聊），若本桩被直接喂给 livingmemory 的
+            # handle_memory_recall，会触发「仅私聊」副作用存储
+            #（memory_recall.py L141），把旁轨 prompt 写进本会话——
+            # conversations 表 u×2 历史残留的镜像源。改报群聊值：
+            # is_group=True 时该分支整体跳过；其余使用点（消息数限制、
+            # groupId 标记）均无副作用，livingmemory 全仓已核实。
+            from astrbot.api.platform import MessageType
+
+            return MessageType.GROUP_MESSAGE
 
         def _get_sender_id():
             return umo
