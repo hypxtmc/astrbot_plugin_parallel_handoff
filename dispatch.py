@@ -261,7 +261,10 @@ class DispatchMixin:
             if _key in self._daily_llm_injected_scenes:
                 return
             if not self._daily_life_injector:
-                prov_id = self.config.get("glm4flash_provider_id", "")
+                prov_id = (
+                    self.config.get("daily_life_provider_id")
+                    or self.config.get("glm4flash_provider_id", "")
+                )
                 async def _resolve_provider(_umo):
                     try:
                         return await self.context.get_current_chat_provider_id(_umo)
@@ -605,9 +608,10 @@ class DispatchMixin:
                 prov_id, handoff, timeout,
             )
 
-            # 超时上限：用户硬性设定永久 120 秒（2026-08-20）
-            # 子代理生成长文经常超 30s 被跳，现恒定置 120，彻底解决“次次超时”
-            llm_timeout = 120
+            # 超时上限：读配置 subagent_reply_timeout（默认 120）
+            # 2026-09-12 改造（用户拍板）：原硬编码 120 改为可配置，
+            # 用户在 WebUI 填的等待上限直接生效，不再被命令强锁。
+            llm_timeout = int(self._cfg("subagent_reply_timeout", 120) or 120)
             # [工具循环 2026-09-11 用户定] 子代理改走 tool_loop_agent：
             # llm_generate 是一次性调用、不执行 tool_call（官方 docstring 明示），
             # 子代理伸手抓工具永远抓空 → 空回复 → 降级无工具重试，工具形同虚设。
