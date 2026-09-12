@@ -413,13 +413,15 @@ class TestRouteDirective(unittest.TestCase):
         self.assertIn("chained", d)
 
     def test_empty_agents_no_directive(self):
-        """direct_delivery_agents 为空时不注入"""
+        """[发布泛化 A 2026-09-13 更新] 直发名单为空、且路由池也为空（无词表、无编排器）→ 不注入。
+        空名单+有池的兜底场景见 test_publish_directive_autofallback_without_lists。"""
         plugin = self._make_plugin({
             "route_mode": "direct",
             "call_mode": "parallel",
             "direct_delivery_agents": "",
         })
-        self.assertEqual(plugin._build_route_directive(), "")
+        with mock.patch.object(type(plugin), "T2_AGENT_BRIEF", {}):
+            self.assertEqual(plugin._build_route_directive(), "")
 
     def test_blacklist_in_direct_directive(self):
         """direct 模式：指令含黑名单直连规范，黑名单 ID 动态注入"""
@@ -577,7 +579,7 @@ class TestRouteDirectiveInject(unittest.TestCase):
         self.assertEqual(len(req.extra_user_content_parts), 1)
 
     def test_no_agents_no_inject(self):
-        """direct_delivery_agents 为空时不注入"""
+        """[发布泛化 A 2026-09-13 更新] 直发名单为空、池也为空 → 不注入（完整注入链路）"""
         import asyncio
         plugin = self._make_plugin({
             "route_mode": "direct",
@@ -589,7 +591,8 @@ class TestRouteDirectiveInject(unittest.TestCase):
         req.system_prompt = "原 prompt"
         req.extra_user_content_parts = []
         req.func_tool = {"tools": []}
-        asyncio.run(plugin._route_directive_inject(MagicMock(), req))
+        with mock.patch.object(type(plugin), "T2_AGENT_BRIEF", {}):
+            asyncio.run(plugin._route_directive_inject(MagicMock(), req))
         self.assertEqual(req.system_prompt, "原 prompt")
         self.assertEqual(len(req.extra_user_content_parts), 0)
 
@@ -1792,8 +1795,10 @@ class TestBuildRouteDirectiveMode(unittest.TestCase):
         assert "【本次任务分类" not in d
 
     def test_tech_directive_no_agents_returns_empty(self):
+        """[发布泛化 A 2026-09-13 更新] 空名单+空池 → 空指令"""
         inst = self._make_plugin({"direct_delivery_agents": ""})
-        assert inst._build_route_directive("tech") == ""
+        with mock.patch.object(type(inst), "T2_AGENT_BRIEF", {}):
+            assert inst._build_route_directive("tech") == ""
 
     def test_need_route_directive_delegates(self):
         inst = self._make_plugin({"direct_delivery_agents": "amiya,closure"})
@@ -4909,6 +4914,87 @@ class TestCmdLockHardGroup(unittest.TestCase):
         ev = MagicMock()
         ev.unified_msg_origin = "sess-nolock"
         self.assertIsNone(p._cmd_locked_group(ev))
+
+    # ── [发布泛化 A 方案 2026-09-13] 无词表自动发现兜底（别的用户只装插件、不写词表）──
+
+    def _fresh_publish(self, with_orchestrator=True):
+        """构造「只装插件、没写词表」用户环境：T2_AGENT_BRIEF 清空、
+        直发名单为空、子代理仅存在于 orchestrator（或完全不存在）。
+
+        [测试隔离] TestAgentCommand._fresh_router 预置了实例级 mock
+        （_router_agent_pool / _get_name_display_map lambda），会遮蔽本测试
+        要验证的真实类方法——先移除，让发布泛化 A 的发现兜底路径生效。
+        """
+        p = self._fresh()
+        for _attr in ("_router_agent_pool", "_get_name_display_map"):
+            if _attr in vars(p):
+                delattr(p, _attr)
+        p.config = {
+            "enable_smart_router": True,
+            "name_display_map": "{}",
+            "direct_delivery_agents": "",
+        }
+
+        class _Agent:
+            def __init__(self, name):
+                self.name = name
+                self.instructions = "PRIVATE-PERSONA-SHOULD-NOT-LEAK"
+
+        class _Handoff:
+            def __init__(self, name, desc=""):
+                self.agent = _Agent(name)
+                self.description = desc
+
+        p.context = MagicMock()
+        if with_orchestrator:
+            orch = MagicMock()
+            orch.handoffs = [
+                _Handoff("amiya", "Delegate tasks to amiya agent to handle the request."),
+                _Handoff("kaltsit", ""),
+            ]
+            p.context.subagent_orchestrator = orch
+        else:
+            p.context.subagent_orchestrator = None
+        return p
+
+    def test_publish_pool_autodiscover_without_tables(self):
+        """[发布泛化 A] 无词表用户：路由池自动从编排器发现子代理（英文id→公开描述）"""
+        from unittest.mock import patch as _patch
+        p = self._fresh_publish(with_orchestrator=True)
+        with _patch.object(type(p), "T2_AGENT_BRIEF", {}):
+            pool = p._router_agent_pool()
+        self.assertEqual(set(pool.keys()), {"amiya", "kaltsit"})
+        self.assertIn("amiya", pool["amiya"])
+        self.assertNotIn("PRIVATE-PERSONA", str(pool), "不得读取人格机密 instructions")
+
+    def test_publish_pool_empty_without_orchestrator(self):
+        """[发布泛化 A] 无词表且无编排器：池空（保守降级，不崩）"""
+        from unittest.mock import patch as _patch
+        p = self._fresh_publish(with_orchestrator=False)
+        with _patch.object(type(p), "T2_AGENT_BRIEF", {}):
+            self.assertEqual(p._router_agent_pool(), {})
+
+    def test_publish_directive_autofallback_without_lists(self):
+        """[发布泛化 A] 无直发名单+无词表：路由指令用发现池兜底生成（不再 return ""）"""
+        from unittest.mock import patch as _patch
+        p = self._fresh_publish(with_orchestrator=True)
+        with _patch.object(type(p), "T2_AGENT_BRIEF", {}):
+            directive = p._build_route_directive("affection")
+        self.assertTrue(directive, "指令应兜底生成而非空")
+        self.assertIn("parallel_handoff", directive)
+        self.assertTrue(
+            "amiya" in directive or "阿米娅" in directive,
+            "指令应含目标子代理名（中英文均可）",
+        )
+
+    def test_publish_directive_still_empty_when_no_agents(self):
+        """[发布泛化 A] 无直发名单且池空：指令不注入（保守兜底不受影响）"""
+        from unittest.mock import patch as _patch
+        p = self._fresh_publish(with_orchestrator=False)
+        with _patch.object(type(p), "T2_AGENT_BRIEF", {}):
+            directive = p._build_route_directive("affection")
+        self.assertEqual(directive, "")
+
 class TestShortcircuitDedup(unittest.TestCase):
     """[同消息去重屏障 2026-09-09 博士 bug 回归] OnWaitingLLMRequestEvent 对同一条
     消息可能顺序触发两次 → 第二次必须被吞掉，子代理不得重复回话（夕回两遍 bug）。"""
