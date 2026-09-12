@@ -240,10 +240,10 @@
         "hint": "压缩时保留原文开头和结尾各 N 个字符，中间用摘要衔接，兼顾剧情连贯与上下文压缩。"
     },
     "enable_chain_memory_persist": {
-        "description": "3P/4P 接龙整场记忆沉淀开关",
+        "description": "【实验性】3P/4P 接龙整场记忆沉淀开关",
         "type": "bool",
         "default": true,
-        "hint": "开启后，接龙模式（3P/4P）结束时把整场剧情按各角色各自视角沉淀进各角色 livingmemory（每人一份主观视角，可自由回忆，日常不跳脸）。关闭则 3P 剧情不留长期记忆，仅当场临时上下文（仍不污染日常）。"
+        "hint": "⚠️ 实验性功能：未经长期验证，普通场景建议保持默认。开启后，接龙模式（3P/4P）结束时把整场剧情按各角色各自视角沉淀进各角色 livingmemory（每人一份主观视角，可自由回忆，日常不跳脸）。关闭则 3P 剧情不留长期记忆，仅当场临时上下文（仍不污染日常）。"
     },
     "enable_route_directive": {
         "description": "启用路由强制指令注入（OnLLMRequestEvent 钩子）",
@@ -294,10 +294,10 @@
         "hint": "自定义日常贴贴模式调度方式，JSON格式：{\"route_mode\": \"relay|direct\", \"call_mode\": \"parallel|chained\", \"timeout\": 秒数}。route_mode=direct 子代理回复直接分段转发用户端（主代理隐身），relay 返回主代理；call_mode=chained 接龙串行，parallel 并行。配置永远优先：mode命中时此配置无条件覆盖模型显式传参。改动即时生效。"
     },
     "enable_read_air_arbitrate": {
-        "description": "读空气仲裁总开关",
+        "description": "【实验性】读空气仲裁总开关",
         "type": "bool",
         "default": false,
-        "hint": "开启后在自动路由犹豫点做「宁静权」克制（群聊杂谈/弱路由时让主代理自然接住，而非逢消息就抢派子代理）。默认关=零行为变化。绝不拦用户明确点名的人（点名神圣不可侵）。"
+        "hint": "⚠️ 实验性功能：未经长期运行验证，请谨慎开启。开启后在自动路由犹豫点做「宁静权」克制（群聊杂谈/弱路由时让主代理自然接住，而非逢消息就抢派子代理）。默认关=零行为变化。绝不拦用户明确点名的人（点名神圣不可侵）。"
     },
     "read_air_enforce": {
         "description": "读空气·真实拦截开关（宁静权落地闸门）",
@@ -324,10 +324,10 @@
         "hint": "记录每个会话最近 N 条发言，供仲裁判断「刚说到哪、该谁接」。越大越能感知长对话气口，越小越省内存。"
     },
     "enable_family_pulse": {
-        "description": "家庭旁轨（她们之间的小日子）",
+        "description": "【实验性】家庭旁轨（她们之间的小日子）",
         "type": "bool",
         "default": false,
-        "hint": "开启后：每小时一次心跳让常驻池里 2 人按今日状态闲聊两句（内部转，不打扰用户），每晚推送一条「家里动静」摘要到用户私聊。关闭=零注册零行为。"
+        "hint": "⚠️ 实验性功能：未经长期运行验证，请谨慎开启并留意日志。开启后：每小时一次心跳让常驻池里 2 人按今日状态闲聊两句（内部转，不打扰用户），每晚推送一条「家里动静」摘要到用户私聊。关闭=零注册零行为。"
     },
     "family_pulse_members": {
         "description": "家庭旁轨常驻池（JSON 数组，子代理英文 id）",
@@ -384,10 +384,10 @@
         "hint": "一场心跳里主代理最多插几次话，防止喧宾夺主。"
     },
     "family_pulse_draft_enable": {
-        "description": "拉用户进旁轨总开关",
+        "description": "【实验性】拉用户进旁轨总开关",
         "type": "bool",
         "default": false,
-        "hint": "围坐聊到兴头把用户拉进来一起聊。默认关，开启后生效。"
+        "hint": "⚠️ 实验性功能：未经长期运行验证，请谨慎开启。围坐聊到兴头把用户拉进来一起聊。默认关，开启后生效。"
     },
     "family_pulse_draft_chance_workday": {
         "description": "工作日拉用户概率",

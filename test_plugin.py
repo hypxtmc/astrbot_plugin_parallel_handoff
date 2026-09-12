@@ -3861,8 +3861,11 @@ class TestFamilyPulse(unittest.TestCase):
         p.context.send_message.assert_not_awaited()
 
     def test_digest_sends_summary(self):
-        """有日志：摘要文本含发言人、发送到博士 UMO"""
-        p = self._make({"enable_family_pulse": True})
+        """有日志：摘要文本含发言人、发送到用户私聊 UMO"""
+        p = self._make({
+            "enable_family_pulse": True,
+            "family_pulse_digest_umo": "test:FriendMessage:TESTUSER00000000000000000000000000",
+        })
         p._pulse_append("amiya", "阿米娅", "今天想泡壶茶晒晒太阳")
         # 文本组装（纯函数）断言
         text = p._build_digest_text(p._pulse_read_day(), "09-04")

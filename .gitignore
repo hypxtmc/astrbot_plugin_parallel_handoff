@@ -11,3 +11,4 @@ __pycache__/
 
 # 测试泄漏产物（MagicMock 路径拼接）
 MagicMock/
+test_plugin_2026*_t*.py

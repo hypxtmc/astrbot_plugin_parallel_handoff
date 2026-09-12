@@ -26,6 +26,9 @@ AstrBot 多子代理并行调度插件（原 `parallel_handoff`，v2.10）。
 
 ## 功能全景
 
+> ⚠️ **实验性功能提示**：以下功能标注为【实验性】——**未经长期运行验证**，行为可能随版本演进调整，请谨慎开启并留意日志。涉及：
+> 家庭旁轨（`enable_family_pulse`）、拉用户进旁轨（`family_pulse_draft_enable`）、读空气仲裁（`enable_read_air_arbitrate`）、3P/4P 接龙记忆沉淀（`enable_chain_memory_persist`）。
+
 ### 双模式配置（v2.7 核心体验）
 
 主代理调用工具时可携带 `mode` 参数命中两套预设：
@@ -93,7 +96,7 @@ chained 长接龙自动生成摘要传给下一棒（阈值/保留首尾策略�
 
 用 GLM-4-Flash 离线读取近期对话，为每个子代理注入「今日心情 / 手头事 / 话题域」的语义温度。子代理不是每次都被叫醒的应答机，而是有自己一天的角色。
 
-### 家庭旁轨（family_pulse，三期 M5，默认关）
+### 【实验性】家庭旁轨（family_pulse，三期 M5，默认关）
 
 > 设计初衷：子代理之间有自己的小日子——不围主对话转，彼此搭话、惦记、拌嘴，攒一屋烟火气；用户每天可收到一条「家里动静」摘要。
 
@@ -135,7 +138,7 @@ chained 长接龙自动生成摘要传给下一棒（阈值/保留首尾策略�
 
 **接龙摘要**：`chain_summary_enabled` · `chain_summary_model` · `chain_summary_threshold` · `chain_summary_keep_head_tail`
 
-**仲裁与生活**：`enable_read_air_arbitrate` · `read_air_enforce` · `read_air_presence_window` · `enable_daily_random_life` · `random_state`（M1 状态机）
+**仲裁与生活**：`enable_read_air_arbitrate`（实验性）· `read_air_enforce` · `read_air_presence_window` · `enable_daily_random_life` · `random_state`（M1 状态机）
 
 **常驻会话**：`subagent_session_persist` · `subagent_session_retention_days`
 
@@ -143,9 +146,9 @@ chained 长接龙自动生成摘要传给下一棒（阈值/保留首尾策略�
 
 **子代理工具循环**：`subagent_tools` · `subagent_readonly_tools` · `subagent_max_steps` · `subagent_tool_call_timeout` · `subagent_response_preview_chars`
 
-**持久化**：`enable_chain_memory_persist`
+**持久化**：`enable_chain_memory_persist`（实验性，3P/4P 接龙记忆沉淀）
 
-**家庭旁轨**（全部默认关）：`enable_family_pulse` · `family_pulse_members` · `family_pulse_cron` · `family_pulse_digest_cron` · `family_pulse_digest_umo` · `family_pulse_provider_id` · 插话/东道主概率与上限 · 草稿概率与配额（工作日/节假日分设）· `family_pulse_recent_hours` · `family_pulse_window_start/end` · `family_pulse_interval_min`
+**家庭旁轨**（实验性，全部默认关）：`enable_family_pulse` · `family_pulse_members` · `family_pulse_cron` · `family_pulse_digest_cron` · `family_pulse_digest_umo` · `family_pulse_provider_id` · 插话/东道主概率与上限 · 草稿概率与配额（工作日/节假日分设）· `family_pulse_recent_hours` · `family_pulse_window_start/end` · `family_pulse_interval_min`
 
 **记忆召回**：`recall_enabled` · `recall_default_k` / `recall_max_k` · `min_fragment_length` · `fragment_interval` · `exclude_agents`
 
