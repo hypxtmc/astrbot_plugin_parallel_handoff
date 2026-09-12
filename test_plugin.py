@@ -791,6 +791,54 @@ class TestHandoffBlacklist(unittest.TestCase):
         self.assertEqual(data["results"][0]["agent_name"], "amiya")
         self.assertIn("阿米娅的回复", data["results"][0]["response"])
 
+    def test_call_one_without_livingmemory_degrades(self):
+        """[发布就绪 2026-09-13 博士问「没装 livingmemory 怎么办」] 未安装 livingmemory：
+        子代理调用全链路正常完成，记忆链路静默跳过——find→None、零报错、零注入。
+        这是发布给第三方用户的关键保障：livingmemory 是可选增强，不是硬依赖。"""
+        mock_context = MagicMock()
+        class _FakeAgent:
+            name = "amiya"
+            instructions = ""
+            tools = None
+            begin_dialogs = None
+        class _FakeHandoff:
+            agent = _FakeAgent()
+            provider_id = None
+            name = "transfer_to_amiya"
+        mock_context.subagent_orchestrator.handoffs = [_FakeHandoff()]
+        mock_context.get_all_stars.return_value = []          # ★ 插件列表里没有 livingmemory
+        class _FakeLLMResp:
+            completion_text = "阿米娅的回复"
+        from unittest.mock import AsyncMock
+        mock_context.llm_generate = AsyncMock(return_value=_FakeLLMResp())
+        mock_context.tool_loop_agent = AsyncMock(return_value=_FakeLLMResp())
+        mock_context.get_current_chat_provider_id = AsyncMock(return_value="prov")
+        plugin = self.PluginClass(context=mock_context, config={
+            "enable_scene_inject": False,
+            "enable_segmented_forward": False,
+            "enable_disambiguation": False,
+            "enable_subagent_name_prefix": False,
+            "subagent_context_enabled": False,
+        })
+        plugin.context = mock_context
+        # 1) 查找返回 None（真实实现，非 mock）
+        self.assertIsNone(plugin._find_livingmemory_plugin())
+        # 2) 全链路调用正常
+        ev = MagicMock()
+        ev.unified_msg_origin = "session-no-lm"
+        ev.message_obj.message_id = "msg-no-lm"
+        raw = asyncio.run(plugin.parallel_handoff(
+            ev,
+            calls=[{"agent_name": "amiya", "input": "你好"}],
+        ))
+        data = json.loads(raw)
+        self.assertEqual(data["results"][0]["success"], True)
+        self.assertIn("阿米娅的回复", data["results"][0]["response"])
+        # 3) 记忆召回 / 存储：None 插件时静默返回空/跳过，不抛异常
+        recall = asyncio.run(plugin._memory_recall(ev, "amiya", "你好", None))
+        self.assertEqual(recall, [])
+        asyncio.run(plugin._memory_store(None, ev, "amiya", "你好", "回复"))  # 不应抛出
+
 
 
 
