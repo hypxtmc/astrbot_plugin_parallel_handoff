@@ -134,12 +134,6 @@ class ParallelHandoffPlugin(
         self._ctx_engine = _ctx_engine_mod.ContextEngine(
             enabled=self._cfg("subagent_context_enabled", True),
             max_turns=self._cfg("subagent_context_max_turns", 100),
-            keep_recent=self._cfg("subagent_context_keep_recent", 5),
-            compress_ratio=self._cfg("subagent_context_compress_ratio", 15),
-            llm_generate=lambda *a, **k: (
-                self.context.llm_generate(*a, **k)
-                if hasattr(self, "context") and self.context else None
-            ),
             store=_store,
         )
         # 二期：后台任务运行器（派单不阻塞主代理；仅在 background=true 时启用）

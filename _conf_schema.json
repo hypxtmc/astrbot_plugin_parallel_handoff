@@ -227,18 +227,6 @@
         "default": 100,
         "hint": "对话历史超过此轮数后会触发压缩（LLM 摘要 + 保留最近 N 轮完整对话）。每轮 = 一对 user+assistant 消息。"
     },
-    "subagent_context_keep_recent": {
-        "description": "已弃用(2026-08-23 纯截断对齐): 原为LLM压缩保留轮数,现策略不走压缩,参数0",
-        "type": "int",
-        "default": 5,
-        "hint": "历史超限时，保留最近 N 轮完整对话原文，其余部分用 LLM 压缩为摘要。"
-    },
-    "subagent_context_compress_ratio": {
-        "description": "已弃用(2026-08-23 纯截断对齐): 原为LLM压缩比例,现策略不走压缩,参数0",
-        "type": "int",
-        "default": 15,
-        "hint": "LLM 压缩历史时，摘要长度约为原文的百分比。值越小摘要越短。"
-    },
     "subagent_session_persist": {
         "description": "会话落盘（跨重启保留子代理对话历史）",
         "type": "bool",

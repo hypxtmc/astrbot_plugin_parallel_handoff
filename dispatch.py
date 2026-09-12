@@ -165,14 +165,20 @@ class DispatchMixin:
             _role_desc = str(_role.get("定位", "") or "")
             _role_rc = _role.get("角色", "") or ""
 
-        # 过滤与该 agent 关联的所有关系边（注意 key 形如 "A<->B"，两侧都可能含 agent_name）
+        # [2026-09-13 修复] 关系文件 key 是中文显示名（如 "成员甲<->成员乙"），
+        # 而真实调用方传入的是英文 id（如 "agent_a"）——原实现拿 id 直接匹配中文 key，
+        # 永远匹配不上 → _pieces 恒空 → 静默返回空串（9-02 上线以来从未真正注入成功）。
+        # 修复：先把 agent_name 归一成中文显示名（英文 id → 中文；已是中文则原样），再匹配。
+        _display_map = getattr(type(self), "AGENT_DISPLAY_NAME", None) or {}
+        _cn_me = _display_map.get(agent_name) or agent_name
+        # 过滤与该 agent 关联的所有关系边（注意 key 形如 "A<->B"，两侧都可能含 _cn_me）
         _pieces = []
         _seen_others = set()  # 去重保护：按"对方是谁"去重，防文件里存在反向重复边
         for _pair, _info in _edges.items():
             _parts = _pair.split("<->")
-            if agent_name not in _parts:
+            if _cn_me not in _parts:
                 continue
-            _other = _parts[0] if _parts[1] == agent_name else _parts[1]
+            _other = _parts[0] if _parts[1] == _cn_me else _parts[1]
             if not isinstance(_info, dict):
                 continue
             if _other in _seen_others:
@@ -183,11 +189,18 @@ class DispatchMixin:
             # 从双向描述里提取"agent 这一方"的表述（按 名字: 前缀切分，取含 agent_name 的半句）
             _me_part = ""
             if _dual:
-                # 双向字段用分号/顿号分隔，挑含 agent_name 的那一段
+                # 双向字段用分号分隔（"某人: …; 另一人: …"），取"我这一方"的表述：
+                # 优先精确匹配「我的名字:」前缀；找不到再退回"含我名"的弱匹配。
                 for _seg in _dual.split("; "):
-                    if agent_name in _seg:
-                        _me_part = _seg.strip()
+                    _s = _seg.strip()
+                    if _s.startswith(f"{_cn_me}:") or _s.startswith(f"{_cn_me}："):
+                        _me_part = _s
                         break
+                if not _me_part:
+                    for _seg in _dual.split("; "):
+                        if _cn_me in _seg:
+                            _me_part = _seg.strip()
+                            break
                 if not _me_part:
                     # 兜底：整段太长就截前半
                     _me_part = _dual
@@ -199,8 +212,17 @@ class DispatchMixin:
         # 命中关系状态（亲密度/最近互动），作为"最近家里的样子"补充
         _state_lines = []
         _seen_states = set()  # 去重保护：A<->B 与 B<->A 视为同一关系
-        for _pair, _st in _states.items():
-            if _pair.startswith(f"{agent_name}<->") or _pair.endswith(f"<->{agent_name}"):
+        # 排序确定化（缓存友好）：亲密度降序、同分按 key 字典序——
+        # 同一份关系文件下输出逐字节稳定，适合放进 system 稳定层命中前缀缓存。
+        def _state_sort_key(_kv):
+            try:
+                _v = int(_kv[1].get("亲密度") or 0) if isinstance(_kv[1], dict) else 0
+            except Exception:
+                _v = 0
+            return (-_v, _kv[0])
+
+        for _pair, _st in sorted(_states.items(), key=_state_sort_key):
+            if _pair.startswith(f"{_cn_me}<->") or _pair.endswith(f"<->{_cn_me}"):
                 if not isinstance(_st, dict):
                     continue
                 _s = sorted(_pair.split("<->"))
@@ -545,20 +567,12 @@ class DispatchMixin:
         except Exception as _e:
             logger.warning(f"[parallel_handoff] 时间感知注入失败: {_e}")
 
-        # ── 关系网注入：让子代理"懂得自家事"（一期·关系网，2026-09-02 主代理）
-        #    从 data/relationships/relationships.json 读取该子代理的关系边，
-        #    组装成她眼中的家庭关系片段，注入 extra_user_content 头部。
-        #    与时间感知注入同位（mark_as_temp 防持久化），只在本轮生效。
-        #    作用：子代理彼此知晓家庭关系与相处方式，
-        #    子代理知道彼此的牵挂与近况——让子代理间的对话有同事日常感。
-        try:
-            _rel_sense = self._relationship_inject(agent_name, input_text)
-            if _rel_sense:
-                _rel_part = TextPart(text=_rel_sense).mark_as_temp()
-                memory_extra_parts = [_rel_part] + (memory_extra_parts or [])
-                logger.info(f"[parallel_handoff] 子代理关系网注入 OK [{agent_name}]: {len(_rel_sense)} chars")
-        except Exception as _e:
-            logger.warning(f"[parallel_handoff] 关系网注入失败 [{agent_name}]: {_e}")
+        # ── 关系网注入：已迁移至 system 稳定层（2026-09-13）
+        #    原实现在此走 extra_user_content（mark_as_temp、每轮重复注入）：
+        #    (a) 匹配 bug——拿英文 id 去匹配中文 key，恒返回空串（上线以来从未生效）；
+        #    (b) 每轮注入落在增量区，不享受前缀缓存。
+        #    现由 _subagent_system_prompt 统一携带（见其 docstring），
+        #    此处不再重复注入，避免双份 + 保持缓存友好。
 
         # ── 今日状态注入：给子代理"过日子"的当天切片（三期 M1/M2 接入主线，2026-09-03 主代理） ──
         #   此前每日状态只挂在读空气观察层，角色说话吃不到今日状态。现并进 extra_user_content
@@ -616,7 +630,6 @@ class DispatchMixin:
             _ctx_contexts = []
             final_input, _ctx_contexts = await self._ctx_engine.inject(
                 agent_name, event.unified_msg_origin, final_input,
-                prov_id, handoff, timeout,
             )
 
             # 超时上限：读配置 subagent_reply_timeout（默认 120）
@@ -637,7 +650,7 @@ class DispatchMixin:
             )
             # [PROF-PROMPT 2026-09-12] 请求体分解打点（一次性实验，完事即撤）
             try:
-                _sys_p = self._subagent_system_prompt(handoff)
+                _sys_p = self._subagent_system_prompt(handoff, agent_name)
                 _ctx_chars = sum(len(m.content or "") for m in (_ctx_contexts or []))
                 _tl = getattr(subagent_tools, "tools", None) or subagent_tools or []
                 _tools_chars = 0
@@ -662,7 +675,7 @@ class DispatchMixin:
                 )
             except Exception as _pe:  # 打点绝不拖垮主链
                 logger.warning(f"[PROF-PROMPT] 打点失败: {_pe}")
-                _sys_p = self._subagent_system_prompt(handoff)
+                _sys_p = self._subagent_system_prompt(handoff, agent_name)
             llm_resp = await asyncio.wait_for(
                 self.context.tool_loop_agent(
                     event=event,
@@ -1425,11 +1438,20 @@ Args:
         "5. 步数预算有限，优先把步数花在「定位→精读→核实」上，少做无目标的宽泛搜索。"
     )
 
-    def _subagent_system_prompt(self, handoff) -> str:
-        """子代理系统提示 = 人格指令 + 检索纪律 + 任务卡解读。"""
+    def _subagent_system_prompt(self, handoff, agent_name: str = "") -> str:
+        """子代理系统提示 = 人格指令 + 关系档案 + 检索纪律 + 任务卡解读。
+
+        [2026-09-13] 关系档案（家庭关系/近况）从 extra_user_content 迁移到 system 稳定层：
+        - 同一子代理的档案逐字节确定（无时间戳/随机），跨调用可命中前缀缓存；
+        - 只有关系文件更新时才变化（低频），不会逐轮打断缓存；
+        - 读失败自动退化为空段，绝不致命。
+        """
         base = getattr(handoff.agent, "instructions", "") or ""
+        _rel = self._relationship_inject(agent_name, "") if agent_name else ""
+        _rel_block = ("\n\n" + _rel) if _rel else ""
         return (
             base
+            + _rel_block
             + self._SUBAGENT_RETRIEVAL_DISCIPLINE
             + self._SUBAGENT_TASKCARD_GUIDE
         )

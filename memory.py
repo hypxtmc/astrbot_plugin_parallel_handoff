@@ -329,25 +329,28 @@ class MemoryMixin:
     # ── 构建子代理工具集（记忆工具过滤） ──
     # 子代理工具白名单默认值。
     # 2026-09-11 先只给「读」的手，写权留在主代理；
-    # 2026-09-12 用户拍板取消只读 —— 默认集补齐文件读写、语法/测试门禁与本地 git，
-    # 子代理不再只是「伸手看一眼」（配合 dispatch 的 tool_loop_agent 才真正可执行）。
+    # 2026-09-12 用户拍板取消只读——默认集曾补齐文件读写、语法/测试门禁与本地 git；
+    # 2026-09-13 用户拍板收回写权——默认集回到「只读 + 网页搜索」：
+    #   写/执行类（safe_edit/safe_write/multi_edit/file_patch/safe_rollback/
+    #   file_remove/file_move/file_zip/file_unzip/symbol_rename/code_index/
+    #   test_runner/git_commit）全部移除，子代理回归「只能看、不能动手」。
     # 配置键优先 subagent_tools，兼容旧键 subagent_readonly_tools；留空回落本默认集。
     # 高风险工具（shell_exec / astrbot_execute_shell / hot_reload_plugin / git_push /
     # gh_*）刻意不进默认集，需用户单独授权后再写进白名单。
     _SUBAGENT_TOOL_NAMES_DEFAULT = (
-        # 读
+        # 读（文件/目录/搜索）
         "safe_read", "dir_list", "dir_tree", "es_search", "rg_search",
-        "text_filter", "code_explore", "code_index", "code_status",
-        "file_hash", "file_diff", "safe_backups", "astr_kb_search",
-        "web_search", "web_fetch",
-        # 写（文件读写档）
-        "safe_edit", "safe_write", "multi_edit", "file_patch", "file_preview",
-        "safe_rollback", "file_remove", "file_move", "file_zip", "file_unzip",
-        "config_diff", "symbol_rename",
-        # 门禁与本地 git
-        "syntax_check", "lint_runner", "test_runner",
-        "git_status", "git_diff", "git_log", "git_commit", "git_branch",
-        "git_remote", "git_changelog",
+        "text_filter", "file_hash", "file_diff", "file_preview", "safe_backups",
+        # 代码理解（只读）
+        "code_explore", "code_status",
+        # 知识库 / 网页搜索
+        "astr_kb_search", "web_search", "web_fetch", "web_search_tavily",
+        "tavily_extract_web_page",
+        # 只读检查（不改文件）
+        "syntax_check", "lint_runner", "config_diff",
+        # 只读 git
+        "git_status", "git_diff", "git_log", "git_branch", "git_remote",
+        "git_changelog",
     )
 
     def _subagent_tool_names(self):
@@ -393,7 +396,7 @@ class MemoryMixin:
                         subagent_tools = ToolSet(tools=picked)
                         logger.info(
                             f"[parallel_handoff] 子代理工具集 [{agent_name}]: "
-                            f"{sorted(t.name for t in picked)}（读写档）"
+                            f"{sorted(t.name for t in picked)}（只读档）"
                         )
                     else:
                         logger.warning(

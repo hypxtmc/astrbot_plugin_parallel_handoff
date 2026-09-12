@@ -3,7 +3,35 @@
 > 多声部并行，一曲收拢。
 > 主代理执棒，子代理各为声部——各唱各的旋律，最终汇成同一首曲子。
 
-AstrBot 多子代理并行调度插件（原 `parallel_handoff`，v2.10）。
+**AstrBot 多子代理并行调度插件**（原名 `parallel_handoff`）
+
+| 信息 | 值 |
+|------|-----|
+| 版本 | 2.10 |
+| 作者 | hypxtmc |
+| 许可 | MIT |
+| 要求 | AstrBot ≥ 4.26.0 |
+| 工具名 | `parallel_handoff` / `call_subagent` / `task_status` / `task_result` / `task_stop` |
+
+---
+
+## 目录
+
+- [为什么叫复调](#为什么叫复调)
+- [特性总览](#特性总览)
+- [快速开始](#快速开始)
+- [核心概念](#核心概念)
+- [调度四式](#调度四式)
+- [功能详解](#功能详解)
+- [工具一览](#工具一览)
+- [命令一览](#命令一览)
+- [配置参考](#配置参考)
+- [数据与文件布局](#数据与文件布局)
+- [架构概览](#架构概览)
+- [开发与测试](#开发与测试)
+- [版本演进纪要](#版本演进纪要)
+- [设计哲学](#设计哲学)
+- [FAQ](#faq)
 
 ---
 
@@ -24,57 +52,140 @@ AstrBot 多子代理并行调度插件（原 `parallel_handoff`，v2.10）。
 
 ---
 
-## 功能全景
+## 特性总览
 
-> ⚠️ **实验性功能提示**：以下功能标注为【实验性】——**未经长期运行验证**，行为可能随版本演进调整，请谨慎开启并留意日志。涉及：
-> 旁路模块（`enable_side_pulse`）、拉用户进旁轨（`side_pulse_draft_enable`）、读空气仲裁（`enable_read_air_arbitrate`）、3P/4P 接龙记忆沉淀（`enable_chain_memory_persist`）。
+- **四种调度**：parallel 齐奏 / chained 接龙 × relay 收谱 / direct 直发，任意组合
+- **双模式配置**：`tech`（技术干活）与 `affection`（日常贴贴）两套预设，一个参数切换
+- **命令式点名 T0 强锁**：`/名字` 锁定目标并持续生效，主代理忙碌时也不被抢
+- **消息消歧**：只传 `message`，自动路由到最近对话中出场的子代理
+- **路由强制指令**：LLM 请求前自动计算路由路径并注入执行指令，任务分类随行
+- **主代理前缀 + 分段转发**：多声部不串音，长回复自动分段
+- **跨轮上下文引擎**：子代理记得跨轮聊过什么，窗口轮数独立可调
+- **常驻会话落盘**：每个子代理的对话线独立成档、实时落盘，重启不丢
+- **后台任务**：子代理长任务不阻塞总线，并发/时限全可配，结果随时回收
+- **会话柜台三件套**：`/谁在`、`/复位`、`/列表`
+- **读空气仲裁**：在场状态机（ConversationPresence）维持多声部秩序【实验性】
+- **个体状态随机演化**：纯规则状态机，每天谁来接话不固定，家是活的
+- **离线心情注入**：小模型离线读取近期对话，为子代理注入「今日心情 / 手头事」
+- **旁路模块**：子代理之间有自己的小日子，攒一屋烟火气【实验性·默认关】
+- **关系档案自动注入**：子代理 system 提示携带家庭关系档案（稳定层·缓存友好）
+- **子代理工具循环**：子代理可带工具干活——默认**只读档**，写权留在主代理
+- **livingmemory 记忆集成**：自动召回相关记忆片段，防止跨人格记忆污染
+- **接龙摘要**：chained 长接龙自动摘要传给下一棒，接力棒不失真
+- **旁听窗**：主代理能接上子代理直发的内容，会话里自然往返
 
-### 双模式配置（v2.7 核心体验）
+---
 
-主代理调用工具时可携带 `mode` 参数命中两套预设：
+## 快速开始
 
-- **`tech` 技术干活**：`relay` 路由 + `parallel` 并行，主代理统帅收卷，适合调研、多方案对比、流水线分工
-- **`affection` 日常贴贴**：`direct` 路由 + `chained` 接龙，子代理直接与用户对话，适合群聊、日常、情感陪伴
+### 安装
 
-注：模式命中时以模式配置为准——显式传参不会覆盖已配置的模式策略（「配置优先」约定）。
+1. 将本插件目录放入 AstrBot 的 `data/plugins/` 下
+2. 重启 AstrBot（或控制台热重载插件）
+3. 确认 AstrBot 版本 ≥ 4.26.0
 
-### 命令式点名（T0 强锁，v2.9）
+### 最小配置
+
+在 WebUI 插件配置中至少设置：
+
+- **`name_display_map`**：子代理英文 id → 中文名映射，例如 `{"agent_a": "助手A", "agent_b": "助手B"}`
+- 主代理路由规则：把想交给子代理的请求导向 `parallel_handoff` 或 `call_subagent`（推荐覆盖日常/情感类）
+
+其余全部有默认值，直接可用。
+
+### 第一次调用
+
+主代理（或你在支持工具调用的大模型对话中）调用：
+
+```json
+// 并行齐奏：同时问两个人
+{"calls": [{"agent_name": "agent_a", "input": "帮我看下这个函数"}, {"agent_name": "agent_b", "input": "顺便评估下性能"}], "mode": "tech"}
+
+// 接龙：A 说完 B 接着
+{"calls": [{"agent_name": "agent_a", "input": "先起个头"}, {"agent_name": "agent_b", "input": "接力"}], "call_mode": "chained"}
+
+// 消歧：不点名，找最近说过话的人
+{"message": "刚才那个问题你再说细点"}
+```
+
+---
+
+## 核心概念
+
+- **主代理**：执棒者。负责汇总、转述（relay）或放手（direct），也负责所有「写」的操作。
+- **子代理**：声部。各自有人格、记忆线、会话档案；默认只带**只读工具 + 网页搜索**，看、查、搜可以，动手改东西不行。
+- **直发（direct）**：子代理的回复不经主代理转述，直接以 `【名字】` 前缀发给用户。
+- **收谱（relay）**：子代理回复交回主代理，由主代理统一对外发声。
+- **场景（scene）**：转发时附带的一句场景说明（如「深夜，书房」），让子代理知道此刻在哪、跟谁说话。
+- **在场（presence）**：读空气仲裁记录「谁在场、该谁接话」的状态机基础。
+
+---
+
+## 调度四式
+
+### relay × parallel（指挥收谱 · 复调齐奏）
+
+所有子代理同时开跑，各自把结果交回主代理，主代理汇总后统一回复。适合：多方案对比、并行调研、任务分派后收卷。
+
+### relay × chained（指挥收谱 · 卡农轮唱）
+
+子代理依次接力，前一位的回复作为后一位的上下文传入。适合：流水线（先查资料 → 再写初稿 → 最后审校）、有依赖关系的多步任务。
+
+### direct × parallel（独唱直出 · 复调齐奏）
+
+所有子代理直接对用户说话（分条转发）。适合：群聊氛围、想让每个人自己发声。
+
+### direct × chained（独唱直出 · 卡农轮唱）
+
+子代理依次对用户说话，后面的人听得到前面的人说了什么。适合：日常接龙、多角色对话感。
+
+> **双模式预设**：调用时传 `mode: "tech"`（relay+parallel）或 `mode: "affection"`（direct+chained）即可整体切换策略。
+> **配置优先约定**：模式命中时以模式配置为准——显式传参不会覆盖已配置的策略。
+
+---
+
+## 功能详解
+
+> ⚠️ **实验性功能提示**：标注【实验性】的功能未经长期运行验证，行为可能随版本演进调整，请谨慎开启并留意日志。涉及：旁路模块（`enable_side_pulse`）、拉用户进旁轨（`side_pulse_draft_enable`）、读空气仲裁（`enable_read_air_arbitrate`）、3P/4P 接龙记忆沉淀（`enable_chain_memory_persist`）。
+
+### 命令式点名（T0 强锁）
 
 消息以 `/`、`／`、`#`、`！`、`!`、`、` 打头直接叫名字——`/助手A`、`/助手B+助手C`、`/助手A+助手B+助手C`——即锁定目标并**持续生效**：之后无需重复点名，消息一直交给对应子代理。主代理忙碌时同样有效，正事不会被抢走。
 
-### 消息消歧（v2.7.1 新增）
+### 消息消歧
 
 不传 `calls` 时可只传 `message`——插件自动路由到**最近对话中出场的子代理**，无需重复点名。接续话题、追问、对话消歧从此一个参数搞定。
 
 ### 路由强制指令（OnLLMRequestEvent）
 
-插件根据配置在 LLM 请求前自动计算路由路径并**注入强制指令**：主代理按注入的调度方式执行，工具全保留、不做软硬拦截。任务分类（plan/exec/chat/weak）随指令注入，让路由决策有章可循。
+插件根据配置在 LLM 请求前自动计算路由路径并**注入强制指令**：主代理按注入的调度方式执行，工具全保留、不做软硬拦截。任务分类（plan / exec / chat / weak）随指令注入，让路由决策有章可循。
 
 ### 主代理前缀 + 分段转发
 
 - 子代理回复经主代理转发时自动带 `【名字】` 前缀，多声部不串音
 - 长回复自动分段转发，支持主代理分段注入
 - 前缀可按子代理粒度开关（`name_prefix_overrides`）
+- QQ 平台自带 markdown 降级（`qq_md_plainify`），裸符号观感修复
 
 ### 跨轮子代理上下文引擎（ctx_engine）
 
-子代理在跨轮对话中记得之前聊过什么。支持历史压缩策略独立调节（`subagent_context_compress_ratio` / 保留最近 N 轮），长对话不爆上下文。
+子代理在跨轮对话中记得之前聊过什么。历史以结构化 messages 注入（前缀缓存友好），超窗口按 `subagent_context_max_turns` 纯截断——保留最近 N 轮，长对话不爆上下文。
 
-### 常驻会话落盘（session_store，v2.10）
+### 常驻会话落盘（session_store）
 
 每个子代理的对话线独立成档、实时落盘（`subagent_sessions/` 目录），重启不丢、跨天不散，保留天数可配。历史长在磁盘上，不在一次性的内存里。
 
-### 后台任务（task_runner，v2.10）
+### 后台任务（task_runner）
 
-子代理的长任务不再阻塞总线：后台执行、并发上限、单会话限量、单轮超时全部可配。派完活主代理可以继续说话，任务结束后结果回收。
+子代理的长任务不再阻塞总线：后台执行、并发上限、单会话限量、单轮超时全部可配。派完活主代理可以继续说话，任务结束后结果回收——配套 `task_status` / `task_result` / `task_stop` 三个工具。
 
-### 会话柜台三件套（v2.10）
+### 会话柜台三件套
 
 `/谁在` 查锁、`/复位` 放锁回自动分派、`/列表` 看全部可点名成员。整句判定（`/谁在 顺便说个事` 这类带内容的不会被误吞），主代理忙碌时同样可用。
 
 ### 读空气仲裁（arbitrate）
 
-在场状态状态机（ConversationPresence）：判断哪些子代理"在场"、该谁接话。多声部抢话时由仲裁机制维持秩序。
+在场状态机（ConversationPresence）：判断哪些子代理"在场"、该谁接话。多声部抢话时由仲裁机制维持秩序。二级闸门 `read_air_enforce` 默认关闭（observe-only，行为零变化）；开启后执行「宁静权」真实拦截。
 
 ### 智能路由（router，默认关）
 
@@ -82,28 +193,57 @@ AstrBot 多子代理并行调度插件（原 `parallel_handoff`，v2.10）。
 
 ### livingmemory 记忆集成
 
-与 livingmemory 插件联动：调用子代理时自动召回相关记忆片段（`recall_enabled`），并为子代理过滤记忆工具，防止跨人格记忆污染。
+与 livingmemory 插件联动：调用子代理时自动召回相关记忆片段（`recall_enabled`），并为子代理过滤记忆工具，防止跨人格记忆污染。私有路径访问通过防腐层 `_lm_bridge` 隔离。
+
+### 子代理工具循环 + 只读白名单
+
+子代理可带工具干活（受 `subagent_max_steps` / `subagent_tool_call_timeout` 约束），工具循环支持多步调用。
+
+**默认只读档（26 项）**——子代理只能看、查、搜，不能动手：
+
+| 分类 | 工具 |
+|------|------|
+| 文件读取 | `safe_read` `dir_list` `dir_tree` `es_search` `rg_search` `text_filter` `file_hash` `file_diff` `file_preview` `safe_backups` |
+| 代码理解 | `code_explore` `code_status` |
+| 知识·网页 | `astr_kb_search` `web_search` `web_fetch` `web_search_tavily` `tavily_extract_web_page` |
+| 只读检查 | `syntax_check` `lint_runner` `config_diff` |
+| 只读 git | `git_status` `git_diff` `git_log` `git_branch` `git_remote` `git_changelog` |
+
+写/执行类工具（文件编辑、删除、移动、压缩、重命名、测试运行、git 提交等）**全部留在主代理**。白名单可由 `subagent_tools` 调整（留空回落内置默认；兼容旧键 `subagent_readonly_tools`）。
+
+### 关系档案自动注入
+
+子代理的 system 提示里会带上她与家中每个成员的「关系档案」——亲密度、基调、最近互动（数据源与旁路模块共用 `relationships.json`）。
+
+- **稳定层注入**：档案放在 system 提示的固定段（人格 → 关系档案 → 检索纪律 → 任务卡），逐字节确定、无时间戳——**跨调用命中前缀缓存，不逐轮打断**；
+- **亲密度降序**：近况按亲密度稳定排序，最亲的先说；
+- **失败退化**：关系文件缺失/读取失败时自动退化为空段，绝不阻塞对话。
 
 ### 接龙摘要（chain_summary）
 
 chained 长接龙自动生成摘要传给下一棒（阈值/保留首尾策略可调），接力棒不失真。
 
-### 个体状态随机演化（random_state，三期 M1）
+### 个体状态随机演化（random_state）
 
 纯规则状态机：**接话人不能被算死**。每个子代理的日常话题、关注度随机演化，同一个问题今天和明天可能由不同的人接——家是活的，不是状态机。
 
-### 离线心情注入（daily_life，三期 M2）
+### 离线心情注入（daily_life）
 
 用 GLM-4-Flash 离线读取近期对话，为每个子代理注入「今日心情 / 手头事 / 话题域」的语义温度。子代理不是每次都被叫醒的应答机，而是有自己一天的角色。
 
-### 【实验性】旁路模块（side_pulse，三期 M5，默认关）
+### 旁听窗
+
+子代理直发（direct）的内容会被记录（1000 字窗口），主代理下次开口时系统把最近 10 分钟内子代理说过的话附进上下文——主代理接得上，会话自然往返，像真人 QQ 对话。
+
+### 【实验性】旁路模块（side_pulse，默认关）
 
 > 设计初衷：子代理之间有自己的小日子——不围主对话转，彼此搭话、惦记、拌嘴，攒一屋烟火气；用户每天可收到一条「家里动静」摘要。
 
 - **心跳闲聊**：子代理之间自主搭话（作息式自管循环 06:17→次日 01:00、窗内每 2h 随机一场；`side_pulse_window_start/end`、`side_pulse_interval_min` 可调）
 - **生活三态**：每件手头事走「起头 → 做到一半 → 收尾」，收尾那轮顺口播报后归档，再开新事——不拖不弃
-- **素材池**：私有素材（`data/side_pulse/thread_flavors.json`）∪ 通用生活池，轮换取用、一圈不重复；首次开启自动生成人格骨架（`data/side_pulse/personas.json`），照骨架写你自己的同事们
+- **素材池**：私有素材（`thread_flavors.json`）∪ 通用生活池，轮换取用、一圈不重复；首次开启自动生成人格骨架（`personas.json`），照骨架写你自己的同事们
 - **全桌关系**：入场每人逐行注入与在场者的关系与基调（`relationships.json`；未收录 =「不太熟，别热络」）
+- **情绪摩擦**：心情影响说话方式，反客套规则在场——不寒暄敷衍
 - **每日摘要**：定时汇总「家里动静」推送到指定会话（`side_pulse_digest_cron` / `side_pulse_digest_umo`）
 - **插话机制**：一定概率闯入正在进行的对话（概率/上限双控）
 - **东道主机制**：围坐主持概率控制
@@ -113,7 +253,19 @@ chained 长接龙自动生成摘要传给下一棒（阈值/保留首尾策略�
 
 ---
 
-## 命令
+## 工具一览
+
+| 工具 | 作用 | 关键参数 |
+|------|------|----------|
+| `parallel_handoff` | 并行/接龙调用多个子代理 | `calls`（列表）· `mode`（tech/affection）· `route_mode` / `call_mode`（覆盖）· `background`（后台执行） |
+| `call_subagent` | 调用单个子代理并转发回复 | `agent_name` · `input` |
+| `task_status` | 查后台任务状态 | `task_id`（可选，不传列全部） |
+| `task_result` | 取后台任务结果 | `task_id` · `timeout` |
+| `task_stop` | 取消后台任务 | `task_id` |
+
+---
+
+## 命令一览
 
 | 命令 | 作用 |
 |------|------|
@@ -127,59 +279,178 @@ chained 长接龙自动生成摘要传给下一棒（阈值/保留首尾策略�
 
 ---
 
-## 配置参考（72 项分速查）
+## 配置参考
 
-**核心调度**：`route_mode`（relay/direct）· `call_mode`（parallel/chained）· `tech_mode_config` / `affection_mode_config`（双模式预设）· `main_agent_name` · `handoff_blacklist_agents`（黑名单）· `direct_delivery_agents`（直发白名单）
+共 **78** 项，按功能分组速查（完整定义见插件 WebUI 配置面板）：
 
-**前缀与转发**：`enable_subagent_name_prefix` · `enable_mainagent_name_prefix` · `enable_mainagent_segmented` · `name_prefix_overrides` · `name_display_map` · `allow_mainagent_after_direct` · `forbid_pre_tool_mainagent_talk`
+**核心调度**
+`user_address` · `main_agent_name` · `route_mode`（relay/direct）· `call_mode`（parallel/chained）· `tech_mode_config` / `affection_mode_config`（双模式预设）· `handoff_blacklist_agents`（黑名单）· `direct_delivery_agents`（直发白名单）
 
-**场景注入**：`enable_scene_inject` · `enable_segmented_forward`
+**前缀与转发**
+`enable_subagent_name_prefix` · `enable_mainagent_name_prefix` · `enable_mainagent_segmented` · `enable_segmented_forward` · `min_fragment_length` · `fragment_interval` · `allow_mainagent_after_direct` · `forbid_pre_tool_mainagent_talk` · `mainagent_disable_md_split` · `mainagent_md_split_max_chars` · `mainagent_md_split_progress` · `name_display_map` · `name_prefix_overrides` · `qq_md_plainify`
 
-**跨轮上下文**：`subagent_context_enabled` · `subagent_context_max_turns` · `subagent_context_keep_recent` · `subagent_context_compress_ratio`
+**路由与指令**
+`enable_route_directive` · `subagent_visibility_inject` · `directive_inject_mode` · `enable_smart_router`（默认关）· `enable_disambiguation` · `router_provider_id` · `router_confidence_threshold` · `router_timeout` · `subagent_reply_timeout`
 
-**路由与指令**：`enable_route_directive` · `directive_inject_mode` · `enable_smart_router`（默认关）· `router_confidence_threshold` · `router_provider_id` · `router_timeout`
+**子代理工具循环**
+`subagent_tools`（白名单·默认只读档）· `subagent_readonly_tools`（旧键兼容）· `subagent_max_steps` · `subagent_tool_call_timeout` · `subagent_response_preview_chars`
 
-**接龙摘要**：`chain_summary_enabled` · `chain_summary_model` · `chain_summary_threshold` · `chain_summary_keep_head_tail`
+**跨轮上下文**
+`subagent_context_enabled` · `subagent_context_max_turns`
 
-**仲裁与生活**：`enable_read_air_arbitrate`（实验性）· `read_air_enforce` · `read_air_presence_window` · `enable_daily_random_life` · `random_state`（M1 状态机）
+**常驻会话**
+`subagent_session_persist` · `subagent_session_retention_days`
 
-**常驻会话**：`subagent_session_persist` · `subagent_session_retention_days`
+**后台任务**
+`subagent_task_max_concurrent` · `subagent_task_max_per_session` · `subagent_task_turn_timeout`
 
-**后台任务**：`subagent_task_max_concurrent` · `subagent_task_max_per_session` · `subagent_task_turn_timeout`
+**记忆召回**
+`recall_enabled` · `recall_default_k` / `recall_max_k` · `exclude_agents`
 
-**子代理工具循环**：`subagent_tools` · `subagent_readonly_tools` · `subagent_max_steps` · `subagent_tool_call_timeout` · `subagent_response_preview_chars`
+**场景与生活**
+`enable_scene_inject` · `enable_daily_random_life` · `daily_life_provider_id` · `enable_read_air_arbitrate`（实验性）· `read_air_enforce` · `read_air_presence_window` · `chain_summary_enabled` · `chain_summary_model` · `chain_summary_threshold` · `chain_summary_keep_head_tail` · `enable_chain_memory_persist`（实验性）
 
-**持久化**：`enable_chain_memory_persist`（实验性，3P/4P 接龙记忆沉淀）
-
-**旁路模块**（实验性，全部默认关）：`enable_side_pulse` · `side_pulse_members` · `side_pulse_cron` · `side_pulse_digest_cron` · `side_pulse_digest_umo` · `side_pulse_provider_id` · 插话/东道主概率与上限 · 草稿概率与配额（工作日/节假日分设）· `side_pulse_recent_hours` · `side_pulse_window_start/end` · `side_pulse_interval_min`
-
-**记忆召回**：`recall_enabled` · `recall_default_k` / `recall_max_k` · `min_fragment_length` · `fragment_interval` · `exclude_agents`
+**旁路模块**（实验性，全部默认关）
+`enable_side_pulse` · `side_pulse_members` · `side_pulse_cron` · `side_pulse_digest_cron` · `side_pulse_digest_umo` · `side_pulse_memory_umo` · `side_pulse_provider_id` · `side_pulse_recent_hours` · `side_pulse_window_start` / `side_pulse_window_end` · `side_pulse_interval_min` · 插话/东道主概率与上限 · 草稿概率与配额（工作日/节假日分设）
 
 ---
 
-## 安装
+## 数据与文件布局
 
-1. 将本目录放入 `data/plugins/`
-2. 要求 AstrBot ≥ 4.26.0
-3. 在 WebUI 配置 `name_display_map`（子代理英文 id → 中文名映射）
-4. 主代理需配置路由规则（推荐将日常/情感类请求交给 `parallel_handoff` 或 `call_subagent`）
-5. 可选：安装 livingmemory 插件以启用记忆召回；配置 `side_pulse_*` 以启用旁路模块
-6. 常驻会话数据默认落在 `data/plugin_data/astrbot_plugin_parallel_handoff/subagent_sessions/`（自动创建）
+```
+astrbot_plugin_parallel_handoff/
+├── main.py            # 入口 + 事件注册（工具/命令/装饰器）
+├── dispatch.py        # 核心调度：parallel_handoff 主流程、工具循环、关系档案
+├── router.py          # 路由层：T0 强锁 / T1 规则 / T2 小模型 / T3 兜底、消歧
+├── forward.py         # 分段转发、前缀注入、markdown 降级、直发记录
+├── side_pulse.py    # 旁路模块（心跳/三态/素材/关系/摘要）
+├── memory.py          # livingmemory 集成、子代理工具白名单、时间感知
+├── random_state.py    # 个体状态随机演化（M1）
+├── daily_life.py      # 离线心情注入（M2）
+├── directive.py       # 路由强制指令注入
+├── arbitrate.py       # 读空气仲裁（在场状态机）
+├── ctx_engine.py      # 跨轮上下文引擎
+├── session_store.py   # 常驻会话落盘
+├── task_runner.py     # 后台任务
+├── _lm_bridge.py      # livingmemory 防腐层
+├── config.py          # 配置读取
+├── _conf_schema.json  # 配置面板定义（78 项）
+└── data/              # 插件自带数据
+    ├── display_names.json      # 英文 id → 中文名
+    ├── random_state_data.json  # 状态机种子数据
+    ├── router_tables.json      # 路由规则表
+    └── side_pulse/           # 旁路模块数据
+        ├── personas.json          # 人格骨架（首开自动生成）
+        ├── thread_flavors.json    # 私有素材池
+        ├── prompts.json           # 提示词
+        ├── threads.json           # 生活三态进度
+        └── *.jsonl                # 每日活动日志
+```
+
+**运行时数据**（自动创建）：
+
+- `data/plugin_data/astrbot_plugin_parallel_handoff/subagent_sessions/` —— 会话落盘
+- `data/relationships/relationships.json` —— 家庭关系网（旁轨与关系档案共用）
+
+---
+
+## 架构概览
+
+| 模块 | 规模 | 职责 |
+|------|------|------|
+| `main.py` | 403 行 | 插件入口、事件注册（`@llm_tool` / `@filter.command` / 装饰器壳方法） |
+| `dispatch.py` | 1545 行 | 核心调度主流程、去重守卫、工具循环、关系档案注入 |
+| `router.py` | 1642 行 | 四层判向（T0 强锁 → T1 规则 → T2 小模型 → T3 兜底）、消歧、场景判定 |
+| `forward.py` | 1155 行 | 分段转发、主代理前缀、markdown 降级、旁听窗记录 |
+| `side_pulse.py` | 1651 行 | 旁路模块全套（心跳/三态/素材/骨架/关系/摘要/插话/草稿） |
+| `memory.py` | 648 行 | livingmemory 集成、工具白名单、时间感知与状态注入 |
+| `random_state.py` | 428 行 | 个体状态随机演化（M1 纯规则状态机） |
+| `directive.py` | 344 行 | 路由强制指令构建与注入 |
+| `arbitrate.py` | 320 行 | 读空气仲裁（ConversationPresence 状态机） |
+| `task_runner.py` | 254 行 | 后台任务执行（并发/超时/回收） |
+| `session_store.py` | 225 行 | 会话落盘（JSONL，磁盘为真源） |
+| `_lm_bridge.py` | 225 行 | livingmemory 私有路径防腐隔离 |
+| `config.py` | 206 行 | 配置读取与默认值 |
+| `daily_life.py` | 174 行 | 离线心情注入（M2） |
+| `ctx_engine.py` | 116 行 | 跨轮上下文：历史存储 / 窗口截断 / 上限裁剪 |
+
+**数据流（一次 direct × parallel 调用）**：
+
+```
+用户消息
+  → router：T0 强锁？/ T1 规则命中？/ T2 小模型？/ T3 兜底主代理
+  → dispatch：构建 calls、并发派发子代理
+      → 每声部：system（人格 + 关系档案 + 纪律 + 任务卡）
+                + 上下文（ctx_engine / session_store）
+                + 工具循环（只读白名单）
+  → forward：前缀注入 → 分段转发 → 旁听窗记录
+  → 用户看到多声部发言
+```
+
+---
+
+## 开发与测试
+
+```bash
+# 全量测试（需要 AstrBot 的 venv 环境）
+python3 test_plugin.py
+
+# 或使用 AstrBot 自带的解释器（路径按你的部署调整）
+<astrbot>/venv/bin/python3 test_plugin.py
+```
+
+- 测试文件：`test_plugin.py`（主套件）、`test_lm_bridge.py`、`test_task_runner.py`、`test_session_store.py`、`test_task_integration.py`
+- 修改插件代码后：先 `python3 -m py_compile` 自查，再热重载插件，用 `plugin_list` + 日志验证
+- 插件级热重载：命令 `热重载并行插件` 或控制台插件管理
+- 提交前建议全量测试零回归
+
+---
 
 ## 版本演进纪要
 
 - **v2.0–v2.3**：核心调度（parallel/chained × relay/direct）、统一场景注入、姓名前缀、分段转发、接龙摘要、热重载命令
-- **v2.4**：P0 拆模块重构——dispatch / forward / directive / arbitrate / ctx_engine / memory 独立成模块，10600 行分层清晰
+- **v2.4**：P0 拆模块重构——dispatch / forward / directive / arbitrate / ctx_engine / memory 独立成模块，分层清晰
 - **v2.5**：路由强制指令注入（OnLLMRequestEvent）+ 读空气仲裁状态机 + 智能路由（默认关）
-- **v2.6**：三期重版——random_state 个体状态种子（M1 纯规则随机演化）+ daily_life GLM-4-Flash 离线心情注入（M2）
+- **v2.6**：三期重版——random_state 个体状态种子（M1 纯规则随机演化）+ daily_life 离线心情注入（M2）
 - **v2.7.1**：side_pulse 旁路模块 v0（M5）+ 消息消歧（message 参数）+ 双模式配置（tech/affection）+ 配置优先约定
 - **v2.8**：livingmemory 私有路径防腐层 `_lm_bridge`
 - **v2.9**：命令式点名 T0 强锁（多前缀、粘滞、忙碌可用）→ v2.9.1 强锁治本与夺锁仲裁 → v2.9.2 子代理接入工具循环 + 只读工具白名单
 - **v2.10**：常驻会话落盘（session_store）+ 后台任务（task_runner）+ 会话柜台三件套（/谁在 /复位 /列表）+ token 计量口径
+- **v2.10 系列（最新）**：旁路模块四缺陷修复（全桌关系矩阵 / 情绪摩擦 / 骨架引导 / 事件三态机）· 关系档案自动注入迁入 system 稳定层（缓存友好）· 子代理工具收权为只读档（26 项）· 旁听窗（主代理↔子代理自然对话）
+
+---
 
 ## 设计哲学
 
 复调的对位法有一条铁律：**每个声部独立成立，对位才成立**。子代理不是主代理的分身，不是应答机，也不是轮流播报的喇叭——各有旋律线，彼此听见，偶尔抢拍，但汇成的是同一首曲子。这个插件只做一件事：把舞台搭好，然后守住对位。
+
+---
+
+## FAQ
+
+**Q：主代理和子代理有什么区别？**
+A：主代理是执棒者——负责调度、汇总、对外发声，并且**独占所有写权限**（改文件、跑命令、提交代码）。子代理是各声部——有人格、有记忆线、有自己的会话档案，能看、能查、能搜，不能动手写。
+
+**Q：为什么子代理默认没有写权限？**
+A：安全第一。子代理是多声部并行执行的，写操作容易互相踩踏；写权集中在主代理，责任链清晰。确实需要时可通过 `subagent_tools` 白名单单项授权。
+
+**Q：默认为什么是 `direct` 路由？**
+A：日常陪伴场景下，子代理直接对用户说话更自然（各唱各的，用户直接听到多个声部）。技术干活场景调用时传 `mode: "tech"` 即可切换为 relay 收谱。
+
+**Q：旁路模块开了没反应？**
+A：检查三处：① `enable_side_pulse` 是否开启；② `side_pulse_members` 是否填了成员；③ 当前时间是否在活跃窗口（默认 06:17 → 次日 01:00）内。首次开启会自动生成人格骨架，照骨架写你自己的同事们。
+
+**Q：改了代码怎么生效？**
+A：插件级热重载即可（命令 `热重载并行插件`）。全局配置变更需重启 AstrBot。
+
+**Q：会消耗很多 token 吗？**
+A：调度本身开销很小；主要消耗在各子代理的对话与工具循环上。关系档案放在 system 稳定层、内容逐字节确定——**跨调用命中前缀缓存**，不会逐轮重复计费。
+
+**Q：子代理能互相聊天吗？**
+A：可以——旁路模块（实验性）就是为此设计的：心跳闲聊、生活三态、全桌关系。主代理也可以通过 chained 接龙让子代理接力对话。
+
+**Q：怎么做多人群聊氛围？**
+A：`direct` 路由 + `parallel` 调用——多个子代理同时直发，各有前缀不串音；配合 `affection` 模式预设食用更佳。
 
 ---
 
