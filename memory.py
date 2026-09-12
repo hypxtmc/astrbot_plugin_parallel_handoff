@@ -7,6 +7,7 @@
 """
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
+from astrbot.api.platform import MessageType
 from astrbot.api.provider import ProviderRequest
 from astrbot.core.agent.tool import ToolSet
 
@@ -220,6 +221,10 @@ class MemoryMixin:
         任何失败静默降级，不影响主召回。
         """
         try:
+            # 2026-09-12 顾主指令：旁轨已关（enable_side_pulse=False），
+            # 旁轨记忆不再自动注入子代理上下文（查看链路保留，按需自取）。
+            if not self._cfg("enable_side_pulse", False):
+                return parts
             pulse_umo = self._cfg(
                 "side_pulse_memory_umo", "side_pulse:FriendMessage:subagents"
             )
@@ -322,27 +327,43 @@ class MemoryMixin:
             return []
 
     # ── 构建子代理工具集（记忆工具过滤） ──
-    # 只读工具白名单默认值（2026-09-11 顾主定：先给子代理「读」的手，写权留在主代理；
-    # 配合 dispatch 的 tool_loop_agent 才真正可执行）。
-    # 可被配置项 subagent_readonly_tools 覆盖。
-    _READONLY_TOOL_NAMES_DEFAULT = (
+    # 子代理工具白名单默认值。
+    # 2026-09-11 先只给「读」的手，写权留在主代理；
+    # 2026-09-12 顾主拍板取消只读 —— 默认集补齐文件读写、语法/测试门禁与本地 git，
+    # 子代理不再只是「伸手看一眼」（配合 dispatch 的 tool_loop_agent 才真正可执行）。
+    # 配置键优先 subagent_tools，兼容旧键 subagent_readonly_tools；留空回落本默认集。
+    # 高风险工具（shell_exec / astrbot_execute_shell / hot_reload_plugin / git_push /
+    # gh_*）刻意不进默认集，需顾主单独授权后再写进白名单。
+    _SUBAGENT_TOOL_NAMES_DEFAULT = (
+        # 读
         "safe_read", "dir_list", "dir_tree", "es_search", "rg_search",
         "text_filter", "code_explore", "code_index", "code_status",
         "file_hash", "file_diff", "safe_backups", "astr_kb_search",
+        "web_search", "web_fetch",
+        # 写（文件读写档）
+        "safe_edit", "safe_write", "multi_edit", "file_patch", "file_preview",
+        "safe_rollback", "file_remove", "file_move", "file_zip", "file_unzip",
+        "config_diff", "symbol_rename",
+        # 门禁与本地 git
+        "syntax_check", "lint_runner", "test_runner",
+        "git_status", "git_diff", "git_log", "git_commit", "git_branch",
+        "git_remote", "git_changelog",
     )
 
-    def _readonly_tool_names(self):
-        """只读白名单：优先取配置 subagent_readonly_tools（逗号分隔字符串或列表），
-        空值回落 _READONLY_TOOL_NAMES_DEFAULT。"""
-        raw = self._cfg("subagent_readonly_tools", "")
+    def _subagent_tool_names(self):
+        """子代理工具白名单：优先取配置 subagent_tools，兼容旧键 subagent_readonly_tools
+        （逗号分隔字符串或列表），空值回落 _SUBAGENT_TOOL_NAMES_DEFAULT（读写档）。"""
+        raw = self._cfg("subagent_tools", "")
+        if not raw:
+            raw = self._cfg("subagent_readonly_tools", "")
         if isinstance(raw, (list, tuple)):
             names = [str(x).strip() for x in raw if str(x).strip()]
         else:
             names = [x.strip() for x in str(raw or "").split(",") if x.strip()]
-        return tuple(names) if names else self._READONLY_TOOL_NAMES_DEFAULT
+        return tuple(names) if names else self._SUBAGENT_TOOL_NAMES_DEFAULT
 
     def _build_memory_tools(self, agent_name: str):
-        """为子代理构建工具集（记忆工具 + 只读代码工具）。
+        """为子代理构建工具集（记忆工具 + 读写工具）。
 
         排除逻辑收敛为单一 exclude_agents 集合：由配置直接控制（默认空 = 全部子代理可召回），
         配置（subagent_memory.exclude_agents 或扁平 exclude_agents）决定集合内容。
@@ -366,17 +387,17 @@ class MemoryMixin:
                     wanted = {
                         "recall_long_term_memory",
                         "memorize_long_term_memory",
-                    } | set(self._readonly_tool_names())
+                    } | set(self._subagent_tool_names())
                     picked = [t for t in global_tools.func_list if t.name in wanted]
                     if picked:
                         subagent_tools = ToolSet(tools=picked)
                         logger.info(
                             f"[parallel_handoff] 子代理工具集 [{agent_name}]: "
-                            f"{sorted(t.name for t in picked)}（只读档）"
+                            f"{sorted(t.name for t in picked)}（读写档）"
                         )
                     else:
                         logger.warning(
-                            f"[parallel_handoff] 只读白名单零命中 [{agent_name}]，"
+                            f"[parallel_handoff] 工具白名单零命中 [{agent_name}]，"
                             f"全局工具名：{sorted(t.name for t in global_tools.func_list)}"
                         )
                 else:
@@ -413,7 +434,14 @@ class MemoryMixin:
             _subagent_persona=agent_name,  # get_persona_id 优先级 0，按子代理隔离
         )
         stub.get_message_str = lambda: "subagent_memory"
-        stub.get_message_type = lambda: 1  # 非群聊，走私聊存储
+        # 2026-09-12 双写修复（顾主拍板）：原先返回 1（非群聊），会触发
+        # livingmemory handle_memory_recall 的副作用存储
+        #（memory_recall.py L140-155「存储用户消息（仅私聊），无论是否启用召回」），
+        # 与本插件 _memory_store 的显式存储叠加 → 子代理会话 user 消息被存两遍
+        #（实测 agent_b 会话 user 158 / assistant 78 ≈ 2:1，真人会话 1:1）。
+        # 改报群聊值：is_group=True 时该分支整体跳过；召回/检索不受影响
+        #（is_group 在 handle_memory_recall 内仅此一处使用，已核实）。
+        stub.get_message_type = lambda: MessageType.GROUP_MESSAGE
         stub.get_sender_id = lambda: umo
         try:
             _platform = event.get_platform_name()
