@@ -758,6 +758,22 @@ class RouterMixin:
         """该会话是否被主代理锁锁定（锁定后非命令消息直通主代理）。"""
         return event.unified_msg_origin in self._main_lock_data()
 
+    def _is_real_command(self, raw_message: str) -> bool:
+        """锁仲裁用：raw_message 是否「真命令」——带 / 且能解析出已知目标。
+
+        [2026-09-12 21:25 根因修复] 唤醒层会把「被唤醒消息」重写为 '/原文'
+        （"你和助手B..." → "/你和助手B..."）。此时 startswith("/") 为真、
+        但解析不出任何已知代理/管理命令——那是被重写的普通消息，对主代理锁
+        必须按「非命令」处理（直通主代理），否则消息会被 T0/T1 扫出子代理名
+        路由走（21:06 实测 bug：锁在场仍被转给 agent_b）。
+        """
+        if not raw_message.startswith("/"):
+            return False
+        if self._parse_admin_command(raw_message):
+            return True
+        ca, cp = self._parse_agent_command(raw_message)
+        return bool(ca or cp)
+
     def _clear_main_lock(self, event):
         """解除主代理锁（/复位 或建立新子代理命令锁时调用）。同步落盘。"""
         lock = self._main_lock_data()
@@ -1148,7 +1164,7 @@ class RouterMixin:
             return True
         # [主代理锁 2026-09-12 用户指定] busy 场景主代理锁同样直通：
         # 非命令消息全部放行主代理（含子代理名的句子只是对话，不切换路由）。
-        if self._main_locked(event) and not raw_message.startswith("/"):
+        if self._main_locked(event) and not self._is_real_command(raw_message):
             logger.info("[parallel_handoff] BusyBypass: 主代理锁在场 → 直通主代理")
             return False
         # [T0 命令式触发 2026-09-08 用户指定] busy 场景同样启用 / 命令：
@@ -1379,7 +1395,7 @@ class RouterMixin:
         # [主代理锁 2026-09-12 用户指定] 会话被主代理锁锁定 → 非命令消息直通主代理，
         # 不跑 T0 点名/T1/T1.5/T0.5/T2；命令字（/ 开头）放行给下方 T0 处理
         # （/子代理名 换锁、/复位 解绑仍可执行）。
-        if self._main_locked(event) and not raw_message.startswith("/"):
+        if self._main_locked(event) and not self._is_real_command(raw_message):
             logger.info(
                 "[parallel_handoff] SmartRouter: 主代理锁在场 → 直通主代理（跳过全部判向）"
             )
