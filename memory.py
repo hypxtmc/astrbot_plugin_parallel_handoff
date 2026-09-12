@@ -441,7 +441,7 @@ class MemoryMixin:
         # livingmemory handle_memory_recall 的副作用存储
         #（memory_recall.py L140-155「存储用户消息（仅私聊），无论是否启用召回」），
         # 与本插件 _memory_store 的显式存储叠加 → 子代理会话 user 消息被存两遍
-        #（实测 agent_b 会话 user 158 / assistant 78 ≈ 2:1，真人会话 1:1）。
+        #（实测样本会话 user 约为 assistant 两倍，真人会话约 1:1）。
         # 改报群聊值：is_group=True 时该分支整体跳过；召回/检索不受影响
         #（is_group 在 handle_memory_recall 内仅此一处使用，已核实）。
         stub.get_message_type = lambda: MessageType.GROUP_MESSAGE
@@ -464,18 +464,20 @@ class MemoryMixin:
         心跳提炼都 WARN 一条并退化 base_prompt。存储维度（classify_atoms
         的 persona_id）保持英文 id 与召回侧 _subagent_persona 一致，
         不经过本函数，防止记忆库 persona 维度分裂。
-        个别子代理的人格在库中按「名字-子代理」后缀登记，需特例映射（见下）。
-        查不到映射时原样返回（行为与旧版一致，仅可能仍有 WARN）。
+        个别子代理的人格在库中按「名字-子代理」后缀登记；由部署方在
+        persona_suffix_agents 配置里声明（逗号分隔的 id 列表，默认空 =
+        原样返回，行为与旧版一致，仅可能仍有 WARN）。
         """
         try:
             _map = self._get_name_display_map() or {}
             disp = _map.get(agent_name) or agent_name
-            _ts = _map.get("agent_c")
         except Exception:
-            disp = agent_name
-            _ts = None
-        if _ts and disp == _ts:
-            disp = f"{_ts}-子代理"
+            return agent_name
+        raw_suffix = str(self._cfg("persona_suffix_agents", "")).strip()
+        if raw_suffix:
+            suffix_ids = {a.strip().lower() for a in raw_suffix.split(",") if a.strip()}
+            if agent_name.lower() in suffix_ids:
+                disp = f"{disp}-子代理"
         return disp
 
     async def _maybe_reflect_subagent(
@@ -522,7 +524,7 @@ class MemoryMixin:
 
             persona_id = agent_name  # 存储维度，须与召回侧 _subagent_persona 一致，勿改
             # 2026-09-05 修：提炼提示词用 personas 表人格真名（中文），
-            # 否则每小时心跳提炼都 WARN「人格 'shu' 不存在」
+            # 否则每小时心跳提炼都 WARN「人格 'xxx' 不存在」
             persona_prompt_id = self._persona_name(agent_name)
             memory_scope = session_id
             try:

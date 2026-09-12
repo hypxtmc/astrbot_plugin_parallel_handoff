@@ -68,10 +68,10 @@ class SessionStore:
     典型用法：
 
         store = SessionStore(root)
-        store.append("agent_b", umo, "user", "问题")
-        store.append("agent_b", umo, "assistant", "回答")
-        hist = store.load("agent_b", umo)        # → [{"role":..., "content":...}, ...]
-        all_hist = store.restore_all()           # → {"agent_b:<hash>": [...]}
+        store.append("nova", umo, "user", "问题")
+        store.append("nova", umo, "assistant", "回答")
+        hist = store.load("nova", umo)        # → [{"role":..., "content":...}, ...]
+        all_hist = store.restore_all()           # → {"nova:<hash>": [...]}
     """
 
     def __init__(self, root: str | os.PathLike, retention_days: int = DEFAULT_RETENTION_DAYS):

@@ -166,7 +166,7 @@ class DispatchMixin:
             _role_rc = _role.get("角色", "") or ""
 
         # [2026-09-13 修复] 关系文件 key 是中文显示名（如 "成员甲<->成员乙"），
-        # 而真实调用方传入的是英文 id（如 "agent_a"）——原实现拿 id 直接匹配中文 key，
+        # 而真实调用方传入的是英文 id——原实现拿 id 直接匹配中文 key，
         # 永远匹配不上 → _pieces 恒空 → 静默返回空串（9-02 上线以来从未真正注入成功）。
         # 修复：先把 agent_name 归一成中文显示名（英文 id → 中文；已是中文则原样），再匹配。
         _display_map = getattr(type(self), "AGENT_DISPLAY_NAME", None) or {}
@@ -991,7 +991,7 @@ Args:
         route_mode = (route_mode or self._cfg("route_mode", "direct")).strip().lower()
 
         # ── 读取直接发送名单（提前定义，供接龙流式转发使用） ────
-        direct_agents_str = self._cfg("direct_delivery_agents", "agent_a,agent_b,agent_c")
+        direct_agents_str = self._cfg("direct_delivery_agents", "")
         direct_agents = {
             name.strip().lower()
             for name in direct_agents_str.split(",")
@@ -1420,7 +1420,7 @@ Args:
 
     # ── 跨轮脉络注入块构造（2026-09-08 用户实测：多代理续接首发者失忆）────────
     # ── 子代理检索纪律（2026-09-11 用户点名修复） ──────────────────
-    # 实证：agent_b 拿到 14 个只读工具、也真的调了 rg_search，但一次搜出 150 条
+    # 实证：样本子代理拿到 14 个只读工具、也真的调了 rg_search，但一次搜出 150 条
     # 命中——关键词太宽 + 用中文描述词搜代码，信号被噪音淹没，导致 4 问只答上 2 问。
     # 工具没毛病，缺的是「怎么用」；把检索顺序写进系统提示，不依赖模型自悟。
     _SUBAGENT_RETRIEVAL_DISCIPLINE = (

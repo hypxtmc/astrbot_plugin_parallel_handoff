@@ -87,7 +87,7 @@ class TaskRunner:
     典型用法：
 
         runner = TaskRunner()
-        tid = runner.submit("umo:123", "agent_b", "查个文件", factory)
+        tid = runner.submit("umo:123", "nova", "查个文件", factory)
         # 前台等一下
         rec = await runner.wait(tid, timeout=50)
         if rec.status == RUNNING:
