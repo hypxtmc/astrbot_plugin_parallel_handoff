@@ -38,7 +38,7 @@ _INJECT_USER_TEMPLATE = (
     "对话记录：\n{logs}\n\n"
     "请输出 JSON 数组，每个元素格式：\n"
     '{{"agent": "角色名", "mood": "心情", "hand": "手头事", "domain": "话题倾向"}}\n'
-    "如信息不足，mood 用『平静』，hand 用空字符串，domain 用 '生活'。"
+    "只输出有把握的角色，从对话里读不出信息的角色直接不要出现在数组里，不要编造。"
 )
 
 
@@ -121,18 +121,26 @@ class DailyLifeInjector:
             )
             text = getattr(resp, "completion_text", None) or ""
             entries = self._parse_json(text)
+            applied, skipped = 0, 0
             for e in entries:
                 agent = (e.get("agent") or "").strip()
                 if not agent:
                     continue
-                self._rng.set_llm(
-                    scene,
-                    agent,
-                    (e.get("mood") or "").strip()[:16],
-                    _coerce_domain(e.get("domain") or ""),
-                    (e.get("hand") or "").strip()[:32],
-                )
-            _logger.info("[daily_life] inject %d states for scene=%s", len(entries), scene)
+                _mood = (e.get("mood") or "").strip()[:16]
+                _hand = (e.get("hand") or "").strip()[:32]
+                _domain = _coerce_domain(e.get("domain") or "")
+                # 兜底信号过滤：mood=平静 且 domain=生活 且 hand 空 —— 三连命中
+                # 是"模型没读出来"的信号（旧 prompt 的兜底写法），绝不能用它覆盖
+                # 规则随机的有效结果；跳过即保留 roll_daily_state 的原味随机。
+                if _mood == "平静" and _domain == "生活" and not _hand:
+                    skipped += 1
+                    continue
+                self._rng.set_llm(scene, agent, _mood, _domain, _hand)
+                applied += 1
+            _logger.info(
+                "[daily_life] inject scene=%s applied=%d skipped_blank=%d total=%d",
+                scene, applied, skipped, len(entries),
+            )
         except Exception as e:  # noqa: BLE001
             _logger.warning("[daily_life] inject failed, degrade to random: %s", e)
             return self._fallback(scene, agents)
