@@ -4413,6 +4413,48 @@ class TestCmdLockHardGroup(unittest.TestCase):
         p._cmd_lock.pop(ev.unified_msg_origin, None)
         self.assertIsNone(p._cmd_locked_group(ev))
 
+    def test_main_lock_record_and_hit(self):
+        """[主代理锁 2026-09-12] 建锁后 _main_locked 为 True，且清掉子代理锁"""
+        p = self._fresh()
+        ev = MagicMock()
+        ev.unified_msg_origin = "sess-mainlock"
+        p._record_cmd_lock(ev, ["nian"])
+        p._record_main_lock(ev)
+        self.assertTrue(p._main_locked(ev))
+        self.assertIsNone(p._cmd_locked_group(ev))
+
+    def test_main_lock_cleared_by_reset(self):
+        """[主代理锁] /复位 后主代理锁解除"""
+        p = self._fresh()
+        ev = MagicMock()
+        ev.unified_msg_origin = "sess-ml-reset"
+        p._record_main_lock(ev)
+        p._clear_main_lock(ev)
+        self.assertFalse(p._main_locked(ev))
+
+    def test_main_lock_replaced_by_agent_command(self):
+        """[主代理锁] 后续 /子代理名 命令接管时主代理锁被清（smart 流程调 _clear）"""
+        p = self._fresh()
+        ev = MagicMock()
+        ev.unified_msg_origin = "sess-ml-replace"
+        p._record_main_lock(ev)
+        p._clear_main_lock(ev)
+        p._cmd_lock = {}
+        p._record_cmd_lock(ev, ["shu"])
+        self.assertFalse(p._main_locked(ev))
+        self.assertEqual(p._cmd_locked_group(ev), ["shu"])
+
+    def test_main_lock_no_leak_across_sessions(self):
+        """[主代理锁] 锁是会话级的，不影响其他会话"""
+        p = self._fresh()
+        ev1 = MagicMock()
+        ev1.unified_msg_origin = "sess-ml-a"
+        ev2 = MagicMock()
+        ev2.unified_msg_origin = "sess-ml-b"
+        p._record_main_lock(ev1)
+        self.assertTrue(p._main_locked(ev1))
+        self.assertFalse(p._main_locked(ev2))
+
     def test_cmd_lock_new_command_overrides(self):
         p = self._fresh()
         ev = MagicMock()

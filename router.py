@@ -378,11 +378,14 @@ class RouterMixin:
             if locked:
                 names = " + ".join(_cn(a) for a in locked)
                 return f"📍 现在锁着：{names}\n（换人：/名字 · 放开：/复位）"
+            if self._main_locked(event):
+                return "📍 现在锁着：主代理\n（换人：/名字 · 放开：/复位）"
             return "📍 没锁着谁，消息自动分派\n（指定：/名字 · 名单：/列表）"
 
         if cmd == "reset":
             if getattr(self, "_cmd_lock", None):
                 self._cmd_lock.pop(event.unified_msg_origin, None)
+            self._clear_main_lock(event)
             last, _ = self._route_mem()
             last.pop(event.unified_msg_origin, None)
             if getattr(self, "_route_reply", None):
@@ -667,6 +670,35 @@ class RouterMixin:
         if len(live) < 2:
             return [next(iter(live.keys()))]
         return list(live.keys())
+
+    # ── 主代理锁（2026-09-12 用户指定）─────────────────
+    def _record_main_lock(self, event):
+        """建立会话级主代理锁：后续消息直通主代理，T1/T0.5/T2 全部让位。
+
+        动机（2026-09-12 博士反馈）：消息里提到子代理名（如「叫个子代理一起
+        陪你看 bug」）会被 T1 抢走路由——用户明明是在对主代理说话。
+        /主代理（或 /普瑞赛斯）一经建立，整个会话直通主代理；
+        仅新命令（/子代理名）或 /复位 能解除。与子代理命令锁互斥。
+        """
+        if not hasattr(self, "_main_lock"):
+            self._main_lock = {}       # session -> ts（主代理强锁）
+        self._main_lock[event.unified_msg_origin] = time.time()
+        # 与子代理锁互斥：清掉旧的子代理命令锁 / 粘滞锁
+        if getattr(self, "_cmd_lock", None):
+            self._cmd_lock.pop(event.unified_msg_origin, None)
+        last, _ = self._route_mem()
+        last.pop(event.unified_msg_origin, None)
+
+    def _main_locked(self, event) -> bool:
+        """该会话是否被主代理锁锁定（锁定后非命令消息直通主代理）。"""
+        if not hasattr(self, "_main_lock"):
+            return False
+        return event.unified_msg_origin in self._main_lock
+
+    def _clear_main_lock(self, event):
+        """解除主代理锁（/复位 或建立新子代理命令锁时调用）。"""
+        if getattr(self, "_main_lock", None):
+            self._main_lock.pop(event.unified_msg_origin, None)
 
     def _record_direct_reply(self, session_id: str, agent_name: str, reply_text: str):
         """记录该 session 最近一次子代理直发回复尾部（供 T2 剧情参照，避免承接句判失）。"""
@@ -1049,6 +1081,11 @@ class RouterMixin:
             await self._send_admin_reply(event, admin_cmd)
             event.stop_event()
             return True
+        # [主代理锁 2026-09-12 用户指定] busy 场景主代理锁同样直通：
+        # 非命令消息全部放行主代理（含子代理名的句子只是对话，不切换路由）。
+        if self._main_locked(event) and not raw_message.startswith("/"):
+            logger.info("[parallel_handoff] BusyBypass: 主代理锁在场 → 直通主代理")
+            return False
         # [T0 命令式触发 2026-09-08 用户指定] busy 场景同样启用 / 命令：
         # 主代理正干活时，/黍、/黍+年 等显式命令仍锁定并短路，不被 follow-up 吞。
         cmd_agents, cmd_presis = self._parse_agent_command(raw_message)
@@ -1265,6 +1302,14 @@ class RouterMixin:
             await self._send_admin_reply(event, admin_cmd)
             event.stop_event()
             return True
+        # [主代理锁 2026-09-12 用户指定] 会话被主代理锁锁定 → 非命令消息直通主代理，
+        # 不跑 T0 点名/T1/T1.5/T0.5/T2；命令字（/ 开头）放行给下方 T0 处理
+        # （/子代理名 换锁、/复位 解绑仍可执行）。
+        if self._main_locked(event) and not raw_message.startswith("/"):
+            logger.info(
+                "[parallel_handoff] SmartRouter: 主代理锁在场 → 直通主代理（跳过全部判向）"
+            )
+            return False
         # [T0 命令式触发 2026-09-08 用户指定] 以 / 开头的显式命令（如 /黍、/黍+年、
         # /王五+张三+赵六、/主代理+张三）→ 直接锁定目标，最高优先级短路，
         # 彻底跳过 T1 关键词猜测 / T0.5 粘滞 / T2 小模型。命令持续生效（写粘滞锁）。
@@ -1297,11 +1342,13 @@ class RouterMixin:
                 event.stop_event()
                 return True
             # 含主代理（/主代理 或 /主代理+张三）：主代理在场。
-            #   - agents 空 → 纯主代理，放行并清除命令锁（用户回归主代理）
+            #   - agents 空 → 纯主代理：建立主代理锁（会话直通主代理）
             #   - agents 非空 → 主代理调度子代理，放行主代理 + 暂存判向目标
             if getattr(self, "_cmd_lock", None):
                 self._cmd_lock.pop(event.unified_msg_origin, None)
             if cmd_agents:
+                # 含子代理：不建主代理锁（子代理优先），主代理本轮可 relay 调度
+                self._clear_main_lock(event)
                 logger.info(
                     f"[parallel_handoff] SmartRouter: T0 命令式含主代理令牌 + {cmd_agents} → "
                     f"放行主代理并暂存候选子代理"
@@ -1310,11 +1357,13 @@ class RouterMixin:
                 self._record_route_hits(event, cmd_agents)
                 self._record_route_suggestions(cmd_agents)
             else:
+                # [主代理锁 2026-09-12 用户指定] 纯 /主代理（/普瑞赛斯）→ 建立会话级
+                # 主代理锁：此后消息直通主代理（含子代理名也不被 T1 抢）。
                 logger.info(
-                    "[parallel_handoff] SmartRouter: T0 命令式（含主代理名）→ 纯主代理放行"
+                    "[parallel_handoff] SmartRouter: T0 命令式（纯主代理）→ "
+                    "建立主代理锁，会话直通主代理"
                 )
-                last, _ = self._route_mem()
-                last.pop(event.unified_msg_origin, None)
+                self._record_main_lock(event)
             return False
         # [最高优先级 2026-09-03 用户指定] 含连续「主代理」四字 → 无条件放行主代理（=主代理）。
         # 跳过 T1/T1.5/T2 全部判向，任何子代理都不得接管。返回 False 表示不短路、不 stop_event，
