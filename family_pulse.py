@@ -64,6 +64,19 @@ PULSE_DIGEST_JOB = "side_pulse_digest"
 # 旁轨专用 random_state 场景（与会话接话判定隔离）
 _PULSE_SCENE = "_side_pulse"
 
+# [2026-09-13] 今日情绪 → 说话行为（让"心情"真正影响怎么说，而不是只当状态标签）
+# 平静/未知留空不注入（省 token）；其他档给"怎么说话"的具体约束
+_PULSE_MOOD_STYLE = {
+    "烦躁": "话短、带刺，别哄你，越哄越烦",
+    "急躁": "急，想快点把手里的事弄完，说话没什么耐心",
+    "低落": "不想多说话，兴致不高，别人热闹你也懒得掺和",
+    "慵懒": "懒洋洋的，能少动就少动，说话拖着",
+    "亢奋": "话多、劲头足，逮谁都想分享一点",
+    "愉悦": "心情好，愿意搭话，被逗也不恼",
+    "好奇": "对别人的事来兴趣，想问两句",
+    "专注": "心思都在手里的事上，说话惜字如金",
+}
+
 # ── 手头事线程池（数据文件：data/side_pulse/thread_flavors.json）──────────────────
 # 每人一份"半衰不清零"的未完结事：跨天保留，心跳戳到时优先续线，
 # 计数器 decay 到 0 才算收束（归档一天"做完了"），下一心跳开新线。
@@ -73,6 +86,20 @@ _FP_PROMPTS: dict = _load_family_data("prompts.json", {})
 
 # 线程未被收录/耗尽时回退
 _THREAD_FALLBACK = ("手头有件没做完的琐事", 2)
+
+# [2026-09-13 素材外置] 通用"生活事件"池（版本整理：不含任何特定家庭内容）。
+# 私有素材（THREAD_FLAVORS，本部署的）与它合并去重后轮换——
+# 新线只从素材池来，不再从对话历史回灌（旧 _pulse_recent_seed 取材路径停用）。
+LIFE_SEEDS = [
+    "把换季的衣物收拾一遍",
+    "给常用的东西做次保养",
+    "试着做一样没做过的吃的",
+    "把堆着没理的角落归置归置",
+    "给屋里添一样小东西",
+    "学个新花样（手上的）",
+    "把落了灰的旧物擦一遍",
+    "给手边的家伙什换个位置摆",
+]
 
 
 def _pulse_period_desc(now: Optional[float] = None) -> str:
@@ -342,6 +369,7 @@ class FamilyPulseMixin:
         text_prompt: str,
         relation_note: str = "",
         mood: str = "daily",
+        rel_matrix: str = "",
     ) -> Optional[str]:
         """以 agent 身份生成一句闲话。
 
@@ -383,21 +411,28 @@ class FamilyPulseMixin:
             persona = FAMILY_PERSONAS.get(
                 agent, f"{agent}，组织成员，性格自然真实"
             )
-            rel_line = f"你和在场那人的关系：{relation_note}。" if relation_note else ""
+            # [2026-09-13 全桌关系矩阵] 矩阵优先：多行"她与你"（含未收录→"不太熟"）；
+            # 旧单线 relation_note 保留兼容（doctor 场景 / 召唤语等）
+            if rel_matrix:
+                rel_line = f"在场每个人的关系（对你而言）：\n{rel_matrix}\n"
+            elif relation_note:
+                rel_line = f"你和在场那人的关系：{relation_note}。"
+            else:
+                rel_line = ""
             if mood == "banter":
                 rules = (
                     _FP_PROMPTS.get("rules_banter")
-                    or "规矩：如同一屋檐下的同事闲谈打趣，口语自然、一两句话；可以带一个短括号动作；不要提自己是AI或模型；只输出对话本身。"
+                    or "规矩：如同一屋檐下的同事闲谈打趣，口语自然、一两句话；不说客套话（不道谢、不寒暄、不客套），想怼就怼、想打断就打断，不想接就回（没接话）继续忙自己的；可以带一个短括号动作；不要提自己是AI或模型；只输出对话本身。"
                 )
             elif mood == "private":
                 rules = (
                     _FP_PROMPTS.get("rules_private")
-                    or "规矩：只有你们两人的私密场合，说点体己话；口语自然、一两句话；可以带一个短括号动作；不要提自己是AI或模型；只输出对话本身。"
+                    or "规矩：只有你们两人的私密场合，说点体己话；口语自然、一两句话；不用客套（体己话本来就不客套），想直接要就直说；不想接就回（没接话）；可以带一个短括号动作；不要提自己是AI或模型；只输出对话本身。"
                 )
             else:
                 rules = (
                     _FP_PROMPTS.get("rules_default")
-                    or "规矩：像同一屋檐下的同事随口说话，一两句话，口语自然；可以带一个短括号动作；不要提自己是AI或模型；只输出对话本身。"
+                    or "规矩：像同一屋檐下的同事随口说话，一两句话，口语自然；不说客套话（不道谢、不寒暄、不客套），有话直说、想怼就怼、不想接就回（没接话）；可以带一个短括号动作；不要提自己是AI或模型；只输出对话本身。"
                 )
             voice_rule = (
                 "底线：你说话必须像范例里那个人，不是像『一同事』模板——"
@@ -405,9 +440,12 @@ class FamilyPulseMixin:
                 "范例是语感示范，不是台词库，内容别照抄范例；"
                 "句式别和上一句同构，别每句都是『接茬+汇报手头事』。"
             )
+            mood_style = _PULSE_MOOD_STYLE.get(st.mood, "")
+            mood_line = f"今天你的心情：{st.mood}——{mood_style}。\n" if mood_style else ""
             system = (
                 f"你在扮演：{persona}。\n"
                 f"你此刻的状态：{st.summary}。\n"
+                f"{mood_line}"
                 f"{rel_line}"
                 f"{voice_rule}"
                 f"{rules}"
@@ -575,51 +613,68 @@ class FamilyPulseMixin:
         # 从她最近的念叨里抽一条作新线程种子，半衰给 2（短，防止一个种子占太久）
         return random.choice(candidates), 2
 
-    def _pulse_ensure_thread(self, agent: str, store: dict) -> str:
-        """取该 agent 当前未完结线程；没有或已耗竭 → 从生活日志取材新种子。
+    def _pulse_ensure_thread(self, agent: str, store: dict):
+        """[2026-09-13 重构] 取该 agent 当前线程：返回 (text, stage)。
 
-        优先返回已在进行的线程；已耗竭/首次则用 _pulse_recent_seed 从她自己
-        的真实念叨里长新线（不信死文案，且排除已在线上线程、贴今日话题底色），
-        无历史才回退 THREAD_FLAVORS 冷启动。
+        素材外置（禁对话回灌）：新线只从素材池轮换取——
+        THREAD_FLAVORS（本部署私有）与 LIFE_SEEDS（通用）合并去重后，
+        按"_seed_used"标记轮换，一圈用尽自动重置。旧 _pulse_recent_seed
+        的"从历史念叨取材"路径停用（对话残渣回灌是固化感与串味的根因）。
         """
         rec = store.get(agent)
-        if rec and isinstance(rec, dict) and rec.get("decay", 0) > 0:
-            return rec["text"]
+        if rec and isinstance(rec, dict) and rec.get("text"):
+            return rec["text"], self._thread_stage(rec)
 
-        used = {r["text"] for r in store.values() if isinstance(r, dict) and r.get("text")}
-        st = None
-        try:
-            rng = getattr(self, "_pulse_rng", None) or RandomStateManager(
-                self._pulse_seen_path()
+        candidates = list(
+            dict.fromkeys(
+                [row[0] for row in (THREAD_FLAVORS.get(agent) or []) if row]
+                + list(LIFE_SEEDS)
             )
-            st = rng.get(_PULSE_SCENE, agent)
-        except Exception:  # noqa: BLE001
-            st = None
-        domain = st.domain if st else None
-        made = self._pulse_recent_seed(agent, used=used, domain=domain)
-        if made:
-            text, decay = made
-            store[agent] = {"text": text, "decay": decay}
-            self._pulse_save_threads(store)
-            return text
-
-        # 冷启动兜底：日志还没有她的话，才用固定物件垫底
-        pool = THREAD_FLAVORS.get(agent, []) or [_THREAD_FALLBACK]
-        text, decay = random.choice(pool)
-        store[agent] = {"text": text, "decay": decay}
+        ) or [_THREAD_FALLBACK[0]]
+        used_live = {
+            r.get("text") for r in store.values() if isinstance(r, dict) and r.get("text")
+        }
+        used_hist = set(store.get("_seed_used", []) or [])
+        pool = [t for t in candidates if t not in used_live and t not in used_hist]
+        if not pool:
+            used_hist = set()
+            pool = [t for t in candidates if t not in used_live] or candidates
+        text = random.choice(pool)
+        used_hist.add(text)
+        store["_seed_used"] = list(used_hist)
+        store[agent] = {"text": text, "stage": 0}
         self._pulse_save_threads(store)
-        return text
+        return text, 0
+
+    @staticmethod
+    def _thread_stage(rec: dict) -> int:
+        """读线程阶段；旧格式（无 stage 有 decay）按 2→0 / 1→1 / 0→2 映射。"""
+        if "stage" in rec:
+            return max(0, min(2, int(rec.get("stage") or 0)))
+        decay = int(rec.get("decay") or 0)
+        return max(0, min(2, 2 - decay))
+
+    @staticmethod
+    def _pulse_thread_line(text: str, stage: int) -> str:
+        """[2026-09-13] 手头事三态措辞：0 起头 / 1 半途 / 2 收尾。"""
+        if stage <= 0:
+            return f"你手头有件刚起头的事：{text}"
+        if stage == 1:
+            return f"你手头有件做到一半的事：{text}"
+        return f"你手里那件事今天收尾了（{text}）——可以顺口提一句，不用隆重"
 
     def _pulse_advance_thread(self, agent: str) -> None:
-        """心跳戳过一个线程：decay-1；归 0 说明做完了，从存储剔除（下次重掷新的）。"""
+        """[2026-09-13] 心跳戳过一次：stage+1（0起头→1半途→2收尾）；到 2 归档（下次开新线）。"""
         store = self._pulse_load_threads()
         rec = store.get(agent)
         if not rec or not isinstance(rec, dict):
             return
-        rec["decay"] = (rec.get("decay", 0) or 0) - 1
-        if rec["decay"] <= 0:
-            store.pop(agent, None)
+        stage = self._thread_stage(rec)
+        if stage >= 2:
+            store.pop(agent, None)  # 收尾已播报，归档
         else:
+            rec["stage"] = stage + 1
+            rec.pop("decay", None)  # 旧字段清理
             store[agent] = rec
         self._pulse_save_threads(store)
 
@@ -628,6 +683,70 @@ class FamilyPulseMixin:
         aff = self._pulse_affinity() or {}
         meta = aff.get(frozenset((a, b)))
         return meta[1] if meta else ""
+
+    def _pulse_rel_matrix(self, agent: str, group: List[str]) -> str:
+        """[2026-09-13] 全桌关系矩阵：对在场每个人逐行给"她与你"的关系。
+
+        旧行为只带"与上一说话人"的单线基调（4 人场丢 2-3 人关系）。
+        现在：有记录 → 亲近度+基调；无记录 → 明说"不太熟，别热络"
+        （有疏有亲才像家，不给"人人皆亲密"的错觉）。空集 → 空串。
+        """
+        aff = self._pulse_affinity() or {}
+        rows = []
+        for other in group:
+            if other == agent:
+                continue
+            disp = self._display_name(other)
+            meta = aff.get(frozenset((agent, other)))
+            if meta:
+                seg = f"- {disp}：亲近度{meta[0]}"
+                if meta[1]:
+                    seg += f"，基调「{meta[1]}」"
+                rows.append(seg)
+            else:
+                rows.append(f"- {disp}：不太熟，别热络")
+        return "\n".join(rows)
+
+    # ── 版本整理：数据骨架（2026-09-13）──────────────────
+    def _pulse_data_dir(self) -> str:
+        """旁路模块数据目录（测试可 patch）。"""
+        return os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "data", "side_pulse"
+        )
+
+    def _pulse_ensure_skeleton(self) -> None:
+        """缺 personas.json 时生成"通用占位"骨架（版本整理）。
+
+        新用户开箱可用、照骨架写成自己的同事；已有文件一律不动。
+        骨架绝不写入任何特定家庭内容（成员名一律取自用户自己的配置）。"""
+        try:
+            path = os.path.join(self._pulse_data_dir(), "personas.json")
+            if os.path.exists(path):
+                return
+            members = self._pulse_members() or []
+            if not members:
+                _logger.info(
+                    "[side_pulse] 无成员配置且无 personas.json——先配 side_pulse_members 再开"
+                )
+                return
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            skeleton = {}
+            for m in members:
+                disp = self._display_name(m) or m
+                skeleton[m] = (
+                    f"{disp}，家庭成员。\n"
+                    f"腔调：（写{disp}的说话风格——句子长短、常用词、脾气）\n"
+                    f"范例：「（{disp}会说的话，短）」「（再一句，语感示范）」\n"
+                    f"禁：（边界——别抢话题、别用别人的口头禅）\n"
+                )
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(skeleton, f, ensure_ascii=False, indent=2)
+            _logger.info("[side_pulse] 已生成人格骨架（%d 人）→ %s", len(skeleton), path)
+            # 生成后即时生效（避免等下次重载）
+            global FAMILY_PERSONAS
+            FAMILY_PERSONAS = skeleton
+        except Exception as e:  # noqa: BLE001
+            _logger.warning("[side_pulse] 骨架生成跳过: %s", e)
 
     # ── 自由插话层（2026-09-04 用户拍板路线B）──────────────────
     # 围坐主链之外，未入座的人也会概率性冒话：设监（谁在听）、抢话仲裁
@@ -674,10 +793,10 @@ class FamilyPulseMixin:
             weights.append(w)
         return random.choices(candidates, weights=weights, k=1)[0]
 
-    def _pulse_interlope_prompt(self, disp: str, prev_disp: str, prev_text: str, scene: str, t_cur: str, recent_txt: str) -> str:
+    def _pulse_interlope_prompt(self, disp: str, prev_disp: str, prev_text: str, scene: str, t_line: str, recent_txt: str) -> str:
         """旁观者插话 prompt：没被点名，是自己忍不住冒了一句。"""
         return (
-            f"现在是{scene}。你手头有件没做完的事：{t_cur}。\n"
+            f"现在是{scene}。{t_line}。\n"
             f"最近屋里动静：\n{recent_txt}\n\n"
             f"{prev_disp}刚说：{prev_text}\n"
             f"你本来在旁边忙自己的事，听到这句实在忍不住了——"
@@ -907,9 +1026,11 @@ class FamilyPulseMixin:
                 )
             else:
                 disp = self._display_name(drafter)
-                t_cur = self._pulse_ensure_thread(drafter, self._pulse_load_threads())
+                t_cur, t_stage = self._pulse_ensure_thread(
+                    drafter, self._pulse_load_threads()
+                )
                 prompt = (
-                    f"现在是{scene}。你手头有件没做完的事：{t_cur}。\n"
+                    f"现在是{scene}。{self._pulse_thread_line(t_cur, t_stage)}。\n"
                     f"最近屋里动静：\n{recent_txt}\n\n"
                     f"{prev_disp}刚说：{prev_text}\n"
                     f"你正听得起劲，忽然觉得这话得让{self._get_user_address()}来评评理/掺一脚才热闹——"
@@ -1044,9 +1165,11 @@ class FamilyPulseMixin:
                 chosen.append(random.choice(rest))
             for ag in chosen[:2]:
                 disp = self._display_name(ag)
-                t_cur = self._pulse_ensure_thread(ag, self._pulse_load_threads())
+                t_cur, t_stage = self._pulse_ensure_thread(
+                    ag, self._pulse_load_threads()
+                )
                 prompt = (
-                    f"现在是{scene}。你手头有件没做完的事：{t_cur}。\n"
+                    f"现在是{scene}。{self._pulse_thread_line(t_cur, t_stage)}。\n"
                     f"最近屋里动静：\n{recent_txt}\n\n"
                     f"{self._get_user_address()}刚说：{doctor_msg}\n"
                     f"{self._get_user_address()}被你拉来聊天了，请以{disp}的身份接这句话——"
@@ -1130,12 +1253,18 @@ class FamilyPulseMixin:
                     inter = self._pulse_pick_interloper(candidates, prev_disp)
                     if inter:
                         inter_disp = self._display_name(inter)
-                        inter_t = self._pulse_ensure_thread(inter, self._pulse_load_threads())
+                        inter_t, inter_stage = self._pulse_ensure_thread(
+                            inter, self._pulse_load_threads()
+                        )
                         inter_prompt = self._pulse_interlope_prompt(
-                            inter_disp, prev_disp, prev_text, scene, inter_t, recent_txt
+                            inter_disp, prev_disp, prev_text, scene,
+                            self._pulse_thread_line(inter_t, inter_stage), recent_txt,
                         )
                         inter_text = await self._pulse_llm(
-                            inter, inter_prompt, relation_note=self._pulse_tone(inter, prev_disp), mood=mood
+                            inter,
+                            inter_prompt,
+                            rel_matrix=self._pulse_rel_matrix(inter, group),
+                            mood=mood,
                         )
                         if inter_text:
                             self._pulse_append(inter, inter_disp, inter_text)
@@ -1168,27 +1297,31 @@ class FamilyPulseMixin:
                     random.shuffle(queue)
                 ag = queue.pop(0)
                 disp = self._display_name(ag)
-                t_cur = self._pulse_ensure_thread(ag, self._pulse_load_threads())
+                t_cur, t_stage = self._pulse_ensure_thread(
+                    ag, self._pulse_load_threads()
+                )
                 if prev_text is None:
-                    # 起话者注入她与下一个人的基调
-                    tone = self._pulse_tone(ag, queue[0]) if len(queue) > 1 else self._pulse_tone(ag, group[1] if len(group) > 1 else ag)
+                    # 起话者：开场白（全桌关系矩阵在调用处统一注入）
                     prompt = (
-                        f"现在是{scene}。你手头有件没做完的事：{t_cur}。\n"
+                        f"现在是{scene}。{self._pulse_thread_line(t_cur, t_stage)}。\n"
                         f"最近屋里动静：\n{recent_txt}\n\n"
                         f"请以{disp}的身份开口，说一句像她会说的话（腔调照你的范例）；"
                         f"手头这事爱提就提，不提也行——别硬塞。"
                     )
                 else:
-                    tone = self._pulse_tone(ag, prev_disp)
                     prompt = (
-                        f"现在是{scene}。你手头有件没做完的事：{t_cur}。\n"
+                        f"现在是{scene}。{self._pulse_thread_line(t_cur, t_stage)}。\n"
                         f"最近屋里动静：\n{recent_txt}\n\n"
                         f"{prev_disp}刚说：{prev_text}\n"
                         f"请以{disp}的身份接这句话——搭腔、拌嘴、或只顾忙自己的"
                         f"随口应一声都行；手头那件事爱提就提，别硬塞，"
                         f"一句像{disp}会说的话就够。"
                     )
-                text = await self._pulse_llm(ag, prompt, relation_note=tone, mood=mood)
+                # [2026-09-13] 全桌关系矩阵（替代单线 tone；doctor 场景仍走 relation_note）
+                rel_matrix = self._pulse_rel_matrix(ag, group)
+                text = await self._pulse_llm(
+                    ag, prompt, rel_matrix=rel_matrix, mood=mood
+                )
                 if not text:
                     # 有人卡住就收场，不硬凑
                     break
@@ -1379,6 +1512,8 @@ class FamilyPulseMixin:
         self._pulse_rng = getattr(self, "_pulse_rng", None) or RandomStateManager(
             self._pulse_seen_path()
         )
+        # [2026-09-13 版本整理] 开启时确保人格骨架存在（缺则生成通用占位，已有不动）
+        self._pulse_ensure_skeleton()
         await self._pulse_clear_legacy(PULSE_TICK_JOB)
         await self._pulse_clear_legacy(PULSE_DIGEST_JOB)
         digest_cron = self._cfg("side_pulse_digest_cron", "50 21 * * *") or "50 21 * * *"
