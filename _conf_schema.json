@@ -194,8 +194,14 @@
     "subagent_response_preview_chars": {
         "description": "返回主代理的子代理回复预览长度（字符）",
         "type": "int",
-        "default": 800,
-        "hint": "分段转发模式下子代理回复直发用户，返回给主代理的是预览。原为硬编码 120 字，主代理无法据此做汇总复核（2026-09-11 实测撞三次）。提到 800 并新增 response_chars / response_truncated 字段，被吞多少一眼可见。"
+        "default": 4000,
+        "hint": "分段转发模式下子代理回复直发用户，返回给主代理的是预览。原为硬编码 120 字（2026-09-11 提到 800）。[2026-09-12 深夜] 用户反馈 800 不够、正经交付物（如审查口述 2279 字）被生硬截断，默认提到 4000；截断时 preview 尾部加 … 标识，配 response_chars / response_truncated 字段被吞多少一眼可见。"
+    },
+    "qq_md_plainify": {
+        "description": "子代理消息 markdown 降级（纯文本平台友好）",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，子代理直发消息里 **加粗**、`代码`、### 标题等 markdown 符号会降级为纯文本（◆/·/去标记），QQ 等不吃 markdown 的平台观感更干净。发支持 md 的平台可关。"
     },
     "subagent_tools": {
         "description": "子代理工具白名单（逗号分隔，留空用默认读写档 37 项）",

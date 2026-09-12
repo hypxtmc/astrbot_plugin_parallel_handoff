@@ -136,6 +136,9 @@ class ForwardMixin:
                     msg = f"{prefix}\n{seg_text}"
                 else:
                     msg = seg_text
+                # [2026-09-12 深夜] QQ 等纯文本平台：markdown 降级（用户反馈裸符号观感差）
+                if self.config.get("qq_md_plainify", True):
+                    msg = self._plainify_md(msg)
                 _baby = _get_baby_feed()
                 if _baby is not None:
                     try:
@@ -149,6 +152,43 @@ class ForwardMixin:
                 await asyncio.sleep(self.config.get("fragment_interval", 0.3))
         except Exception as e:
             logger.error(f"[parallel_handoff] 分段发送失败: {e}")
+
+    def _plainify_md(self, text: str) -> str:
+        """[2026-09-12 深夜] markdown → 纯文本降级（qq_restapi 等不吃 md 的平台友好）。
+
+        用户反馈：子代理消息（如可露希尔）里的 md 符号在 QQ 裸奔——
+        **加粗**、`行内代码`、### 标题、- 列表原样显示，观感差。
+        本函数只动"符号"不动内容，保守规则：
+        - ``` 围栏行去掉，块内容原样保留（代码不动）
+        - **加粗** / __加粗__ → 去标记；单星斜体不动（防误伤 *args 等）
+        - `行内` → 去反引号
+        - ### 标题 → ◆ 标题；> 引用 → ｜ 引用；- 列表 → · 列表
+        - [文字](url) → 文字（url）；---/*** 分隔线 → ─────
+        表格暂不动（保留竖线，配套既有表格居中处理）。
+        """
+        if not text:
+            return text
+        _out = []
+        _in_fence = False
+        for _ln in text.split("\n"):
+            _s = _ln
+            if _s.strip().startswith("```"):
+                _in_fence = not _in_fence
+                continue
+            if _in_fence:
+                _out.append(_s)
+                continue
+            _s = re.sub(r"^\s{0,3}#{1,6}\s*", "◆ ", _s)
+            _s = re.sub(r"^(\s{0,3})>\s?", r"\1｜ ", _s)
+            _s = re.sub(r"^(\s*)[-*+]\s+", r"\1· ", _s)
+            _s = re.sub(r"\*\*(.+?)\*\*", r"\1", _s)
+            _s = re.sub(r"__(.+?)__", r"\1", _s)
+            _s = re.sub(r"`([^`\n]+)`", r"\1", _s)
+            _s = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1（\2）", _s)
+            if re.match(r"^\s{0,3}(-{3,}|\*{3,}|_{3,})\s*$", _s):
+                _s = "─────"
+            _out.append(_s)
+        return "\n".join(_out)
 
     def _extract_chain_text(self, result) -> str:
         """拼接 result.chain 中所有文本组件的文本并去除首尾空白。"""

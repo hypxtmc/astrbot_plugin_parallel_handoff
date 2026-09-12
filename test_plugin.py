@@ -5213,3 +5213,206 @@ class TestSubagentVisibilityInject(unittest.TestCase):
         req.extra_user_content_parts = []
         asyncio.run(plugin._route_directive_inject(self._make_event(), req))
         self.assertEqual(len(self._visibility_parts(req)), 0)
+
+
+# ── 审查盲区补强（2026-09-12 深夜，可露希尔口述 ⑤⑥⑦ 七条用例） ──────────
+class TestAuditBlindSpots(unittest.TestCase):
+    """盲区三条：⑤关系网注入触达 / ⑥群身份超时+缓存 / ⑦重载任务生命周期。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.PluginClass = _load_plugin_class()
+
+    def setUp(self):
+        import tempfile
+        import scene as _scene_mod
+
+        self._tmp = tempfile.mkdtemp(prefix="blindspot_")
+        self._scene_mod = _scene_mod
+        self._cache_backup = _scene_mod._MEMBER_CACHE
+        _scene_mod._MEMBER_CACHE = {}
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self._tmp, ignore_errors=True)
+        self._scene_mod._MEMBER_CACHE = self._cache_backup
+
+    def _make_plugin(self, config=None):
+        ctx = MagicMock()
+        plugin = self.PluginClass(context=ctx, config=config or {})
+        plugin.context = ctx
+        return plugin
+
+    # ── ⑤ dispatch._relationship_inject（L130-235）──
+    def test_rel_inject_missing_file_returns_empty(self):
+        """⑤a 缺文件：空目录 → 返回空串、不抛异常。"""
+        p = self._make_plugin()
+        p._relationship_root = self._tmp  # 空目录，无 relationships.json
+        self.assertEqual(p._relationship_inject("测试甲", ""), "")
+
+    def test_rel_inject_reads_minimal_edges(self):
+        """⑤b 正常读：最小 edges → 返回含【家庭关系】与对方名。"""
+        p = self._make_plugin()
+        p._relationship_root = self._tmp
+        rel = {
+            "relationship_edges": {
+                "测试甲<->测试乙": {
+                    "type": "姐妹",
+                    "双向": "测试甲: 很喜欢她; 测试乙: 依赖姐姐",
+                }
+            },
+            "relationship_state": {},
+            "family_roles": {},
+        }
+        with open(os.path.join(self._tmp, "relationships.json"), "w", encoding="utf-8") as f:
+            json.dump(rel, f, ensure_ascii=False)
+        out = p._relationship_inject("测试甲", "")
+        self.assertIn("【家庭关系】", out)
+        self.assertIn("测试乙", out)
+
+    def test_rel_inject_empty_edges_returns_empty(self):
+        """⑤c 空关系人：edges 空 → 空串。"""
+        p = self._make_plugin()
+        p._relationship_root = self._tmp
+        rel = {"relationship_edges": {}, "relationship_state": {}, "family_roles": {}}
+        with open(os.path.join(self._tmp, "relationships.json"), "w", encoding="utf-8") as f:
+            json.dump(rel, f, ensure_ascii=False)
+        self.assertEqual(p._relationship_inject("测试甲", ""), "")
+
+    def test_rel_inject_path_resolution_regression(self):
+        """⑤d 路径回归：默认解析 == 插件目录上溯三级 + data/relationships/relationships.json。
+        谁改回硬编码、或改错层数，这条先红。"""
+        p = self._make_plugin()
+        opened = []
+
+        def _spy_open(path, *a, **k):
+            opened.append(str(path))
+            raise FileNotFoundError("spy: 只记录路径，不真读")
+
+        with mock.patch("builtins.open", side_effect=_spy_open):
+            out = p._relationship_inject("测试甲", "")
+        self.assertEqual(out, "")
+        self.assertTrue(opened, "应尝试打开关系文件")
+        expected = os.path.normpath(
+            os.path.join(PLUGIN_DIR, "..", "..", "..", "data", "relationships", "relationships.json")
+        )
+        self.assertEqual(os.path.normpath(opened[0]), expected)
+
+    # ── ⑥ scene._fetch_group_member_identity（L43-86）──
+    def _make_scene_event(self, call_action):
+        ev = MagicMock()
+        ev.get_group_id.return_value = "10086"
+        ev.get_sender_id.return_value = "20086"
+        bot = MagicMock()
+        bot.call_action = call_action
+        ev.bot = bot
+        return ev
+
+    def test_scene_identity_timeout_degrades_no_cache(self):
+        """⑥a 超时：4s 超时降级返回空串、不抛、耗时 <6s、不写缓存。"""
+        from scene import SceneMixin
+
+        m = SceneMixin()
+
+        async def hang(*_a, **_kw):
+            await asyncio.sleep(10)
+
+        ev = self._make_scene_event(hang)
+        t0 = time.time()
+        out = asyncio.run(m._fetch_group_member_identity(ev))
+        dt = time.time() - t0
+        self.assertEqual(out, "")
+        self.assertLess(dt, 6.0)
+        self.assertNotIn(("10086", "20086"), self._scene_mod._MEMBER_CACHE)
+
+    def test_scene_identity_recovers_and_caches(self):
+        """⑥b 恢复+缓存：正常返回含名片/角色；二次调用吃缓存不重打。"""
+        from scene import SceneMixin
+
+        m = SceneMixin()
+        calls = []
+
+        async def ok(*_a, **_kw):
+            calls.append(_kw)
+            return {"card": "测试名片", "nickname": "昵称", "role": "admin"}
+
+        ev = self._make_scene_event(ok)
+        out1 = asyncio.run(m._fetch_group_member_identity(ev))
+        self.assertIn("测试名片", out1)
+        self.assertIn("管理员", out1)
+        out2 = asyncio.run(m._fetch_group_member_identity(ev))
+        self.assertEqual(out2, out1)
+        self.assertEqual(len(calls), 1)
+
+    # ── ⑦ main.reload_plugin（L236-269）──
+    def test_reload_task_ref_held_and_discarded(self):
+        """⑦ 重载任务：强引用持有（未完成）→ await 后 done_callback 释放。"""
+        p = self._make_plugin()
+        star_manager = MagicMock()
+        star_manager.reload = AsyncMock(return_value=(True, None))
+        p.context._star_manager = star_manager
+
+        ev = MagicMock()
+        ev.plain_result = MagicMock(return_value="r")
+        ev.send = AsyncMock()
+
+        async def _scenario():
+            # 异步生成器必须跑到耗尽：create_task 段在最后一个 yield 之后
+            agen = p.reload_plugin(ev)
+            async for _ in agen:
+                pass
+            self.assertEqual(len(p._reload_tasks), 1)
+            task = next(iter(p._reload_tasks))
+            await task
+            await asyncio.sleep(0)  # 让 done_callback 落地
+            self.assertEqual(len(p._reload_tasks), 0)
+
+        asyncio.run(_scenario())
+        star_manager.reload.assert_awaited_once()
+
+
+# ── markdown 降级（2026-09-12 深夜，博士反馈她的消息在 QQ 裸符号） ──────────
+class TestMdPlainify(unittest.TestCase):
+    """子代理消息 markdown → 纯文本降级（_plainify_md）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.PluginClass = _load_plugin_class()
+
+    def _p(self):
+        return self.PluginClass(context=MagicMock(), config={})
+
+    def test_bold_and_code_stripped(self):
+        """加粗与行内代码去标记，内容保留。"""
+        p = self._p()
+        out = p._plainify_md("**加粗**文字和`代码`行")
+        self.assertEqual(out, "加粗文字和代码行")
+
+    def test_headings_lists_quotes(self):
+        """标题/列表/引用符号降级为 ◆ / · / ｜。"""
+        p = self._p()
+        out = p._plainify_md("### 标题\n- 第一项\n> 引用")
+        self.assertIn("◆ 标题", out)
+        self.assertIn("· 第一项", out)
+        self.assertIn("｜ 引用", out)
+        self.assertNotIn("###", out)
+        self.assertNotIn("- 第一项", out)
+
+    def test_code_block_kept_intact(self):
+        """代码块：围栏去掉、块内容原样（内含 ** 不被动）。"""
+        p = self._p()
+        src = "看这里\n```python\nx = **a** + `b`\n```\n结束"
+        out = p._plainify_md(src)
+        self.assertIn("x = **a** + `b`", out)  # 块内原样
+        self.assertNotIn("```", out)  # 围栏行去掉
+        self.assertIn("看这里", out)
+        self.assertIn("结束", out)
+
+    def test_link_and_divider(self):
+        """链接转 文字（url）；分隔线转 ─────。"""
+        p = self._p()
+        out = p._plainify_md("见[官网](https://x.com)\n---")
+        self.assertIn("官网（https://x.com）", out)
+        self.assertIn("─────", out)
+        self.assertNotIn("[官网]", out)
