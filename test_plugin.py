@@ -1811,35 +1811,64 @@ class TestContextEngine:
         from ctx_engine import ContextEngine
 
         eng = ContextEngine(enabled=True, max_turns=5, keep_recent=5)
-        key_fn = lambda a, s: f"{a}:{s}"
         # 存储一轮对话
         eng.append("amiya", "sess1", "你好", "你好呀博士")
-        hist = eng.histories.get(key_fn("amiya", "sess1"))
+        hist = eng.histories.get("amiya:sess1")
         assert hist and len(hist) == 2
         assert hist[0]["role"] == "user" and hist[0]["content"] == "你好"
 
-        # 注入：历史拼进输入
-        out = asyncio.run(eng.inject("amiya", "sess1", "新的问题"))
-        assert "对话历史" in out and "新的输入" in out
-        assert "assistant: 你好呀博士" in out
+        # 2026-09-11 改造：inject 返回 (prompt, contexts)，历史改走结构化 messages
+        # 注：本测试环境把 astrbot.core.agent.message 整体 mock 了，Message 实例是
+        # MagicMock，故只能断言「结构与长度」，不能断言 role/content 的值；
+        # 历史内容正确性由上面的 histories 断言负责。
+        prompt, contexts = asyncio.run(eng.inject("amiya", "sess1", "新的问题"))
+        # 核心契约：prompt 必须干净——历史不再拼进去（这是缓存能命中的前提）
+        assert prompt == "新的问题"
+        assert "对话历史" not in prompt and "新的输入" not in prompt
+        # 历史以独立 messages 返回，条数与存储一致
+        assert len(contexts) == 2
 
-        # 无历史时原样返回
-        out2 = asyncio.run(eng.inject("closure", "sess1", "独自"))
-        assert out2 == "独自"
+        # 无历史时：prompt 原样、contexts 为空
+        prompt2, ctx2 = asyncio.run(eng.inject("closure", "sess1", "独自"))
+        assert prompt2 == "独自" and ctx2 == []
+
+    def test_inject_second_round_keeps_prefix_stable(self):
+        """回归：第二次 inject 时，contexts 的前缀必须与第一次完全一致。
+
+        这是本次改造的全部意义——前缀逐轮累积复用，缓存才吃得下。
+        若历史被拼回单条文本，本断言会失败。
+        """
+        import asyncio
+        from ctx_engine import ContextEngine
+
+        eng = ContextEngine(enabled=True, max_turns=10)
+        eng.append("closure", "s", "第一问", "第一答")
+        _, ctx1 = asyncio.run(eng.inject("closure", "s", "第二问"))
+
+        eng.append("closure", "s", "第二问", "第二答")
+        _, ctx2 = asyncio.run(eng.inject("closure", "s", "第三问"))
+
+        # 前缀稳定：老的 messages 一条不多一条不少，且首条对象身份不变
+        assert len(ctx1) == 2
+        assert len(ctx2) == 4
+        assert ctx2[0] is ctx1[0]
+        assert ctx2[1] is ctx1[1]
 
     def test_compress_fallback_without_llm(self):
         import asyncio
         from ctx_engine import ContextEngine
 
-        # max_turns=1：第2轮起触发压缩；未绑定 llm → 截断降级，不抛
+        # max_turns=1：第2轮起触发截断；未绑定 llm → 纯截断降级，不抛
         eng = ContextEngine(enabled=True, max_turns=1, keep_recent=1, llm_generate=None)
         for i in range(3):
             eng.append("theresia", "s9", f"问{i}", f"答{i}")
-        out = asyncio.run(eng.inject("theresia", "s9", "继续"))
-        # 3轮(6条) > 1轮 → 压缩尝试;降级后保留最近 1 轮完整=2 条
-        assert out.count("assistant:") == 1
-        assert "答2" in out and "新的输入" in out
-        assert "历史摘要" not in out
+        prompt, contexts = asyncio.run(eng.inject("theresia", "s9", "继续"))
+        # 3轮(6条) > 1轮 → 只保留最近 1 轮完整 = 2 条
+        assert len(contexts) == 2
+        assert prompt == "继续"
+        # 截断后留下的是最近一轮（内容正确性看存储侧）
+        assert eng.histories["theresia:s9"][-2]["content"] == "问2"
+        assert "历史摘要" not in eng._format(contexts and eng.histories["theresia:s9"])
 
     def test_disabled_noop(self):
         import asyncio
@@ -1848,8 +1877,8 @@ class TestContextEngine:
         eng = ContextEngine(enabled=False)
         eng.append("amiya", "sx", "甲", "乙")
         assert eng.histories == {}
-        out = asyncio.run(eng.inject("amiya", "sx", "原样"))
-        assert out == "原样"
+        prompt, contexts = asyncio.run(eng.inject("amiya", "sx", "原样"))
+        assert prompt == "原样" and contexts == []
 
     def test_ctx_injection_stripped_for_memory_store(self):
         """2026-08-31 修复回归：存储链路必须剥离 ctx_engine 历史块，
@@ -1967,7 +1996,11 @@ class TestContextEngine:
         assert stub.unified_msg_origin == "s1:FriendMessage:u1:subagent:amiya"
         assert stub._subagent_persona == "amiya"
         assert stub.persona_id == "amiya"
-        assert stub.get_message_type() == 1  # 非群聊
+        # 2026-09-12 双写修复：改报群聊值，屏蔽 livingmemory 召回钩子的副作用存储
+        #（钩子内 is_group=False 时会顺带存一遍用户消息，与本插件 _memory_store 叠加成双写）
+        from astrbot.api.platform import MessageType
+
+        assert stub.get_message_type() == MessageType.GROUP_MESSAGE
         assert stub.get_platform_name() == "qq_restapi"
         # 原始 event 不被污染
         assert getattr(ev, "_subagent_persona", None) is None
@@ -3201,6 +3234,49 @@ class TestFamilyPulse(unittest.TestCase):
         self.assertEqual(parts, ["<主召回>"], "旁轨会话本身不应重复注入")
         lm.handle_memory_recall.assert_not_awaited()
 
+    def test_merge_pulse_memory_recall_pulse_off_no_inject(self):
+        """旁轨已关（enable_family_pulse=False）：不再注入旁轨家常（2026-09-12 博士指令）"""
+        p = self._make({"enable_family_pulse": False})
+        lm = MagicMock()
+        lm.initializer.is_initialized = True
+        lm.initializer.is_failed = False
+        lm.handle_memory_recall = AsyncMock()
+        called = {"n": 0}
+
+        def _spy(agent_name, max_lines=15):
+            called["n"] += 1
+            return ["<旁轨家常>"]
+
+        p._pulse_log_fallback = _spy
+        event = MagicMock()
+        event.unified_msg_origin = (
+            "qq_restapi:FriendMessage:TESTUSER00000000000000000000000000"
+        )
+        parts = asyncio.run(
+            p._merge_pulse_memory_recall(
+                ["<主召回>"], event, "amiya", "你们今天聊了什么", lm
+            )
+        )
+        self.assertEqual(parts, ["<主召回>"], "旁轨关闭时不得注入家常")
+        self.assertEqual(called["n"], 0, "旁轨关闭时不该读旁轨 jsonl")
+
+    def test_subagent_event_stub_reports_group_message(self):
+        """双写修复：子代理桩须报群聊，避免 livingmemory 召回钩子顺带存用户消息"""
+        from astrbot.api.platform import MessageType
+
+        p = self._make({})
+        event = MagicMock()
+        event.unified_msg_origin = (
+            "qq_restapi:FriendMessage:TESTUSER00000000000000000000000000"
+        )
+        event.get_platform_name.return_value = "qq_restapi"
+        stub = p._subagent_event_stub(event, "closure")
+        self.assertEqual(
+            stub.get_message_type(),
+            MessageType.GROUP_MESSAGE,
+            "桩必须报群聊值：livingmemory L141 is_group=False 会触发副作用存储",
+        )
+
     def test_persona_name_mapping(self):
         """子代理英文 id → personas 表人格真名（2026-09-05 修提炼 WARN）"""
         p = self._make(
@@ -4423,8 +4499,8 @@ class TestSwitchLockOnNewMention(unittest.TestCase):
         self.assertEqual(sticky, "skadi")
 
 
-class TestReadonlyToolWhitelistConfig(unittest.TestCase):
-    """2026-09-11：只读工具白名单抽成配置项 subagent_readonly_tools"""
+class TestSubagentToolWhitelistConfig(unittest.TestCase):
+    """2026-09-11：工具白名单抽成配置项；2026-09-12 博士拍板取消只读，默认集含写工具"""
 
     @classmethod
     def setUpClass(cls):
@@ -4437,33 +4513,230 @@ class TestReadonlyToolWhitelistConfig(unittest.TestCase):
         return self.PluginClass(context=mock_context, config=cfg)
 
     def test_default_when_config_empty(self):
-        """配置留空 → 回落内置默认 13 项"""
+        """配置留空 → 回落内置默认 37 项（读写档）"""
         p = self._plugin({})
-        names = p._readonly_tool_names()
-        self.assertEqual(names, p._READONLY_TOOL_NAMES_DEFAULT)
-        self.assertEqual(len(names), 13)
+        names = p._subagent_tool_names()
+        self.assertEqual(names, p._SUBAGENT_TOOL_NAMES_DEFAULT)
+        self.assertEqual(len(names), 37)
         self.assertIn("safe_read", names)
+        # 2026-09-12 取消只读：默认集必须含写工具与门禁工具
+        self.assertIn("safe_edit", names)
+        self.assertIn("multi_edit", names)
+        self.assertIn("safe_write", names)
+        self.assertIn("file_patch", names)
+        self.assertIn("test_runner", names)
+        # 高风险工具不进默认集
+        self.assertNotIn("shell_exec", names)
+        self.assertNotIn("astrbot_execute_shell", names)
+        self.assertNotIn("hot_reload_plugin", names)
+        self.assertNotIn("git_push", names)
 
     def test_config_override_comma_string(self):
-        """配置为逗号分隔字符串 → 按分隔解析"""
-        p = self._plugin({"subagent_readonly_tools": "safe_read, rg_search"})
-        self.assertEqual(p._readonly_tool_names(), ("safe_read", "rg_search"))
+        """新键为逗号分隔字符串 → 按分隔解析"""
+        p = self._plugin({"subagent_tools": "safe_read, rg_search"})
+        self.assertEqual(p._subagent_tool_names(), ("safe_read", "rg_search"))
 
     def test_config_override_list(self):
-        """配置为列表 → 直接采用"""
-        p = self._plugin({"subagent_readonly_tools": ["dir_list", "file_hash"]})
-        self.assertEqual(p._readonly_tool_names(), ("dir_list", "file_hash"))
+        """新键为列表 → 直接采用"""
+        p = self._plugin({"subagent_tools": ["dir_list", "file_hash"]})
+        self.assertEqual(p._subagent_tool_names(), ("dir_list", "file_hash"))
+
+    def test_new_key_wins_over_legacy(self):
+        """新旧键并存 → 新键 subagent_tools 优先，旧键仅作回落"""
+        p = self._plugin({
+            "subagent_tools": "safe_edit,safe_read",
+            "subagent_readonly_tools": "dir_list",
+        })
+        self.assertEqual(p._subagent_tool_names(), ("safe_edit", "safe_read"))
+
+    def test_legacy_key_still_works(self):
+        """只给旧键 → 仍生效（向后兼容）"""
+        p = self._plugin({"subagent_readonly_tools": "safe_read, safe_edit"})
+        self.assertEqual(p._subagent_tool_names(), ("safe_read", "safe_edit"))
 
     def test_blank_config_falls_back(self):
         """配置为空白串 → 回落默认，不产生空白名单"""
-        p = self._plugin({"subagent_readonly_tools": "  ,  "})
-        self.assertEqual(p._readonly_tool_names(), p._READONLY_TOOL_NAMES_DEFAULT)
+        p = self._plugin({"subagent_tools": "  ,  "})
+        self.assertEqual(p._subagent_tool_names(), p._SUBAGENT_TOOL_NAMES_DEFAULT)
 
     def test_tool_loop_params_read_from_config(self):
         """工具循环参数从配置读取（不再硬编码 5 / 45）"""
         p = self._plugin({"subagent_max_steps": 9, "subagent_tool_call_timeout": 30})
         self.assertEqual(p._cfg("subagent_max_steps", 5), 9)
         self.assertEqual(p._cfg("subagent_tool_call_timeout", 45), 30)
+
+
+class TestSubagentRetrievalDiscipline(unittest.TestCase):
+    """2026-09-11：子代理检索纪律 + 步数默认值（博士点名修复「她的工具调用问题」）
+
+    实证背景：closure 拿到 14 个只读工具、也真的调了 rg_search，但一次搜出 150 条
+    命中，关键词太宽 + 用中文描述词搜代码，信号被噪音淹没，4 问只答上 2 问。
+    工具没毛病，缺的是「怎么用」。这组测试锁住写进系统提示的检索纪律。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.PluginClass = _load_plugin_class()
+
+    def _plugin(self, cfg=None):
+        mock_context = MagicMock()
+        mock_context.provider_manager = MagicMock()
+        mock_context.provider_manager.llm_tools = None
+        return self.PluginClass(context=mock_context, config=cfg or {})
+
+    @staticmethod
+    def _handoff(instructions):
+        agent = type("Agent", (), {"instructions": instructions})()
+        return type("Handoff", (), {"agent": agent})()
+
+    def test_max_steps_default_is_10(self):
+        """步数默认值提到 10：实测 8 步对「4 问 / 3 文件」的检索刚好卡边界"""
+        p = self._plugin()
+        self.assertEqual(p._cfg("subagent_max_steps", 10), 10)
+
+    def test_system_prompt_appends_discipline(self):
+        """系统提示 = 人格指令 + 检索纪律，人格在前不被覆盖"""
+        p = self._plugin()
+        out = p._subagent_system_prompt(self._handoff("你是可露希尔"))
+        self.assertTrue(out.startswith("你是可露希尔"))
+        self.assertIn("工具检索纪律", out)
+        self.assertIn("不要用中文描述词", out)
+        self.assertIn("绝对不要编造行号", out)
+
+    def test_system_prompt_tolerates_missing_instructions(self):
+        """人格指令缺失/为空时仍要带上纪律，且不抛异常"""
+        p = self._plugin()
+        for bad in (None, ""):
+            out = p._subagent_system_prompt(self._handoff(bad))
+            self.assertIn("工具检索纪律", out)
+
+    def test_discipline_names_the_two_key_tools(self):
+        """纪律必须点名「先精确定位再精读」这两个工具，否则等于没写"""
+        p = self._plugin()
+        d = p._SUBAGENT_RETRIEVAL_DISCIPLINE
+        self.assertIn("rg_search", d)
+        self.assertIn("safe_read", d)
+        self.assertIn("start_line", d)
+
+    def test_discipline_forbids_fabrication(self):
+        """禁编造行号是硬要求（她说「没看见原文我不报行号」是正确行为，要固化）"""
+        p = self._plugin()
+        self.assertIn("未读到原文", p._SUBAGENT_RETRIEVAL_DISCIPLINE)
+
+    def test_system_prompt_includes_taskcard_guide(self):
+        """系统提示要带任务卡解读，与检索纪律并列"""
+        p = self._plugin()
+        out = p._subagent_system_prompt(self._handoff("你是可露希尔"))
+        self.assertIn("任务卡解读", out)
+        self.assertIn("靶点", out)
+        self.assertIn("不要从全库开始搜", out)
+
+    def test_taskcard_guide_has_judgment_blocks(self):
+        """L2 协议（2026-09-12）：任务卡解读必须含【判断】【依据】两块。
+
+        背景：主代理只在任务卡里**明说假设**，子代理才有东西可反驳。
+        实测教训：写"我认为 X 没实现"→ 她查出其实早已实现，拦住一次重复造轮子；
+        写"实现 X"→ 她照做，错的那部分直接落进交付物。
+        """
+        p = self._plugin()
+        d = p._SUBAGENT_TASKCARD_GUIDE
+        self.assertIn("【判断】", d)
+        self.assertIn("【依据】", d)
+        self.assertIn("待验证命题", d)
+
+    def test_taskcard_guide_grants_falsification_duty(self):
+        """必须明确授予「证伪」职责，否则她只会顺着指令干"""
+        p = self._plugin()
+        d = p._SUBAGENT_TASKCARD_GUIDE
+        self.assertIn("证伪", d)
+        self.assertIn("判断不成立", d)
+        # 三种结论都要有出口，不能只写「错了怎么办」
+        self.assertIn("已核实", d)
+        self.assertIn("半对", d)
+
+    def test_taskcard_guide_states_return_beats_steps(self):
+        """核心价值判断写死在提示里：退回错误判断 > 多干十步活"""
+        p = self._plugin()
+        self.assertIn("比多干十步活更值钱", p._SUBAGENT_TASKCARD_GUIDE)
+
+    def test_resolve_command_text_uses_wake_flag(self):
+        """2026-09-12 四修：T0 命令判定改吃 is_at_or_wake_command 标志。
+
+        三次踩坑史（①message_str 被剥 ②消息段也被剥 ③raw_message 也没有）
+        都栽在「想把被剥掉的前缀还原回来」。四修换成框架自带的权威信号：
+        唤醒层命中 wake_prefix 时会置 is_at_or_wake_command=True，
+        此时 message_str 剩下的正是命令正文，补个虚拟前缀交给下游即可。
+        """
+
+        class _Ev:
+            is_at_or_wake_command = True
+            message_obj = None
+
+            def get_messages(self):
+                return []
+
+        p = self._plugin()
+        # 唤醒层剥过前缀 → 补回来
+        self.assertEqual(p._resolve_command_text(_Ev(), "阿米娅"), "/阿米娅")
+        self.assertEqual(p._resolve_command_text(_Ev(), "阿米娅+夕"), "/阿米娅+夕")
+        # 前缀还在就别重复补
+        self.assertEqual(p._resolve_command_text(_Ev(), "/阿米娅"), "/阿米娅")
+
+        class _EvPlain(_Ev):
+            """自然语言点名：没走唤醒前缀，不该被当命令"""
+
+            is_at_or_wake_command = False
+
+        self.assertEqual(p._resolve_command_text(_EvPlain(), "阿米娅"), "阿米娅")
+
+    def test_prompt_order_persona_first(self):
+        """顺序：人格在最前，其后检索纪律，再任务卡——人格不被挤掉"""
+        p = self._plugin()
+        out = p._subagent_system_prompt(self._handoff("我是谁"))
+        self.assertTrue(out.startswith("我是谁"))
+        self.assertLess(out.index("工具检索纪律"), out.index("任务卡解读"))
+
+
+class TestSubagentResponsePreview(unittest.TestCase):
+    """2026-09-11 博士拍板：回传截断可配置化
+
+    原 preview 硬编码 120 字，segmented_forward 模式下主代理只拿得到 120 字摘要，
+    无法做汇总复核（实测撞三次：子代理答卷、盲评表、G3 交付物）。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.PluginClass = _load_plugin_class()
+
+    def _plugin(self, cfg=None):
+        mock_context = MagicMock()
+        mock_context.provider_manager = MagicMock()
+        mock_context.provider_manager.llm_tools = None
+        return self.PluginClass(context=mock_context, config=cfg or {})
+
+    def test_preview_chars_default_is_800(self):
+        """预览长度默认 800（原硬编码 120）"""
+        p = self._plugin()
+        self.assertEqual(p._cfg("subagent_response_preview_chars", 800), 800)
+
+    def test_preview_chars_configurable(self):
+        """可被配置覆盖，便于按需调大调小"""
+        p = self._plugin({"subagent_response_preview_chars": 2000})
+        self.assertEqual(p._cfg("subagent_response_preview_chars", 800), 2000)
+
+    def test_no_hardcoded_120_in_summary_construction(self):
+        """回归：摘要构造里不许再出现硬编码 [:120]，改用可配置 _preview_chars
+
+        直接读源文件断言，不走 inspect（后者受 linecache/加载方式影响，脆）。
+        """
+        from pathlib import Path
+
+        src = (Path(__file__).parent / "dispatch.py").read_text(encoding="utf-8")
+        self.assertNotIn(
+            '"response_preview": (r.get("response", "") or "")[:120]', src
+        )
+        self.assertIn("_preview_chars", src)
+        self.assertIn("response_truncated", src)
 
 
 class TestTokenMetrics(unittest.TestCase):
