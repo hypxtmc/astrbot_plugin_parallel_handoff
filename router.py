@@ -767,7 +767,7 @@ class RouterMixin:
         必须按「非命令」处理（直通主代理），否则消息会被 T0/T1 扫出子代理名
         路由走（21:06 实测 bug：锁在场仍被转给 agent_b）。
         """
-        if not raw_message.startswith("/"):
+        if not raw_message.startswith(self._CMD_PREFIXES):
             return False
         if self._parse_admin_command(raw_message):
             return True
@@ -833,7 +833,11 @@ class RouterMixin:
         2026-09-11：显式命令豁免——用户连发两条相同前缀命令（如 /助手A）时，
         第二条必须照常执行，不能被去重窗口吃掉。
         """
-        if (raw_message or message or "").lstrip().startswith(self._CMD_PREFIXES):
+        # [审查修复 2026-09-12] 仅「真命令」豁免：唤醒重写（'/原文'）不得逃逸去重窗口，
+        # 否则 QQ 私聊（消息普遍被唤醒重写）下去重屏障形同虚设、重复路由回归。
+        if self._is_real_command(raw_message) or (message or "").lstrip().startswith(
+            self._CMD_PREFIXES
+        ):
             return False
         if not hasattr(self, "_shortcircuit_last"):
             self._shortcircuit_last = {}  # session -> (hash, ts)
@@ -1189,8 +1193,13 @@ class RouterMixin:
                     f"[parallel_handoff] BusyBypass: T0 命令式调用失败 {e}; release to main"
                 )
                 return False
-            self._cmd_lock = {}
+            # [审查修复 2026-09-12] 仅覆盖当前会话旧命令锁（原为全局重置，
+            # 多会话场景会抹掉其他会话的锁）；换人命令同时解除主代理锁
+            # （对齐 docstring「新命令（/子代理名）能解除」——否则残锁换人换不出去）。
+            if getattr(self, "_cmd_lock", None):
+                self._cmd_lock.pop(event.unified_msg_origin, None)
             self._record_cmd_lock(event, cmd_agents)
+            self._clear_main_lock(event)
             event.stop_event()
             return True
         # 含主代理的命令（busy 时主代理在场优先；纯主代理建锁+回执短路，20:57 强化）
@@ -1198,6 +1207,8 @@ class RouterMixin:
             if getattr(self, "_cmd_lock", None):
                 self._cmd_lock.pop(event.unified_msg_origin, None)
             if cmd_agents:
+                # [审查修复 2026-09-12] 含子代理：不维持主代理锁（与 smart 端对称）
+                self._clear_main_lock(event)
                 self._record_route_hits(event, cmd_agents)
                 self._record_route_suggestions(cmd_agents)
                 logger.info(
@@ -1426,9 +1437,13 @@ class RouterMixin:
                         f"[parallel_handoff] SmartRouter: T0 命令式调用失败 {e}; release to main"
                     )
                     return False
-                # 写命令强制锁（会覆盖该会话旧命令锁）→ 此后 messages 按锁组强制路由
-                self._cmd_lock = {}
+                # 写命令强制锁（覆盖该会话旧命令锁，不动其他会话——审查修复 2026-09-12）
+                # → 此后 messages 按锁组强制路由
+                if getattr(self, "_cmd_lock", None):
+                    self._cmd_lock.pop(event.unified_msg_origin, None)
                 self._record_cmd_lock(event, cmd_agents)
+                # [审查修复] 换人命令即解除主代理锁（对齐 docstring 语义）
+                self._clear_main_lock(event)
                 event.stop_event()
                 return True
             # 含主代理（/主代理 或 /主代理+助手A）：主代理在场。

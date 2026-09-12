@@ -260,7 +260,13 @@ class ParallelHandoffPlugin(
             except Exception as e:
                 logger.error(f"[parallel_handoff] 热重载异常: {e}")
 
-        asyncio.create_task(_delayed_reload())
+        # [审查修复 2026-09-12] create_task 弱引用语义：不留强引用会被 GC；
+        # 对齐 side_pulse 修例（set + done_callback）。
+        if not hasattr(self, "_reload_tasks"):
+            self._reload_tasks = set()
+        _rt = asyncio.create_task(_delayed_reload())
+        self._reload_tasks.add(_rt)
+        _rt.add_done_callback(self._reload_tasks.discard)
 
     # ── 事件注册：动态前缀切换（实现见 config.py ConfigMixin） ──
     @filter.regex(r"(?:关掉|打开)（(.+?)）的前缀|（(.+?)）的前缀(?:关|开)了")
