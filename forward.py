@@ -161,7 +161,7 @@ class ForwardMixin:
         return full_text.strip()
 
     def _zh_fullwidth_sentinel(self, text: str) -> str:
-        """[2026-08-27 标点哨兵] 中文叙述半角标点→全角兜底。
+        r"""[2026-08-27 标点哨兵] 中文叙述半角标点→全角兜底。
 
         把叙述文本中的半角标点（, . ? ! ; : ( )）转为全角。
         豁免区：代码块、行内代码、LaTeX 公式（$ $$ \( \) \begin{}）、
@@ -375,7 +375,7 @@ class ForwardMixin:
     )
 
     def _split_by_block_type(self, full_text: str) -> list:
-        """[2026-08-27 类型拆条] 按块级代码/公式/叙述切分消息。
+        r"""[2026-08-27 类型拆条] 按块级代码/公式/叙述切分消息。
 
         返回 [(type, text)]：
           type ∈ {"text","code","latexenv","ddot"}
