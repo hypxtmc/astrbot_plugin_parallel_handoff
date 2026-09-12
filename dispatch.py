@@ -1239,7 +1239,7 @@ Args:
         # 2026-09-11 用户拍板：回传截断可配置化。
         # 原 preview 硬编码 120 字，segmented_forward 下主代理只拿得到 120 字摘要，
         # 无法做汇总/复核（今晚实测撞三次：子代理答卷、盲评表、G3 交付物）。
-        _preview_chars = int(self._cfg("subagent_response_preview_chars", 800))
+        _preview_chars = int(self._cfg("subagent_response_preview_chars", 4000))
         if enable_segmented_forward:
             self._suppress_mainagent_prefix = True
             self._suppress_mainagent_ts = time.time()
@@ -1271,9 +1271,14 @@ Args:
                         "agent_name": r.get("agent_name"),
                         "success": r.get("success"),
                         "latency_ms": r.get("latency_ms"),
-                        "response_preview": (r.get("response", "") or "")[
-                            :_preview_chars
-                        ],
+                        "response_preview": (
+                            (r.get("response", "") or "")[:_preview_chars]
+                            + (
+                                "…"
+                                if len(r.get("response", "") or "") > _preview_chars
+                                else ""
+                            )
+                        ),
                         # 被吞了多少一眼看得见：总量 + 是否截断
                         "response_chars": len(r.get("response", "") or ""),
                         "response_truncated": len(r.get("response", "") or "")
