@@ -38,7 +38,6 @@ class SceneMixin:
         _logger.debug("场景前缀为空，原样透传 input")
         return input_text
 
-    # ── 场景注入 ─────────────────────────────────────────────
     # ── 群身份（2026-09-12 新增）──────────
     async def _fetch_group_member_identity(self, event) -> str:
         """群场景拉取对方群内身份文本（群名片/昵称 + 角色）。

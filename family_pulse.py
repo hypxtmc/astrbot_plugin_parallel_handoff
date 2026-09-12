@@ -1004,11 +1004,16 @@ class FamilyPulseMixin:
             ).isoformat()
             self._pulse_draft_save(st)
             # 立即接茬：优先拉他的人接第一句（谁喊的谁接），异步推回
-            asyncio.create_task(
+            # 保持任务强引用防被 GC（create_task 弱引用语义）
+            if not hasattr(self, "_draft_followup_tasks"):
+                self._draft_followup_tasks = set()
+            _t = asyncio.create_task(
                 self._pulse_draft_followup(
                     msg, self._pulse_draft_umo(), st.get("draft_by")
                 )
             )
+            self._draft_followup_tasks.add(_t)
+            _t.add_done_callback(self._draft_followup_tasks.discard)
             _logger.info("[side_pulse] 用户回话已注入旁轨，触发接茬")
             return True
         except Exception as e:  # noqa: BLE001
