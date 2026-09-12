@@ -882,10 +882,26 @@ class TestBuildScenePrefix(unittest.TestCase):
         ev.get_message_type.return_value = mt
         return ev
 
+    def _make_group_event(self, role="admin", card="", nickname="群友甲", gid="g-100", uid="u-2"):
+        ev = MagicMock()
+        ev.get_sender_name.return_value = nickname
+        ev.get_sender_id.return_value = uid
+        mt = MagicMock()
+        mt.value = "group"
+        ev.get_message_type.return_value = mt
+        ev.get_group_id.return_value = gid
+
+        async def _ca(action, **kw):
+            return {"nickname": nickname, "card": card, "role": role}
+
+        ev.bot = MagicMock()
+        ev.bot.call_action = _ca
+        return ev
+
     def test_scene_only(self):
         """场景注入：前缀含场景信息"""
         plugin = self._make_plugin({})
-        prefix = plugin._build_scene_prefix(self._make_event(), True)
+        prefix = asyncio.run(plugin._build_scene_prefix(self._make_event(), True))
         self.assertIn("[场景信息]", prefix)
 
     def test_apply_scene_prefix_empty_noop(self):
@@ -896,7 +912,52 @@ class TestBuildScenePrefix(unittest.TestCase):
     def test_scene_disabled(self):
         """场景关闭：返回空串"""
         plugin = self._make_plugin({})
-        self.assertEqual(plugin._build_scene_prefix(self._make_event(), False), "")
+        self.assertEqual(asyncio.run(plugin._build_scene_prefix(self._make_event(), False)), "")
+
+    def test_group_identity_injected(self):
+        """群场景：前缀包含群内身份（名片+角色）"""
+        plugin = self._make_plugin({})
+        ev = self._make_group_event(role="admin", card="阿甲", gid="g-idt-1", uid="u-idt-1")
+        prefix = asyncio.run(plugin._build_scene_prefix(ev, True))
+        self.assertIn("对方群内身份", prefix)
+        self.assertIn("阿甲", prefix)
+        self.assertIn("管理员", prefix)
+
+    def test_group_identity_nickname_fallback(self):
+        """群场景：无群名片时回退昵称，角色成员"""
+        plugin = self._make_plugin({})
+        ev = self._make_group_event(role="member", card="", nickname="小白", gid="g-idt-2", uid="u-idt-2")
+        prefix = asyncio.run(plugin._build_scene_prefix(ev, True))
+        self.assertIn("小白", prefix)
+        self.assertIn("群成员", prefix)
+
+    def test_group_identity_failure_degrades(self):
+        """群身份查询失败：静默降级，不影响场景前缀基本内容"""
+        plugin = self._make_plugin({})
+        ev = self._make_group_event(gid="g-idt-3", uid="u-idt-3")
+
+        async def _boom(action, **kw):
+            raise RuntimeError("api down")
+
+        ev.bot.call_action = _boom
+        prefix = asyncio.run(plugin._build_scene_prefix(ev, True))
+        self.assertIn("[场景信息]", prefix)
+        self.assertNotIn("对方群内身份", prefix)
+
+    def test_group_identity_cache(self):
+        """同群同人第二次查询走缓存，不再调 API"""
+        plugin = self._make_plugin({})
+        calls = []
+
+        async def _ca(action, **kw):
+            calls.append(1)
+            return {"nickname": "x", "card": "阿乙", "role": "member"}
+
+        ev = self._make_group_event(gid="g-idt-cache", uid="u-idt-cache")
+        ev.bot.call_action = _ca
+        asyncio.run(plugin._build_scene_prefix(ev, True))
+        asyncio.run(plugin._build_scene_prefix(ev, True))
+        self.assertEqual(len(calls), 1)
 
 
 class TestTailSuppressFix(unittest.TestCase):
