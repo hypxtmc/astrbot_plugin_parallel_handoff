@@ -5134,3 +5134,82 @@ class TestCallOneFailurePaths(unittest.TestCase):
         self.assertFalse(
             getattr(ev, "_subagent_persona", None), "取消后 _subagent_persona 必须清空"
         )
+
+
+class TestSubagentVisibilityInject(unittest.TestCase):
+    """[2026-09-12] 旁听窗注入：子代理直发 → 主代理下一轮可见。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.PluginClass = _load_plugin_class()
+
+    def _make_plugin(self, config=None):
+        mock_context = MagicMock()
+        return self.PluginClass(context=mock_context, config=config or {})
+
+    def _make_event(self, sid="test_sid"):
+        event = MagicMock()
+        event.unified_msg_origin = sid
+        return event
+
+    @staticmethod
+    def _visibility_parts(req):
+        return [p for p in req.extra_user_content_parts if "【旁听窗】" in getattr(p, "text", "")]
+
+    def test_basic_inject(self):
+        """有直发记录 → 请求尾部出现旁听窗且含她的话。"""
+        import asyncio
+        plugin = self._make_plugin({"subagent_visibility_inject": True})
+        plugin._record_direct_reply("test_sid", "closure", "还在看，普瑞赛斯你别急")
+        req = MagicMock()
+        req.extra_user_content_parts = []
+        asyncio.run(plugin._route_directive_inject(self._make_event(), req))
+        parts = self._visibility_parts(req)
+        self.assertEqual(len(parts), 1)
+        self.assertIn("还在看", parts[0].text)
+        self.assertIn("closure", parts[0].text)
+
+    def test_dedup_same_record(self):
+        """同一记录只注入一次（二次请求不再追加）。"""
+        import asyncio
+        plugin = self._make_plugin({"subagent_visibility_inject": True})
+        plugin._record_direct_reply("test_sid", "closure", "还在看")
+        req1 = MagicMock()
+        req1.extra_user_content_parts = []
+        asyncio.run(plugin._route_directive_inject(self._make_event(), req1))
+        req2 = MagicMock()
+        req2.extra_user_content_parts = []
+        asyncio.run(plugin._route_directive_inject(self._make_event(), req2))
+        self.assertEqual(len(self._visibility_parts(req1)), 1)
+        self.assertEqual(len(self._visibility_parts(req2)), 0)
+
+    def test_disabled(self):
+        """开关关闭时不注入。"""
+        import asyncio
+        plugin = self._make_plugin({"subagent_visibility_inject": False})
+        plugin._record_direct_reply("test_sid", "closure", "还在看")
+        req = MagicMock()
+        req.extra_user_content_parts = []
+        asyncio.run(plugin._route_directive_inject(self._make_event(), req))
+        self.assertEqual(len(self._visibility_parts(req)), 0)
+
+    def test_stale_record_not_injected(self):
+        """超过 10 分钟窗口的旧记录不注入。"""
+        import asyncio
+        plugin = self._make_plugin({"subagent_visibility_inject": True})
+        plugin._record_direct_reply("test_sid", "closure", "很久以前")
+        agent, ts, tail = plugin._route_reply["test_sid"]
+        plugin._route_reply["test_sid"] = (agent, ts - 700, tail)
+        req = MagicMock()
+        req.extra_user_content_parts = []
+        asyncio.run(plugin._route_directive_inject(self._make_event(), req))
+        self.assertEqual(len(self._visibility_parts(req)), 0)
+
+    def test_no_record_no_inject(self):
+        """无直发记录时不注入。"""
+        import asyncio
+        plugin = self._make_plugin({"subagent_visibility_inject": True})
+        req = MagicMock()
+        req.extra_user_content_parts = []
+        asyncio.run(plugin._route_directive_inject(self._make_event(), req))
+        self.assertEqual(len(self._visibility_parts(req)), 0)

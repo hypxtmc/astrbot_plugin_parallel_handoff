@@ -10,6 +10,7 @@ from astrbot.api.event import AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
 from astrbot.core.agent.message import TextPart
 import re
+import time
 
 
 class DirectiveMixin:
@@ -50,6 +51,11 @@ class DirectiveMixin:
         - 无路由意图（纯闲聊）→ 不注入
         注入内容与用户在 WebUI 填写的模式配置块保持一致，指令内明确标注本次任务分类。
         """
+        # [2026-09-12 深夜·旁听窗] 子代理直发可见性注入（独立于路由指令开关，失败静默）
+        try:
+            self._inject_subagent_visibility(event, req)
+        except Exception:  # noqa: BLE001
+            pass
         try:
             if not bool(self._cfg("enable_route_directive", True)):
                 return False
@@ -93,6 +99,57 @@ class DirectiveMixin:
         except Exception as e:
             logger.warning(f"[parallel_handoff] 路由指令注入失败: {e}")
         return False
+
+    # ── 子代理直发「旁听窗」注入（OnLLMRequestEvent 钩子内调用）────
+    def _inject_subagent_visibility(self, event: AstrMessageEvent, req: ProviderRequest):
+        """[2026-09-12 深夜·用户需求] 子代理直发「旁听窗」注入。
+
+        背景：direct（直发）模式下子代理回复直接发到用户，主代理在后续轮次
+        对其不可见——这是“三方自然对话感”的断点（用户问过三次）。
+        本注入把“最近一次子代理直发”以旁听形式附在请求尾部
+        （extra_user_content_parts，mark_as_temp 不写历史），主代理下一轮
+        即可自然承接她的话（“她说还在看呢，你别急”）。
+
+        边界：
+        - 仅注入「本会话、10 分钟窗口内、尚未注入过」的记录（按记录时间戳去重，
+          天然防 agent 工具循环重复注入；旧剧情不注入防误导）
+        - 与路由指令共用请求尾通道，不碰系统提示/历史前缀，不破坏前缀缓存
+        - 开关 subagent_visibility_inject 默认开，可关；失败静默（不碍主链路）
+        """
+        if not bool(self._cfg("subagent_visibility_inject", True)):
+            return
+        sid = getattr(event, "unified_msg_origin", None)
+        if not sid:
+            return
+        rec = (getattr(self, "_route_reply", None) or {}).get(sid)
+        if not rec:
+            return
+        agent, ts, tail = rec
+        if not agent or not tail:
+            return
+        if time.time() - ts > 600.0:
+            return
+        seen = getattr(self, "_visibility_injected_ts", None)
+        if seen is None:
+            seen = self._visibility_injected_ts = {}
+        if seen.get(sid) == ts:
+            return
+        display_map = self._get_name_display_map() or {}
+        name = display_map.get(agent, agent)
+        text = (
+            f"【旁听窗】你未参与的一轮对话：子代理 {name}({agent}) 刚对用户直发过——\n"
+            f"「{str(tail)[:400]}」\n"
+            "你已听到这句（用户也看到了）。若与当前回复相关可自然承接；"
+            "不相关就正常回复用户即可，不必强行提及。"
+        )
+        try:
+            req.extra_user_content_parts.append(TextPart(text=text).mark_as_temp())
+        except Exception:  # noqa: BLE001
+            return
+        seen[sid] = ts
+        logger.info(
+            f"[parallel_handoff] 旁听窗注入：{agent} 直发（{len(str(tail))}字）已附主代理请求"
+        )
 
     # ── 任务分类（T1 规则层停用后的智能预判替代，2026-08-31） ──
     # 用户指定：T1/T2 小模型路由层与动态模式冲突，已关闭 enable_smart_router。

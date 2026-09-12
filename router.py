@@ -786,7 +786,8 @@ class RouterMixin:
         if not session_id or not agent_name or not reply_text:
             return
         self._route_mem()  # 兜底初始化惰性记忆
-        tail = reply_text.strip()[-300:]
+        # [2026-09-12 深夜] 300→1000：配合「旁听窗」主代理可见性注入（她的话主代理下一轮可见）
+        tail = reply_text.strip()[-1000:]
         self._route_reply[session_id] = (agent_name, time.time(), tail)
 
     def _last_direct_reply(self, session_id: str, max_age: float = 600.0):

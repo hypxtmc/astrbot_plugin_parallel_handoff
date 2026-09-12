@@ -1087,6 +1087,13 @@ Args:
                         # direct 代理：已流式转发，统一转发阶段跳过
                         r["_sent"] = True
                         await self._forward_segmented(r.get("response", ""), event)
+                        # [2026-09-12 旁听窗] 流式路径补记录（原仅统一转发路径记录），
+                        # 供主代理下一轮可见性注入
+                        self._record_direct_reply(
+                            event.unified_msg_origin,
+                            r.get("agent_name", ""),
+                            r.get("response", "") or "",
+                        )
                     elif not r.get("success"):
                         # 失败：已通知，统一转发阶段跳过
                         r["_sent"] = True
