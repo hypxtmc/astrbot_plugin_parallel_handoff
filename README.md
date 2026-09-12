@@ -32,6 +32,7 @@
 - [版本演进纪要](#版本演进纪要)
 - [设计哲学](#设计哲学)
 - [FAQ](#faq)
+- [致谢与参考](#致谢与参考)
 
 ---
 
@@ -451,6 +452,19 @@ A：可以——家庭旁轨（实验性）就是为此设计的：心跳闲聊�
 
 **Q：怎么做多人群聊氛围？**
 A：`direct` 路由 + `parallel` 调用——多个子代理同时直发，各有前缀不串音；配合 `affection` 模式预设食用更佳。
+
+---
+
+## 致谢与参考
+
+复调不是凭空长出来的——它的好几处设计，站在了社区前辈的肩膀上。遵照 [AstrBot 官方插件开发指南](https://docs.astrbot.app/dev/star/plugin-new.html) 的要求（借鉴其他项目的设计、功能创意或实现方式时，应在 README 中明确致谢来源并链接相关项目），在此逐一鸣谢：
+
+- **[astrbot_plugin_custome_segment_reply](https://github.com/LinJohn8/astrbot_plugin_custome_segment_reply)**（作者：**LinJohn8**）——复调的**流式守卫**源自该插件的「**回放不抢发**」思想：流式通道已逐 token 发出文本时，分段转发必须主动让位，否则必然重复/乱序。这份"知道什么时候不该说话"的经验，是复调流式稳定性的基石。
+- **[astrbot_plugin_maid_agent · 代理女仆](https://github.com/Kalospacer/astrbot_plugin_maid_agent)**（作者：**Kalo（@Kalospacer）**）——复调的**后台任务体系**（task_runner）借鉴了它的「**前台阈值 → 超时原地转后台**」非阻塞派活模型。`steer`（运行中追加要求）因复调一次性工具循环的架构限制暂未实现，此处刻意保留差异、如实注明。
+- **[astrbot_plugin_livingmemory](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory)**（作者：**lxfight**）——复调与 livingmemory 深度集成（记忆召回 / 存储 / 工具过滤 / 私有路径防腐层 `_lm_bridge`）。感谢 lxfight 提供了稳定可靠的记忆底座，让子代理记得住来路。
+- **[AstrBot](https://github.com/AstrBotDevs/AstrBot)**（AstrBotDevs 团队与全体贡献者）——复调首先是 AstrBot 的插件。感谢框架、官方文档与社区生态，让这一切得以成立。
+
+若以上清单有所疏漏，或某处借鉴的边界描述不够准确，欢迎联系作者补充与修正——**尊重每一位开源作者的劳动，是复调对位法的一部分**。
 
 ---
 
