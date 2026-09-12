@@ -51,18 +51,28 @@ class ConfigMixin:
             return raw
         return {}
 
-    # ── 双模式调度配置（技术干活 / 后宫贴贴，2026-08-31 顾主指定） ──
+    def _get_user_address(self) -> str:
+        """读取主对话者称呼（系统文本用：共享记录、记忆沉淀模板等）。
+
+        角色台词层的称呼由各子代理人格自理，不经过此项。
+        配置缺失/为空时回退中性默认「用户」。
+        """
+        raw = self._cfg("user_address", "用户")
+        addr = str(raw).strip() if raw is not None else ""
+        return addr or "用户"
+
+    # ── 双模式调度配置（技术干活 / 日常贴贴，2026-08-31 用户指定） ──
     MODE_CONFIG_DEFAULTS = {
         # 技术干活：子代理回复返回主代理，主代理当统帅并行收卷
         "tech": {"route_mode": "relay", "call_mode": "parallel", "timeout": 120},
-        # 后宫贴贴：子代理回复直接分段转发用户端，主代理隐身
+        # 日常贴贴：子代理回复直接分段转发用户端，主代理隐身
         "affection": {"route_mode": "direct", "call_mode": "chained", "timeout": 120},
     }
 
     def _get_mode_config(self, mode: str) -> dict:
         """读取双模式调度配置块（tech/affection），兼容 JSON 字符串和 dict 两种格式。
 
-        顾主可在 WebUI 填写 `tech_mode_config` / `affection_mode_config`（JSON 字符串），
+        用户可在 WebUI 填写 `tech_mode_config` / `affection_mode_config`（JSON 字符串），
         自行决定每个模式的调度方式：
         {
           "route_mode": "relay|direct",   # 路由模式：relay=回复返回主代理，direct=直接分段转发
@@ -94,11 +104,11 @@ class ConfigMixin:
         return merged
 
     def resolve_mode_params(self, mode, route_mode, call_mode, timeout):
-        """顾主配置永远优先（2026-08-31 顾主指定）：
+        """用户配置永远优先（2026-08-31 用户指定）：
 
         mode 命中 tech/affection 时，模式配置（tech_mode_config /
         affection_mode_config）无条件覆盖 LLM 显式传参——不再有
-        "timeout==120 才让步"之类的默认哨兵逻辑，顾主在 WebUI 填什么
+        "timeout==120 才让步"之类的默认哨兵逻辑，用户在 WebUI 填什么
         就是什么。
 
         mode 未命中时原样返回，交给全局 route_mode/call_mode 兜底。

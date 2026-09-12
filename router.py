@@ -18,6 +18,7 @@
 """
 import asyncio
 import json
+import os
 import re
 import time
 from collections import deque
@@ -59,6 +60,29 @@ class BusyRunnerFilter(_BusyFilterBase):
         return event.unified_msg_origin in _ACTIVE_AGENT_RUNNERS
 
 
+def _load_router_tables() -> dict:
+    """从插件 data/ 目录加载路由数据表（不进仓库；缺文件时返回空表）。"""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "router_tables.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and data:
+            logger.info("[router] 已加载 router_tables.json（%d 组数据）", len(data))
+            return data
+        return {}
+    except FileNotFoundError:
+        logger.info("[router] 数据文件 router_tables.json 不存在，使用空表")
+        return {}
+    except Exception as exc:
+        logger.warning("[router] 数据文件 router_tables.json 加载失败（用空表继续）: %s", exc)
+        return {}
+
+
+_ROUTER_TABLES = _load_router_tables()
+_MAIN_TOKEN_SET = tuple(_ROUTER_TABLES.get("main_token_set", []))
+
+
+
 class RouterMixin:
     """三层路由实现（装饰器 @filter.on_waiting_llm_request 保留在 main.py 壳方法上）"""
 
@@ -66,91 +90,18 @@ class RouterMixin:
     # 纯承接句检测：剥离这些承接词 + 标点空白后应无残留。
     # 用于"好舒服，继续""再来""嗯"等上一条已路由给子代理的短承接消息，
     # 时间窗内无新点名时直接续接上次路由对象，避免 T2 因单消息无上下文误放行主代理
-    T1_CONTINUE_WORDS = (
-        "继续(?:吧|啊|好)?",
-        "再来(?:一次|一下|吧|啊)?",
-        "接着(?:来|说)?",
-        "然后呢?",
-        "嗯{1,6}",
-        "唔{1,4}",
-        "好(?:的|啊|吧)?",
-        "舒服",
-        "亲亲?",
-        "抱抱?",
-        "贴贴?",
-        "还要",
-        "来吧?",
-        "对(?:啊|的)?",
-        "来了",
-        "哈(?:哈)?",
-        # ── 响应式情话承接（2026-08-22 新增，剥离后无残留即视为承接） ──
-        "让我(?:好|也)?舒服(?:起来|点|吧|好不好|一下)?",
-        "想要(?:你|了|吗|嘛|啊)?",
-        "爱(?:死)?你?(?:啊|哟|哦|啦|呀|呢|哇|嘛)?",
-        "用力(?:点|啊|吧|嘛)?",
-        "继续(?:动|做|来|亲)?(?:吧|啊|嗯)?",
-        "接着继续?(?:吧|啊)?",
-        "再来(?:一点|一遍|一轮)?(?:吧|啊)?",
-        "还?想要?(?:你)?(?:嘛|啊|呀)?",
-        "顶(?:进去|到了|到底)?(?:吧|啊)?",
-        "操?(?:我|你)?(?:吧|啊|嘛)?",
-        "干了?(?:我|你)?(?:吧|啊|嘛)?",
-        "快点?(?:动|来|呀|啊)?",
-        "深点?(?:啊|吧|呀)?",
-        "爽(?:死|炸|翻)?了?(?:吧|啊|嘛)?",
-        "还要?(?:你|更多)?(?:吗|嘛|啊)?",
-        "别停(?:啊|嘛|吧)?",
-        "再来?(?:呀|吧|啊)?",
-        "想(?:死|要|坏)(?:你|了|我)?(?:啦|啊|嘛|呀)?",
-        "舒服?(?:嘛|吧|啊|呀)?",
-        "强?(?:奸|上|搞|肏)(?:我|你)?(?:吧|啊|嘛)?",
-    )
-    _T1_CONTINUE_WORD_RE = re.compile("|".join(T1_CONTINUE_WORDS))
+    T1_CONTINUE_WORDS = tuple(_ROUTER_TABLES.get("continue_words", []))
+    _T1_CONTINUE_WORD_RE = re.compile("|".join(T1_CONTINUE_WORDS)) if T1_CONTINUE_WORDS else None
 
-    T1_KEYWORDS = {
-        "agent_b": ["工程部", "爆改", "验孕", "折叠床", "焊接", "掌机", "改机"],
-        "xi": ["画室", "墨虎", "墨龙", "画中造物", "画画"],
-        "ling": ["吟诗", "对酒", "赋诗", "作诗", "念诗"],
-        "nian": ["火锅", "看电影", "锻造", "涮火锅", "吃火锅"],
-        "shu": ["药膳", "做饭", "种田", "做菜", "煲汤"],
-        "agent_f": ["演出", "应援", "偶像", "演唱会", "听歌", "唱歌"],
-        "agent_d": ["深海"],
-        "agent_a": ["撒娇", "贴贴"],
-        "m3": ["M3", "猫猫", "小猫", "助手", "听诊器", "医疗顾问"],
-        "agent_e": ["助手E", "思衡托", "医师", "医疗部", "问诊"],
-    }
-    # 爱称别名（2026-08-30 顾主指定）：直呼爱称 → 对应子代理 T1 命中
-    T1_ALIASES = {
-        "agent_b": ["奸商"],
-        "agent_d": ["蒂蒂", "虎鲸"],
-        "agent_c": ["小特", "小特老师", "小特妈妈"],
-        "xi": ["夕宝"],
-        "ling": ["令姐"],
-        "shu": ["黍姐", "黍妈妈"],
-        "agent_a": ["助手A", "助手A", "助手A", "助手A"],
-        "nian": ["年姐"],
-        "agent_f": ["小偶像"],
-        "m3": ["小M3", "猫猫", "小娇娇", "猫娘", "黑猫", "助手贝", "小猫娘"],
-        "agent_e": ["老女人", "医生", "凯喵", "思衡托", "凯姐", "白毛医生", "凯大夫"],
-    }
-    # 最高优先级令牌（2026-09-03 顾主指定）：只要消息含连续「主代理」四字，
-    # 无论 T1 点名 / T1.5 续接 / T2 小模型判定结果如何，一律放行主代理（主代理）。
+    T1_KEYWORDS = _ROUTER_TABLES.get("keywords", {})
+    # 爱称别名（2026-08-30 用户指定）：直呼爱称 → 对应子代理 T1 命中
+    T1_ALIASES = _ROUTER_TABLES.get("aliases", {})
+    # 最高优先级令牌（2026-09-03 用户指定）：只要消息含主代理的专属令牌词，
+    # 无论 T1 点名 / T1.5 续接 / T2 小模型判定结果如何，一律放行主代理。
     # 放在路由链最前，任何子代理都不允许接管主代理。
-    _MAIN_TOKEN_RE = re.compile(r"主代理")
+    _MAIN_TOKEN_RE = re.compile(_ROUTER_TABLES["main_token"]) if _ROUTER_TABLES.get("main_token") else None
     # T2 判向时给模型看的子代理职责简介（简写，不涉及人格机密）
-    T2_AGENT_BRIEF = {
-        "agent_a": "助手A：温柔陪伴、撒娇、日常闲聊",
-        "agent_c": "助手C：正事、政务、策略讨论、与顾主的亲密互动、恋爱情话",
-        "agent_b": "助手B：工程改造、设备爆改、验孕相关",
-        "agent_d": "助手D：深海话题、战斗、想要拥抱",
-        "xi": "夕：画画、画室、水墨丹青",
-        "ling": "令：诗歌、饮酒、诗词歌赋",
-        "nian": "年：火锅、看电影、锻造手艺",
-        "shu": "黍：做饭、药膳、种田、家常",
-        "agent_f": "助手F：偶像演出、应援、唱歌",
-        "m3": "M3：医疗学识、小猫贴贴、撒娇",
-        "agent_e": "助手E：医疗、政务、战略、正事",
-    }
+    T2_AGENT_BRIEF = _ROUTER_TABLES.get("t2_brief", {})
 
     # ── 配置读取（全走 _cfg 兜底，未配置项全部返回安全默认） ──
     def _router_enabled(self) -> bool:
@@ -180,33 +131,93 @@ class RouterMixin:
             pool = {k: v for k, v in pool.items() if k in ids}
         return pool
 
-    # ── T0 命令式触发层（2026-09-08 顾主指定）────────────
+    # ── T0 命令式触发层（2026-09-08 用户指定）────────────
     # 以 / 开头 + 名字（可 + 连接多名字）的显式命令，直接指定目标子代理/主代理，
     # 取代「从自然语言关键词猜测路由目标」的旧机制。命令命中 → 最高优先级短路，
     # 跳过 T1/T0.5/T2 全部猜测层，零正则歧义、零误触发。
-    # 格式：/黍 · /黍+年 · /助手C+助手A+助手D · /主代理+助手A+助手C
+    # 格式：/助手A · /助手A+助手C · /助手C+助手D+助手G · /主代理+助手A+助手C
     # 不设上限，点名几个就锁定几个；命令持续生效（写入粘滞锁，之后无需再发命令）。
     # Python 同款命令见系统提示「以 / 开头指定」，与下方实现保持一致。
-    # 2026-09-11 顾主报 bug 治本：AstrBot 唤醒层命中全局 wake_prefix（默认 ["/"]）后
+    # 2026-09-11 用户报 bug 治本：AstrBot 唤醒层命中全局 wake_prefix（默认 ["/"]）后
     # 会把前缀从 event.message_str 里剥掉（waking_check/stage.py:123），所以 T0 判定
     # 不能只看 message_str——统一改用 _raw_command_text(event) 从消息段拼回原文。
-    # 同时把可用前缀扩成一组（/ 全角／ # ！ ! 、），顾主在 QQ 上发哪个都能锁。
+    # 同时把可用前缀扩成一组（/ 全角／ # ！ ! 、），用户在 QQ 上发哪个都能锁。
     _CMD_PREFIXES = ("/", "／", "#", "！", "!", "、")
     _CMD_RE = re.compile(
         r"^[/／#！!、]([^\s/／#！!、]+(?:[/+、，,，][^\s/／#！!、]+)*)\s*$", re.M
     )
+    # ── T0 管理命令（软入口·A 方案 2026-09-12 用户指定）──────────────
+    # /谁在 /复位 /列表 —— 会话柜台三件套：查锁、放锁、看名单。
+    # 判定先于点名（管理词不是 agent 名，天然不冲突）；且必须整条消息只有命令本体，
+    # 「/谁在 顺便说个事」这类带尾巴的不拦截，照常进消息流（防误吞正式内容）。
+    _ADMIN_RE = re.compile(
+        r"^[/／#！!、](谁在|状态|复位|解除|放开|释放|列表|名单)\s*$", re.M
+    )
+
+    def _extract_original_from_raw(self, raw) -> str:
+        """从平台原始事件里抠出未经改写的纯文本（2026-09-12 加固）。
+
+        为什么需要它：唤醒层只改 message_str，09-11 我以为消息段没被碰，
+        实测发现段里那份也可能是剥过的（用户实测「/子代理名」仍落 T1，
+        日志里原文已无斜杠）。而 message_obj.raw_message 是平台原始事件，
+        唤醒层绝不碰，是最后一份可信原文。
+
+        兼容两种形态：
+          - dict（aiocqhttp/OneBot）：取 raw_message / message 字段
+          - 对象式适配器：取同名属性
+        只认纯文本（type 为 None/text）；拿不到返回 ""。
+        """
+        if not raw:
+            return ""
+        if isinstance(raw, dict):
+            for key in ("raw_message", "message"):
+                v = raw.get(key)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+                if isinstance(v, list):
+                    parts = []
+                    for seg in v:
+                        if not isinstance(seg, dict):
+                            continue
+                        if seg.get("type") not in (None, "text"):
+                            continue
+                        data = seg.get("data")
+                        t = data.get("text") if isinstance(data, dict) else seg.get("text")
+                        if isinstance(t, str) and t:
+                            parts.append(t)
+                    if parts:
+                        return "".join(parts).strip()
+            return ""
+        for key in ("raw_message", "message"):
+            v = getattr(raw, key, None)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return ""
 
     def _raw_command_text(self, event: AstrMessageEvent) -> str:
-        """还原含前缀的原始用户消息文本（2026-09-11 顾主报 bug 治本）。
+        """还原含前缀的原始用户消息文本（2026-09-11 初版 / 2026-09-12 加固）。
 
-        bug 复现：顾主发「/助手A」，插件里 message_str 却是「助手A」，T0 命令式
+        bug 复现：用户发「/助手A」，插件里 message_str 却是「助手A」，T0 命令式
         (startswith("/")) 永远不成立 → 命令强锁形同虚设，消息落回 T1 猜名字。
         根因：AstrBot 唤醒层命中全局 wake_prefix（["/"]）后执行
         `event.message_str = event.message_str[len(wake_prefix):].strip()`
-        （astrbot/core/pipeline/waking_check/stage.py:123），前缀被剥掉；
-        而消息段列表（event.get_messages()）未被改写，原文还在里面。
-        所以这里从段里把纯文本拼回来，供 T0 识别与去重豁免使用。
+        （astrbot/core/pipeline/waking_check/stage.py:123），前缀被剥掉。
+
+        2026-09-12 二次报 bug：按 09-11 方案从消息段拼回，仍然拿不到斜杠——
+        说明段里那份也是剥过的。改为三层取值，从最原始到最加工：
+          ① message_obj.raw_message —— 平台原始事件，唤醒层绝不碰（最可信）
+          ② event.get_messages() 段拼回 —— 09-11 的老路，能拿到就用
+          ③ 都拿不到 → 返回 ""，由调用方回落 message_str
         """
+        # ① 平台原始事件（最可信）
+        try:
+            raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+            txt = self._extract_original_from_raw(raw)
+            if txt:
+                return txt
+        except Exception as e:
+            logger.debug(f"[parallel_handoff] raw_message 取原文失败: {e}")
+        # ② 消息段拼回
         try:
             segs = event.get_messages()
         except Exception:
@@ -218,11 +229,38 @@ class RouterMixin:
                 buf.append(txt)
         return "".join(buf).strip()
 
+    def _resolve_command_text(self, event: AstrMessageEvent, message: str) -> str:
+        """解析出用于 T0 命令判定的文本（2026-09-12 四修）。
+
+        三次踩坑史（都栽在「想把被剥掉的前缀还原回去」）：
+          ① 直接用 message_str → 唤醒层已剥掉 "/"，startswith 永假
+          ② 从 get_messages() 段拼回 → 段里那份同样是剥过的
+          ③ 从 message_obj.raw_message 取 → 实测平台侧就已经没有 "/"
+
+        四修改用「框架自己的判据」：唤醒层命中 wake_prefix 时，会同时置
+        `event.is_at_or_wake_command = True`
+        （astrbot/core/pipeline/waking_check/stage.py:113-122）——
+        这个标志才是「用户显式用了前缀 / @」的权威信号，**不依赖任何文本还原**。
+        而 message_str 被剥后剩下的，正是命令正文。
+
+        所以：标志为真且文本无前缀 → 补一个虚拟前缀，
+        让下游 _CMD_PREFIXES / _CMD_RE 的现有逻辑原封不动地跑。
+        """
+        raw = self._raw_command_text(event) or message
+        if raw.startswith(self._CMD_PREFIXES):
+            return raw
+        # 严格 `is True`：唤醒层赋的就是字面 True（waking_check/stage.py:114）。
+        # 不能用宽松判真——MagicMock 的任意属性访问都返回 truthy 的 Mock 对象，
+        # 宽松写会把测试与任何 mock 场景误补前缀，把自然语言点名错当命令锁。
+        if getattr(event, "is_at_or_wake_command", False) is True:
+            return "/" + raw
+        return raw
+
     # 呼叫词（锁仲裁用：锁在场时，只有「前缀命令」或「呼叫词 + 已知名字」才算换人）
     _TRANSFER_WORDS = ("换", "找", "叫", "让", "请", "喊", "召", "切到", "换成", "过来")
 
     def _is_explicit_transfer(self, message: str) -> bool:
-        """本条是否构成「显式转移」（换人意图）——2026-09-11 顾主口径。
+        """本条是否构成「显式转移」（换人意图）——2026-09-11 用户口径。
 
         是：前缀命令（/、#、！、全角／…）、呼叫短语（换 X / 找 X / 叫 X 过来）、
             极短消息且只含一个已知代理名（≤6 字）
@@ -290,7 +328,7 @@ class RouterMixin:
         has_main = False
         unknown = []
         for p in parts:
-            if p in ("主代理", "普瑞塞斯"):
+            if p in _MAIN_TOKEN_SET:
                 has_main = True
                 continue
             aid = name2aid.get(p)
@@ -305,6 +343,66 @@ class RouterMixin:
             logger.info(f"[parallel_handoff] 命令式含未知目标 {unknown}，已忽略（已知目标照常锁定）")
         return (agents or None), has_main
 
+    def _parse_admin_command(self, message: str) -> str:
+        """[软入口·A 方案 2026-09-12] 解析会话管理命令。
+
+        返回 'status' / 'reset' / 'list'；非管理命令返回 ""。
+        与 T0 点名互斥：管理词先判（_ADMIN_RE 整句匹配），命中即短路返回。
+        """
+        if not message:
+            return ""
+        m = self._ADMIN_RE.match(message)
+        if not m:
+            return ""
+        word = m.group(1)
+        if word in ("谁在", "状态"):
+            return "status"
+        if word in ("复位", "解除", "放开", "释放"):
+            return "reset"
+        return "list"
+
+    def _admin_reply_text(self, event, cmd: str) -> str:
+        """生成管理命令回执文案；reset 顺带清锁（命令锁 + 粘滞锁 + 直发参照）。
+
+        拆成同步纯逻辑便于测试；发送由 _send_admin_reply 的 async 薄壳负责。
+        """
+        disp = self._get_name_display_map() or {}
+
+        def _cn(aid):
+            return str(disp.get(aid, aid))
+
+        if cmd == "status":
+            locked = []
+            if getattr(self, "_cmd_lock", None):
+                locked = list(self._cmd_lock.get(event.unified_msg_origin, {}).keys())
+            if locked:
+                names = " + ".join(_cn(a) for a in locked)
+                return f"📍 现在锁着：{names}\n（换人：/名字 · 放开：/复位）"
+            return "📍 没锁着谁，消息自动分派\n（指定：/名字 · 名单：/列表）"
+
+        if cmd == "reset":
+            if getattr(self, "_cmd_lock", None):
+                self._cmd_lock.pop(event.unified_msg_origin, None)
+            last, _ = self._route_mem()
+            last.pop(event.unified_msg_origin, None)
+            if getattr(self, "_route_reply", None):
+                self._route_reply.pop(event.unified_msg_origin, None)
+            return "✅ 放开了，消息回到自动分派"
+
+        pool = self._router_agent_pool()
+        names = " · ".join(_cn(a) for a in pool)
+        return f"📋 可点名：{names}\n（发 /名字 直接锁定）"
+
+    async def _send_admin_reply(self, event, cmd: str) -> None:
+        """发送管理命令回执（发送失败不炸路由，仅记日志）。"""
+        try:
+            text = self._admin_reply_text(event, cmd)
+            from astrbot.core.message.components import Plain
+            from astrbot.core.message.message_event_result import MessageChain
+            await event.send(MessageChain([Plain(text)]))
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[parallel_handoff] 管理命令回执发送失败: {e}")
+
     # ── T1 规则层 ────────────────────────────────────────
     # 报错/日志/代码强特征：命中且整条无呼叫词（找/叫/让/喊…）→ 判定为技术文本，
     # 子代理名此时多为报错主体/路径/引用，不构成点名，直接放行 main/T2；
@@ -314,8 +412,8 @@ class RouterMixin:
         r"stderr|stdout|报错|异常|超时|timeout|not\s+found|import\s+error|"
         r"module\s|missing\s|undefined|(?:file|line)\s+\d+|```|`[^`]*`)", re.I)
     # 叙述尾：名字后面直接紧跟这些 → 是"提及"，不是"呼叫"
-    # 2026-08-30："又"收紧为必须后接叙述动词（"奸商又在坑我钱"是抱怨非叙述，"黍又做饭了"才是）；
-    # 疑问句（吗/么/呢/吧/？）不视为叙述（"夕宝在画室吗"是询问非转述）
+    # 2026-08-30："又"收紧为必须后接叙述动词（"奸商又在坑我钱"是抱怨非叙述，"助手A又做饭了"才是）；
+    # 疑问句（吗/么/呢/吧/？）不视为叙述（"助手A在画室吗"是询问非转述）
     _T1_NARR_TAIL_RE = re.compile(
         r"^(?:的|了|过|说|说过|说道|提到|提起|曾经|上次|之前|昨天|刚才|"
         r"和他|和她|和他们|和她们|跟|与|同|也|还|在|去|来|过|离开|走了|"
@@ -337,7 +435,7 @@ class RouterMixin:
         r"(?:想找|去找|帮我找|叫她|叫他|叫|喊|唤|找|让|请|问|约|召唤|"
         r"去\s*(?:找|叫)|快叫|帮我叫)", )
     # [多点名专用 CALL_TAIL 2026-09-07] 在原修饰词簇追加 我们/你们/咱们/一起，
-    # 使「助手A，助手D，我们一起来玩3p吧」里"我们一起来"能命中"来"作拜请动词。
+    # 使「助手A，助手D，我们一起来玩吧」里"我们一起来"能命中"来"作拜请动词。
     # 仅 `_t1_route_multi` 使用，单点名路径仍用原 `_T1_CALL_TAIL_RE`（零回归）。
     _T1_MULTI_CALL_TAIL_RE = re.compile(
         r"(?:，|,|：|:|！|!|？|\?|\s)*(?:(?:那|再|想|要|还|又|也|快|就|现在|我|人家|好想|真的|我们|你们|咱们|一起)*"
@@ -366,7 +464,7 @@ class RouterMixin:
         for aid, cn in disp_map.items():
             candidates[cn] = aid
             candidates[aid] = aid
-        # 爱称别名（2026-08-30 顾主指定）：T1 直呼爱称同样命中对应子代理
+        # 爱称别名（2026-08-30 用户指定）：T1 直呼爱称同样命中对应子代理
         for aid, aliases in self.T1_ALIASES.items():
             for al in aliases:
                 candidates[al] = aid
@@ -396,7 +494,7 @@ class RouterMixin:
                     rf"(?<![0-9A-Za-z\u4e00-\u9fff]){re.escape(name_s)}(?![0-9A-Za-z\u4e00-\u9fff])"
                 )
                 # 单字名叙述锚 A：紧贴后续 说过/聊过/讲到/提到… 即转述语境
-                # （"黍聊过药膳""夕说想去画画"→ 提及，非点名）
+                # （"助手A聊过药膳""助手B说想去画画"→ 提及，非点名）
                 cue = re.compile(
                     rf"(?<![0-9A-Za-z\u4e00-\u9fff])"
                     rf"{re.escape(name_s)}(?=(?:说|说过|说道|说了|聊|聊过|聊了|讲|讲过|讲到?|提|提到|提起|记得))"
@@ -406,7 +504,7 @@ class RouterMixin:
                     narr_context = True
                     continue
                 # 单字名叙述锚 B：伴随介词（和/跟/与/同）+ 名字 + 转述动词
-                # （"之前和黍聊了药膳" → "和黍"因词边界不相邻，此锚接住转述语境）
+                # （"之前和助手A聊了药膳" → "和助手A"因词边界不相邻，此锚接住转述语境）
                 cue_with = re.compile(
                     rf"(?:和|跟|与|同){re.escape(name_s)}"
                     rf"(?=(?:说过|说道|说|聊过|聊了|聊|讲过|讲|提到|提起|记得))"
@@ -423,11 +521,11 @@ class RouterMixin:
                 if self._T1_CALL_PREFIX_RE.search(pre[-8:]) or self._T1_CALL_TAIL_RE.match(post):
                     call_hits.add(aid)
                     continue
-                # 2) 叙述尾：名字后紧跟叙述结构 → 提及，非呼叫（疑问句除外："夕宝在画室吗"是询问）
+                # 2) 叙述尾：名字后紧跟叙述结构 → 提及，非呼叫（疑问句除外："助手A在画室吗"是询问）
                 if self._T1_NARR_TAIL_RE.match(post) and not self._T1_QUESTION_RE.search(post):
                     narr_context = True
                     continue
-                # 3) 弱点名：名字为消息头，或整条消息极短（"夕"、"助手A"）→ 认
+                # 3) 弱点名：名字为消息头，或整条消息极短（"助手A"、"助手B"）→ 认
                 if not pre.strip() or (not post.strip() and len(stripped) <= 12):
                     weak_hits.add(aid)
         # ── 多点名歧义 → 不盲选，交 T2/main ──
@@ -437,7 +535,7 @@ class RouterMixin:
         if self._T1_ERR_RE.search(stripped) and not call_hits:
             return None
         # ── 单点名路由（2026-08-30 放宽：名字出现即路由，位置无关）──
-        # 原来要求名字在句首/有呼叫动词才命中，导致"帮我看一下助手D""最近怎么样，蒂蒂"
+        # 原来要求名字在句首/有呼叫动词才命中，导致"帮我看一下助手D""最近怎么样"
         # 这类名字在句中/句尾的消息落 T2。现放宽为：单点名 + 非叙述语境 → 直接路由。
         if len(appeared) == 1 and not narr_context:
             return next(iter(appeared))
@@ -457,7 +555,7 @@ class RouterMixin:
 
         背景：原 `_t1_route` 遇到多点名直接 `return None`（router.py:300-301），
         把「明确多点名呼叫」跟「叙述性提到多个名字」一刀切全挡回主代理，
-        主代理被迫当主持人转述——违背顾主 2026-09-07 记忆#4「点几个名就几个延续、
+        主代理被迫当主持人转述——违背用户 2026-09-07 记忆#4「点几个名就几个延续、
         主代理不插嘴」。本方法独立实现并复用相同判定正则，不动 `_t1_route` 返回契约，
         零侵入单点名/模糊提及路径。
         """
@@ -486,7 +584,7 @@ class RouterMixin:
                 else:
                     pattern = re.compile(rf"(?<![0-9A-Za-z]){re.escape(name_s)}")
             else:
-                # 单字名（夕/年/令/黍）：强制词边界防误伤
+                # 单字名（单字中文名）：强制词边界防误伤
                 pattern = re.compile(
                     rf"(?<![0-9A-Za-z\u4e00-\u9fff]){re.escape(name_s)}"
                     rf"(?![0-9A-Za-z\u4e00-\u9fff])"
@@ -505,7 +603,7 @@ class RouterMixin:
                     or self._T1_MULTI_CALL_TAIL_RE.match(post)
                 )
                 if not call:
-                    # 弱点名（句首/极短消息）也算强呼叫：如「助手A，助手D，来」/「助手A，猫猫」
+                    # 弱点名（句首/极短消息）也算强呼叫：如「助手A，助手D，来」/「小黑，小白」
                     if not pre.strip() or (not post.strip() and len(stripped) <= 12):
                         call = True
                     else:
@@ -523,7 +621,7 @@ class RouterMixin:
 
         2026-09-07 方案①升级：_route_last 从「单 agent 锁」升级为「在场者组」，
         支持 3P/多P 场次后无点名消息按多人组接龙（根因：旧结构只留最后一个 agent，
-        助手A在多角色场次里天然掉队）。
+        部分子代理在多角色场次里天然掉队）。
         """
         if not hasattr(self, "_route_last"):
             self._route_last = {}      # session -> {aid: ts}（在场者组）
@@ -532,7 +630,7 @@ class RouterMixin:
         return self._route_last, self._route_msgs
 
     def _record_cmd_lock(self, event, agents):
-        """[T0 命令式强制锁定 2026-09-08 顾主指定] 记录会话级命令锁定在场者组。
+        """[T0 命令式强制锁定 2026-09-08 用户指定] 记录会话级命令锁定在场者组。
 
         命令锁定是独立于粘滞锁 _route_last 的最高权重强制锁：/<名A>+<名B> 一经建立，
         该会话直到被新命令或「主代理」文本解除前，永远只跟锁定组对话。
@@ -604,7 +702,7 @@ class RouterMixin:
     def _dedup_shortcircuit(
         self, event: AstrMessageEvent, message: str, raw_message: str = ""
     ) -> bool:
-        """会话级消息去重屏障（2026-09-09 顾主 bug 治本）。
+        """会话级消息去重屏障（2026-09-09 用户 bug 治本）。
 
         bug 复现：/<名A>+<名B> 命令锁 → 发"继续做爱"，T0.5 粘滞命中 nian+xi chained，
         但某位助手回了两遍。根因：_smart_router_check 挂在 OnWaitingLLMRequestEvent 上，
@@ -619,7 +717,7 @@ class RouterMixin:
         路由。覆盖所有短路路径的通用屏障。
         返回 True = 已吞（去重），False = 正常放行。
 
-        2026-09-11：显式命令豁免——顾主连发两条相同前缀命令（如 /助手A）时，
+        2026-09-11：显式命令豁免——用户连发两条相同前缀命令（如 /助手A）时，
         第二条必须照常执行，不能被去重窗口吃掉。
         """
         if (raw_message or message or "").lstrip().startswith(self._CMD_PREFIXES):
@@ -658,7 +756,7 @@ class RouterMixin:
         或消息含「主代理」最高级令牌（由上层先行清锁，本层不接管）。
 
         取代旧 T1.5 的「纯承接短句 + 300s 时间窗 + 无新点名」弱续接设计，
-        按顾主 2026-09-07 指定改为会话级硬锁定（agent → 一路粘着，久聊不解放绑）。
+        按用户 2026-09-07 指定改为会话级硬锁定（agent → 一路粘着，久聊不解放绑）。
 
         2026-09-07 方案①升级：_route_last 现为「在场者组」（session -> {aid: ts}）。
         返回：单人组 -> str（该 agent）；多人组（≥2 全在池）-> list[str]（整组，
@@ -681,7 +779,7 @@ class RouterMixin:
         if not live:
             return None
         # 3) 本条出现新的子代理名 → 仅当构成「显式转移」才让位给 T1 重新点名；
-        #    长句里顺带提及则继续沿用旧锁（2026-09-11 顾主口径：锁不被 T1 夺走）
+        #    长句里顺带提及则继续沿用旧锁（2026-09-11 用户口径：锁不被 T1 夺走）
         if self._t1_mentions(message) and self._is_explicit_transfer(message):
             return None
         # 4) 未点名 → 按在场者组粘滞
@@ -695,9 +793,9 @@ class RouterMixin:
         """记录本次成功路由（供粘滞锁定续接：点名建立/切换后一路沿用）。
         2026-09-07 方案A：记录即会话锁定，久聊不释放；由新点名或主代理令牌覆盖/清除。
         2026-09-07 方案①：并入「在场者组」（session -> {aid: ts}），同名归一化。
-        2026-09-09 顾主 bug 治本（点名=换组）：单点名命中 → 覆盖在场者组为仅此一人。
-        旧实现是并入（group[aid]=ts 不清旧成员），导致锁 nian+xi 后自然语言点「助手D」
-        被 T1 当单点名追加进旧组变 3P，而不是换锁成助手D。顾主心智：点名谁就是谁，
+        2026-09-09 用户 bug 治本（点名=换组）：单点名命中 → 覆盖在场者组为仅此一人。
+        旧实现是并入（group[aid]=ts 不清旧成员），导致锁住一组后自然语言点「助手D」
+        被 T1 当单点名追加进旧组，而不是换锁成助手D。用户心智：点名谁就是谁，
         新点名重定义在场者组，旧成员退出。无点名承接句才沿用原组（见 _t1_sticky_route）。
         """
         last, _ = self._route_mem()
@@ -710,15 +808,15 @@ class RouterMixin:
                 break
         group = last.get(event.unified_msg_origin, {})
         if aid in group:
-            # [3P 保组 2026-09-09] 点名者是旧在场者组成员（如 3P 中点"年"）→ 只刷新
+            # [多代理保组 2026-09-09] 点名者是旧在场者组成员（如多场次中点名）→ 只刷新
             # 时间戳、不拆散整组。多P场次后续无点名消息仍按整组 chained 续接不掉队
             # （记忆#4 Bug B 修复语义，防 regression）。
             group[aid] = time.time()
             return
-        # [点名=换锁 2026-09-09 顾主 bug 治本] 单点名命中新面孔 → 覆盖在场者组为仅此
+        # [点名=换锁 2026-09-09 用户 bug 治本] 单点名命中新面孔 → 覆盖在场者组为仅此
         # 一人。旧实现是并入（group[aid]=ts 不清旧成员），导致锁 nian+xi 后自然语言点
-        # 「助手D」被 T1 当单点名追加进旧组变 3P，而不是换锁成助手D（顾主 2026-09-09
-        # 报：锁助手D失效，还是锁在年+夕身上）。顾主心智：点名新面孔 = 换锁到 TA，
+        # 「助手D」被 T1 当单点名追加进旧组，而不是换锁成助手D（用户 2026-09-09
+        # 报：点名换锁失效，仍停在旧组）。用户心智：点名新面孔 = 换锁到 TA，
         # 旧在场者退出；点名在场者 = 只是跟 TA 说话，不拆 3P。
         last[event.unified_msg_origin] = {aid: time.time()}
 
@@ -726,10 +824,10 @@ class RouterMixin:
         """[方案① 2026-09-07] 把一整组在场者写入粘滞记忆（多P场次用）。
 
         行内注意：agents 可为 list/tuple 等多点名返回值，统一并入同组。
-        2026-09-09 顾主 bug 治本（点名=换组）：整组覆盖写入，清掉旧在场者。
+        2026-09-09 用户 bug 治本（点名=换组）：整组覆盖写入，清掉旧在场者。
         与 _record_route_hit 对齐——多点名（如「助手A，助手D，一起来玩」）就是
-        重新定义在场者组；若沿用并入，则「年+夕」后再点「助手A+助手D」会变成
-        4P 而顾主心智是要换到新组。
+        重新定义在场者组；若沿用并入，则「甲+乙」后再点「丙+丁」会变成
+        4P 而用户心智是要换到新组。
         """
         last, _ = self._route_mem()
         disp_map = self._get_name_display_map() or {}
@@ -762,7 +860,7 @@ class RouterMixin:
                         out.add(aid)
                 else:
                     # 单字名：三种语境任一命中即算提及（宁可多抓，兜底用于拒接）
-                    # 1) 叙述锚：说/聊过/提到…  2) 介词前导：和夕说…  3) 独立出现（后置仅排英文数字）
+                    # 1) 叙述锚：说/聊过/提到…  2) 介词前导：和助手A说…  3) 独立出现（后置仅排英文数字）
                     cue = re.compile(
                         rf"(?<![0-9A-Za-z\u4e00-\u9fff]){re.escape(name_s)}"
                         rf"(?=(?:说过|说道|说了|说|聊过|聊了|聊|讲过|讲|提到|提起|记得))"
@@ -851,12 +949,12 @@ class RouterMixin:
         返回 False = 放行主代理（不 stop，让 directive 注入 + parallel_handoff 模式调度）
 
         冲突背景：T1/T2 命中直接 call_subagent 直发，绕过 tech_mode_config /
-        affection_mode_config 模式调度——技术干活任务被单发直连，顾主配置形同虚设；
+        affection_mode_config 模式调度——技术干活任务被单发直连，用户配置形同虚设；
         短路后主代理 LLM 不调用，directive 强制路由指令根本没机会注入。
 
-        裁决规则（顾主配置永远优先；2026-09-07 方案A 调整 tech 分支）：
+        裁决规则（用户配置永远优先；2026-09-07 方案A 调整 tech 分支）：
         - 任务分类 tech（技术特征）+ 路由命中（点名/粘滞）→ **短路直发被点名者处理**
-          （顾主 2026-09-07 拍板：点名粘滞期间技术请求也归被点名子代理直发处理，
+          （用户 2026-09-07 拍板：点名粘滞期间技术请求也归被点名子代理直发处理，
           不再放行主代理统帅收卷——旧 8-31 规则作废，因为统帅形态实际未生效）
         - 任务分类 affection → 按 affection_mode_config.route_mode：
             direct → 短路直发（贴贴快速直达）；relay → 放行主代理（回复返回主代理汇总）
@@ -915,7 +1013,7 @@ class RouterMixin:
         """[Busy Bypass 2026-08-31] 消息入口旁路：主代理正在干活（活跃 runner）时，
         点名子代理的消息直接直发子代理，绕过 follow-up 捕获。
 
-        背景：主代理工具链执行中（agent run 活跃）时，顾主发来的新消息会被
+        背景：主代理工具链执行中（agent run 活跃）时，用户发来的新消息会被
         internal.py:194 的 try_capture_follow_up 吞进当前 run 的 follow-up ticket，
         OnWaitingLLMRequestEvent（T1/T2 路由唯一入口）根本不触发，消息混入主代理
         上下文，主代理只能边干活边手动调子代理。
@@ -935,9 +1033,23 @@ class RouterMixin:
         message = (event.get_message_str() or "").strip()
         if not message:
             return False
-        # [唤醒来路 2026-09-11] 唤醒层剥掉 "/"，从消息段拼回原文供 T0 识别
-        raw_message = self._raw_command_text(event) or message
-        # [T0 命令式触发 2026-09-08 顾主指定] busy 场景同样启用 / 命令：
+        # [唤醒来路 2026-09-12 四修] 唤醒层剥前缀时会置 is_at_or_wake_command，
+        # 拿它当判据，不再赌「原文还能还原回来」
+        raw_message = self._resolve_command_text(event, message)
+        if raw_message != message:
+            logger.info(
+                f"[parallel_handoff] T0 命令原文解析: {message!r} → {raw_message!r} "
+                f"(at_or_wake={getattr(event, 'is_at_or_wake_command', None)})"
+            )
+        # [软入口·A 方案 2026-09-12] 柜台命令 /谁在 /复位 /列表：
+        # busy（主代理干活中）同样可查锁、放锁、看名单。
+        admin_cmd = self._parse_admin_command(raw_message)
+        if admin_cmd:
+            logger.info(f"[parallel_handoff] BusyBypass: 管理命令 {admin_cmd} → 回执并短路")
+            await self._send_admin_reply(event, admin_cmd)
+            event.stop_event()
+            return True
+        # [T0 命令式触发 2026-09-08 用户指定] busy 场景同样启用 / 命令：
         # 主代理正干活时，/<名A>、/<名A>+<名B> 等显式命令仍锁定并短路，不被 follow-up 吞。
         cmd_agents, cmd_main = self._parse_agent_command(raw_message)
         if cmd_agents and not cmd_main:
@@ -971,14 +1083,14 @@ class RouterMixin:
                 self._record_route_hits(event, cmd_agents)
                 self._record_route_suggestions(cmd_agents)
             logger.info(
-                f"[parallel_handoff] BusyBypass: T0 命令式含主代理 → 放行主代理 "
+                f"[parallel_handoff] BusyBypass: T0 命令式含主代理令牌 → 放行主代理 "
                 f"(record lock for {cmd_agents})"
             )
             return False
         # 再次确认活跃 runner（filter 通过后可能已结束，兜底）
         if _ACTIVE_AGENT_RUNNERS is None or event.unified_msg_origin not in _ACTIVE_AGENT_RUNNERS:
             return False
-        # [T0 命令式强制锁定 2026-09-08 顾主指定] busy 场景命令锁同样最高权重：
+        # [T0 命令式强制锁定 2026-09-08 用户指定] busy 场景命令锁同样最高权重：
         # 锁定到场者组按锁组路由，对话提及他名也不切换。
         cmd_locked = self._cmd_locked_group(event)
         if cmd_locked:
@@ -1077,7 +1189,7 @@ class RouterMixin:
         route = self._t1_route(message)
         if not route:
             return False
-        # [模式兼容 2026-08-31] 忙碌旁路同样按顾主模式配置裁决：技术干活/relay 放行主代理
+        # [模式兼容 2026-08-31] 忙碌旁路同样按用户模式配置裁决：技术干活/relay 放行主代理
         if not self._mode_shortcut_decision(event, message, route):
             logger.info(
                 f"[parallel_handoff] BusyBypass: T1 route -> {route} "
@@ -1131,15 +1243,29 @@ class RouterMixin:
         message = (event.get_message_str() or "").strip()
         if not message:
             return False
-        # [唤醒来路 2026-09-11] 唤醒层会剥掉 "/"，从消息段拼回原文供 T0 识别
-        raw_message = self._raw_command_text(event) or message
+        # [唤醒来路 2026-09-12 四修] 唤醒层剥前缀时会置 is_at_or_wake_command，
+        # 拿它当判据，不再赌「原文还能还原回来」
+        raw_message = self._resolve_command_text(event, message)
+        if raw_message != message:
+            logger.info(
+                f"[parallel_handoff] T0 命令原文解析: {message!r} → {raw_message!r} "
+                f"(at_or_wake={getattr(event, 'is_at_or_wake_command', None)})"
+            )
         self._record_user_msg(event, message)
-        # [去重屏障 2026-09-09 顾主 bug 治本] 同消息二次触发（OnWaitingLLMRequestEvent
+        # [去重屏障 2026-09-09 用户 bug 治本] 同消息二次触发（OnWaitingLLMRequestEvent
         # 可能对同一消息顺序跑两次）→ 直接吞掉，杜绝子代理重复回话。
         # 2026-09-11：显式命令豁免（连发两条 /助手A，第二条必须照常执行）
         if self._dedup_shortcircuit(event, message, raw_message):
             return True
-        # [T0 命令式触发 2026-09-08 顾主指定] 以 / 开头的显式命令（如 /<名A>、/<名A>+<名B>、
+        # [软入口·A 方案 2026-09-12] 柜台命令 /谁在 /复位 /列表：回执并短路，
+        # 不进 T0 点名 / T1 / T0.5 / T2 任何一层。
+        admin_cmd = self._parse_admin_command(raw_message)
+        if admin_cmd:
+            logger.info(f"[parallel_handoff] SmartRouter: 管理命令 {admin_cmd} → 回执并短路")
+            await self._send_admin_reply(event, admin_cmd)
+            event.stop_event()
+            return True
+        # [T0 命令式触发 2026-09-08 用户指定] 以 / 开头的显式命令（如 /<名A>、/<名A>+<名B>、
         # /助手C+助手A+助手D、/主代理+助手A）→ 直接锁定目标，最高优先级短路，
         # 彻底跳过 T1 关键词猜测 / T0.5 粘滞 / T2 小模型。命令持续生效（写粘滞锁）。
         cmd_agents, cmd_main = self._parse_agent_command(raw_message)
@@ -1171,13 +1297,13 @@ class RouterMixin:
                 event.stop_event()
                 return True
             # 含主代理（/主代理 或 /主代理+助手A）：主代理在场。
-            #   - agents 空 → 纯主代理，放行并清除命令锁（顾主回归主代理）
+            #   - agents 空 → 纯主代理，放行并清除命令锁（用户回归主代理）
             #   - agents 非空 → 主代理调度子代理，放行主代理 + 暂存判向目标
             if getattr(self, "_cmd_lock", None):
                 self._cmd_lock.pop(event.unified_msg_origin, None)
             if cmd_agents:
                 logger.info(
-                    f"[parallel_handoff] SmartRouter: T0 命令式含主代理 + {cmd_agents} → "
+                    f"[parallel_handoff] SmartRouter: T0 命令式含主代理令牌 + {cmd_agents} → "
                     f"放行主代理并暂存候选子代理"
                 )
                 # 写粘滞锁：主代理+子代理共在场，后续无命令续接时子代理按锁调度
@@ -1185,30 +1311,30 @@ class RouterMixin:
                 self._record_route_suggestions(cmd_agents)
             else:
                 logger.info(
-                    "[parallel_handoff] SmartRouter: T0 命令式 /主代理 → 纯主代理放行"
+                    "[parallel_handoff] SmartRouter: T0 命令式（含主代理名）→ 纯主代理放行"
                 )
                 last, _ = self._route_mem()
                 last.pop(event.unified_msg_origin, None)
             return False
-        # [最高优先级 2026-09-03 顾主指定] 含连续「主代理」四字 → 无条件放行主代理（=主代理）。
+        # [最高优先级 2026-09-03 用户指定] 含连续「主代理」四字 → 无条件放行主代理（=主代理）。
         # 跳过 T1/T1.5/T2 全部判向，任何子代理都不得接管。返回 False 表示不短路、不 stop_event，
         # 消息自然落回主代理路径。登记路由历史防止 T1.5 后续承接接到子代理。
-        if self._MAIN_TOKEN_RE.search(message):
+        if self._MAIN_TOKEN_RE and self._MAIN_TOKEN_RE.search(message):
             logger.info(
-                "[parallel_handoff] SmartRouter: 消息含「主代理」→ 最高优先级放行主代理（不路由子代理）"
+                "[parallel_handoff] SmartRouter: 消息含「主代理令牌」→ 最高优先级放行主代理（不路由子代理）"
             )
             # 清掉该会话的续接记忆，避免后续承接句被 T1.5 续给错误子代理。
-            # [2026-09-11 顾主口径修正] 这里**不再**清命令锁：过去对话里只要提到
+            # [2026-09-11 用户口径修正] 这里**不再**清命令锁：过去对话里只要提到
             # 「主代理」四个字就把命令强锁拆了，是「锁莫名其妙失效」的元凶之一。
             # 现在令牌只放行本轮；要解绑请发 /主代理（走 T0 命令路径显式解锁）。
             last, _ = self._route_mem()
             last.pop(event.unified_msg_origin, None)
             return False
         t0 = time.perf_counter()
-        # [T0 命令式强制锁定 2026-09-08 顾主指定] 命令锁在场者组存在 → 该会话所有后续
+        # [T0 命令式强制锁定 2026-09-08 用户指定] 命令锁在场者组存在 → 该会话所有后续
         # 消息直接按锁组路由（多人 chained / 单人 direct），T1 名字判定/T0.5 粘滞/T2
-        # 全部跳过——即使对话里点了其他子代理名（如「你对助手A的看法」），也只是
-        # 对话内容，绝不切换到助手A。只有新命令或「主代理」文本能解除（上层已判）。
+        # 全部跳过——即使对话里点了其他子代理名（如「你对某人的看法」），也只是
+        # 对话内容，绝不切换到该子代理。只有新命令或「主代理」文本能解除（上层已判）。
         cmd_locked = self._cmd_locked_group(event)
         if cmd_locked:
             logger.info(
@@ -1233,7 +1359,7 @@ class RouterMixin:
             return True
         # [多点名强呼叫短路 2026-09-07 方案A] 一次明确点名多个子代理
         #（如「助手A，助手D，我们一起来玩」）→ 短路走 chained 接龙，
-        # 主代理完全不下场（顾主记忆#4：点几个名就几个延续、不插嘴）。
+        # 主代理完全不下场（用户记忆#4：点几个名就几个延续、不插嘴）。
         # 放在 T1 判定之前，覆盖粘滞（新点名优先于旧锁）。
         multi = self._t1_route_multi(message)
         if multi and len(multi) >= 2:
@@ -1261,7 +1387,7 @@ class RouterMixin:
             return True
         # T1 点名 / 领域词
         route = self._t1_route(message)
-        # [锁仲裁 2026-09-11 顾主口径] 粘滞在册组存在时，T1 只有提名权、没有转移权：
+        # [锁仲裁 2026-09-11 用户口径] 粘滞在册组存在时，T1 只有提名权、没有转移权：
         # 命中项在组外且不构成显式转移 → 判为叙述提及，丢弃 T1 结果，落回 T0.5 按原组
         # 续接。效果：锁定了就一路是 TA，除非你明确喊人（呼叫词/前缀命令/短名消息）。
         if route:
@@ -1309,9 +1435,9 @@ class RouterMixin:
             source = "T2"
         if not route or conf < self._router_threshold():
             return False
-        # [模式兼容 2026-08-31] T1/T2 命中后按顾主模式配置裁决：
+        # [模式兼容 2026-08-31] T1/T2 命中后按用户模式配置裁决：
         # 技术干活任务（tech 特征）→ 放行主代理走 tech 模式统帅收卷（relay+parallel），
-        # 避免 T1/T2 短路把任务变成 direct 单发、绕过顾主模式配置；
+        # 避免 T1/T2 短路把任务变成 direct 单发、绕过用户模式配置；
         # 贴贴任务 → 按 affection_mode_config.route_mode：direct 短路直发，relay 放行主代理。
         if not self._mode_shortcut_decision(event, message, route):
             logger.info(

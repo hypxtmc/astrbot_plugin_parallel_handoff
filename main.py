@@ -1,6 +1,6 @@
 """并行子代理调用插件 (Parallel Handoff) — 入口 + 事件注册（P0 拆模块）
 
-允许主代理通过 parallel_handoff tool 同时调用多个子代理（如助手A、助手C等）,
+允许主代理通过 parallel_handoff tool 同时调用多个子代理（如 agent_a、agent_b 等）,
 并行获取所有回复后统一返回结果。
 
 P0 重构说明：本文件只保留插件入口与事件注册（装饰器方法）。被
@@ -9,7 +9,7 @@ P0 重构说明：本文件只保留插件入口与事件注册（装饰器方�
 按 module_path 绑定插件实例），具体实现通过 super() 转发到各 mixin 模块：
 - config.py    ConfigMixin    配置读取/迁移/保存/前缀开关
 - directive.py DirectiveMixin 路由强制指令 + 强制直连黑名单映射
-- scene.py     SceneMixin     场景上下文 + 剧情基线
+- scene.py     SceneMixin     场景上下文
 - memory.py    MemoryMixin    livingmemory 集成/召回/存储/记忆工具过滤
 - dispatch.py  DispatchMixin  去重守卫/单子代理调用/并行调度/跨轮上下文
 - forward.py   ForwardMixin   分段转发/主代理前缀注入
@@ -18,9 +18,11 @@ P0 重构说明：本文件只保留插件入口与事件注册（装饰器方�
 单测 mock 环境用 spec_from_file_location 直接加载本文件（无 package，走绝对导入）。
 """
 import asyncio
+import json
+import os
 
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.event.filter import llm_tool
 from astrbot.api.provider import ProviderRequest
@@ -35,10 +37,11 @@ try:
     from . import dispatch as _dispatch_mod
     from . import forward as _forward_mod
     from . import ctx_engine as _ctx_engine_mod
+    from . import session_store as _session_store_mod
+    from . import task_runner as _task_runner_mod
     from . import router as _router_mod
     from . import arbitrate as _arbitrate_mod
     from . import side_pulse as _side_pulse_mod
-    from . import metrics as _metrics_mod
 except ImportError:
     import config as _config_mod
     import directive as _directive_mod
@@ -47,10 +50,32 @@ except ImportError:
     import dispatch as _dispatch_mod
     import forward as _forward_mod
     import ctx_engine as _ctx_engine_mod
+    import session_store as _session_store_mod
+    import task_runner as _task_runner_mod
     import router as _router_mod
     import arbitrate as _arbitrate_mod
     import side_pulse as _side_pulse_mod
-    import metrics as _metrics_mod
+
+
+def _load_display_names() -> dict:
+    """从插件 data/ 目录加载子代理显示名映射（不进仓库；缺文件时返回空表）。
+
+    空表时 name_display_map 配置与英文 id 仍可用，中文显示名派生的功能自然降级。"""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "display_names.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and data:
+            logger.info("[main] 已加载 display_names.json（%d 项）", len(data))
+            return data
+        return {}
+    except FileNotFoundError:
+        logger.info("[main] 数据文件 display_names.json 不存在，使用空表")
+        return {}
+    except Exception as exc:
+        logger.warning("[main] 数据文件 display_names.json 加载失败（用空表继续）: %s", exc)
+        return {}
+
 
 
 @register(
@@ -69,32 +94,12 @@ class ParallelHandoffPlugin(
     _router_mod.RouterMixin,
     _arbitrate_mod.ArbitrationMixin,
     _side_pulse_mod.FamilyPulseMixin,
-    _metrics_mod.MetricsMixin,
     Star,
 ):
     """并行子代理调用插件"""
 
-    @filter.on_llm_response()
-    async def metrics_on_llm_response(self, event, response):
-        """主代理侧 token 计量（子代理走 llm_generate/tool_loop_agent，不触发本事件）"""
-        await self.on_llm_response_metrics(event, response)
-
     # agent_name -> 中文显示名 映射表
-    AGENT_DISPLAY_NAME = {
-        "agent_a": "助手A",
-        "agent_c": "助手C",
-        "memory": "记忆管家",
-        "search": "搜索Agent",
-        "agent_b": "助手B",
-        "agent_d": "助手D",
-        "xi": "夕",
-        "shu": "黍",
-        "nian": "年",
-        "ling": "令",
-        "agent_f": "助手F",
-        "m3": "M3",
-        "agent_e": "助手E",
-    }
+    AGENT_DISPLAY_NAME = _load_display_names()
     # 中文显示名 -> agent_name 反向映射
     AGENT_NAME_REVERSE = {v: k for k, v in AGENT_DISPLAY_NAME.items()}
 
@@ -107,6 +112,25 @@ class ParallelHandoffPlugin(
         self._tool_call_seen: dict[str, tuple[float, None]] = {}
         # 跨轮对话上下文：{agent_name:session_id -> [{"role": ..., "content": ...}, ...]}
         # 跨轮对话上下文：独立引擎 ContextEngine（压缩参数构造注入，可独立调参）
+        # 2026-09-12 一期：会话落盘。磁盘为真源、内存为热窗口，重启不再失忆。
+        # 默认开、可一键关；初始化失败一律回落纯内存，不阻断插件加载。
+        _store = None
+        if self._cfg("subagent_session_persist", True):
+            try:
+                import os as _os
+
+                _data_dir = str(
+                    StarTools.get_data_dir("astrbot_plugin_parallel_handoff")
+                )
+                _store = _session_store_mod.SessionStore(
+                    _os.path.join(_data_dir, "subagent_sessions"),
+                    retention_days=self._cfg("subagent_session_retention_days", 30),
+                )
+            except Exception as _store_e:  # noqa: BLE001
+                logger.warning(
+                    f"[parallel_handoff] 会话落盘初始化失败，回落纯内存: {_store_e}"
+                )
+                _store = None
         self._ctx_engine = _ctx_engine_mod.ContextEngine(
             enabled=self._cfg("subagent_context_enabled", True),
             max_turns=self._cfg("subagent_context_max_turns", 100),
@@ -116,7 +140,21 @@ class ParallelHandoffPlugin(
                 self.context.llm_generate(*a, **k)
                 if hasattr(self, "context") and self.context else None
             ),
+            store=_store,
         )
+        # 二期：后台任务运行器（派单不阻塞主代理；仅在 background=true 时启用）
+        try:
+            self._task_runner = _task_runner_mod.TaskRunner(
+                max_concurrent=self._cfg("subagent_task_max_concurrent", 20),
+                max_per_session=self._cfg("subagent_task_max_per_session", 5),
+                turn_timeout=self._cfg("subagent_task_turn_timeout", 900),
+            )
+            # 进程刚起来，内存里本不该有残留任务；此调用为防御性清理，
+            # 将来若任务也落盘，它就是必需的一步。
+            self._task_runner.interrupt_orphans()
+        except Exception as _tr_e:  # noqa: BLE001
+            logger.warning(f"[parallel_handoff] 后台任务运行器初始化失败: {_tr_e}")
+            self._task_runner = None
 
     # ── 事件注册：主代理前缀自动注入（实现见 forward.py ForwardMixin） ──
     @filter.on_decorating_result()
@@ -142,8 +180,8 @@ class ParallelHandoffPlugin(
         故不破坏 DeepSeek 前缀缓存命中率；mark_as_temp 置 _no_save，不写入对话历史。
         已含标记则跳过，避免 agent 循环多轮重复注入。
         """
-        # [2026-09-04 顾主拍板] 拉顾主接回旁路：主代理链路零侵入检测顾主私聊回复，
-        # 命中则注入旁轨日志 + 异步触发接茬（不 stop_event、不拦截，主代理照常回复顾主）。
+        # [2026-09-04 用户拍板] 拉用户接回旁路：主代理链路零侵入检测用户私聊回复，
+        # 命中则注入旁轨日志 + 异步触发接茬（不 stop_event、不拦截，主代理照常回复用户）。
         try:
             self._pulse_draft_reply_check(event)
         except Exception:  # noqa: BLE001
@@ -237,12 +275,12 @@ class ParallelHandoffPlugin(
         """
         return await super().toggle_prefix(event)
 
-    # ── 事件注册：唤即看（顾主私聊回看旁轨日志，实现见 side_pulse.py FamilyPulseMixin） ──
+    # ── 事件注册：唤即看（用户私聊回看旁轨日志，实现见 side_pulse.py FamilyPulseMixin） ──
     @filter.regex(r"^(看看家里|看家里|家里今天|家里动静|看看她们聊了啥|看看大家)")
     async def pulse_peek(self, event: AstrMessageEvent):
-        """顾主私聊发「看看家里」→ 回看旁轨日志原文（今天/昨天/前天）。
+        """用户私聊发「看看家里」→ 回看旁轨日志原文（今天/昨天/前天）。
 
-        仅顾主私聊响应：命中 stop_event 并推送日志；其他会话/他人消息
+        仅用户私聊响应：命中 stop_event 并推送日志；其他会话/他人消息
         内部判定后放行，不影响正常对话流程。
         """
         return await super()._pulse_peek(event)
@@ -258,25 +296,84 @@ class ParallelHandoffPlugin(
         route_mode: str = None,
         call_mode: str = None,
         mode: str = None,
+        background: bool = False,
     ) -> str:
-        """并行调用多个子代理（如助手A、助手B、助手C、夕、令等）,
+        """并行调用多个子代理（如 agent_a、agent_b、agent_c 等）,
 同时获取它们的回复并汇总。
 
 使用场景：当需要多个子代理从不同角度回答同一个问题时使用此工具。
-例如同时询问助手A和助手C对某件事的看法。
+例如同时询问 agent_a 和 agent_b 对某件事的看法。
 
 Args:
     calls(array[object]): 子代理调用列表。每个元素必须包含：
         - agent_name(string): 子代理名称,可选值: 助手A, 助手B 等（需在 name_display_map 中配置）
-        - input(string): 传给该子代理的问题/指令
+        - input(string): 传给该子代理的问题/指令。**推荐按任务卡块写**：
+              【任务】要解决什么
+              【靶点】已给的定位线索（文件路径/符号/行号）
+              【判断】你当前的判断——**待验证命题，不是事实**
+              【依据】判断凭什么（线索来源，可能本身就有漏洞）
+              【产出】【边界】【完成标准】
+            为什么【判断】必须写：只在任务卡里**明说你的假设**，子代理才有东西可反驳。
+            实测教训（2026-09-12）：写"我认为 X 没实现"→ 她查出其实早已实现（prune 就在
+            session_store.py L179-200），拦住了一次重复造轮子；写"实现 X"→ 她照做，
+            错的那部分直接落进交付物。子代理系统提示里已写死"判断校验"职责，
+            她会主动证伪——但前提是你给了靶子。
         - order(integer, 可选): 输出时的排序序号,越小越靠前
-    timeout(number): 单个子代理的超时秒数,默认120秒（顾主设定，永久生效）。超过此时间未返回则跳过该子代理。
+    timeout(number): 单个子代理的超时秒数,默认120秒（用户设定，永久生效）。超过此时间未返回则跳过该子代理。
     message(string): 当开启消息消歧且不传calls时,传入原始消息文本,工具会自动路由到最近对话的子代理。
-    mode(string): 模式可选设置，'tech'或'affection'。传 'tech' 用技术干活模式配置（tech_mode_config，默认 relay+parallel 主代理统帅收卷）；传 'affection' 用后宫贴贴模式配置（affection_mode_config，默认 direct+chained 直发）。不传则回落全局 route_mode/call_mode 配置。顾主配置永远优先（2026-08-31 顾主指定）：mode 命中时以模式配置为准，显式传参不覆盖。
+    mode(string): 模式可选设置，'tech'或'affection'。传 'tech' 用技术干活模式配置（tech_mode_config，默认 relay+parallel 主代理统帅收卷）；传 'affection' 用日常贴贴模式配置（affection_mode_config，默认 direct+chained 直发）。不传则回落全局 route_mode/call_mode 配置。用户配置永远优先（2026-08-31 用户指定）：mode 命中时以模式配置为准，显式传参不覆盖。
     route_mode(string): 路由模式覆盖，'direct'或'relay'；不传用模式/配置默认。技术干活任务传"relay"使子代理回复返回主代理汇总；日常贴贴不传走默认直发。
     call_mode(string): 调用模式覆盖，'parallel'或'chained'；不传用模式/配置默认。技术干活传"parallel"并行调度；流水线任务传"chained"接龙。
+    background(boolean): 是否后台执行（二期，默认 false）。true 时立即返回 task_id 不阻塞——主代理可以继续和用户对话，子代理做完再用 task_result 取结果；适合耗时长或需要真并行的任务。false 时等子代理全部做完再返回，与原行为完全一致。
+
+【派单纪律（L2 协议，2026-09-12 立）】
+1. **带判断**：任务卡必写【判断】+【依据】，不写纯指令——只给指令她会照做，
+   判断错了没人拦得住。**你压缩掉的往往正是她能挑出错的地方。**
+2. **角色偏审查**：执行你自己也能做（你有全局视野，还更准）；
+   **独立视角只有她有**——优先派"校验/复核/找盲区/证伪"，其次才是"实现"。
+3. **同批交同一人**：EXP2 实测集中派单快 3.43 倍、省 61%（摊薄启动成本）。
+4. **产出默认可疑**：她交回来的是**线索**不是**结论**，验收时先问
+   "这东西和已有实现重不重复"——防"往代码库塞第二个轮子"。
 """
-        return await super().parallel_handoff(event, calls, timeout, message, route_mode, call_mode, mode)
+        return await super().parallel_handoff(event, calls, timeout, message, route_mode, call_mode, mode, background)
+
+    # ── LLM 工具注册：task_status / task_result / task_stop（二期后台任务） ──
+    @llm_tool(name="task_status")
+    async def task_status(self, event: AstrMessageEvent, task_id: str = None) -> str:
+        """查后台任务状态（二期）。不阻塞，立即返回。
+
+使用场景：派了后台任务之后，想知道它跑完没有。
+不传 task_id 则列出当前所有活跃任务。
+
+Args:
+    task_id (string): 任务 ID，不传则列出全部活跃任务
+"""
+        return await super().task_status(event, task_id)
+
+    @llm_tool(name="task_result")
+    async def task_result(
+        self, event: AstrMessageEvent, task_id: str, timeout: int = 60
+    ) -> str:
+        """取后台任务的结果（二期）。
+
+使用场景：派了后台任务后，等它跑完拿结果。已经跑完的直接返回，不再等待。
+
+Args:
+    task_id (string): 任务 ID（由 parallel_handoff 的 background=true 返回）
+    timeout (number): 最多等多少秒，默认 60。超时则返回当前进度，不报错
+"""
+        return await super().task_result(event, task_id, timeout)
+
+    @llm_tool(name="task_stop")
+    async def task_stop(self, event: AstrMessageEvent, task_id: str) -> str:
+        """取消一个后台任务（二期）。
+
+使用场景：派出去的任务发现没必要了、或者要叫停某个跑偏的子代理。
+
+Args:
+    task_id (string): 要取消的任务 ID
+"""
+        return await super().task_stop(event, task_id)
 
     # ── LLM 工具注册：call_subagent（实现见 dispatch.py DispatchMixin） ──
     @llm_tool(name="call_subagent")
@@ -289,12 +386,12 @@ Args:
         """替代 transfer_to_* 工具的统一入口。调用单个子代理并将回复直接分段转发到用户。
 
 使用场景：
-- 用户明确要求与某子代理对话（如「助手B，改掌机的事交给你了」）
+- 用户明确要求与某子代理对话（如「agent_b，设备改造的事交给你了」）
 - 用户提到子代理名字后说正事
 - 相比 transfer_to_* 工具，本工具确保回复直接发到用户而不用主代理转述
 
 Args:
-    agent_name (string): 子代理名称。支持英文 id（agent_a, agent_b, agent_c, xi 等）和中文名（助手A, 助手B, 助手C, 夕 等），大小写不敏感
+    agent_name (string): 子代理名称。支持英文 id（如 agent_a、agent_b）和中文名（以 name_display_map 配置为准），大小写不敏感
     input (string): 传给子代理的完整问题或指令
 """
         return await super().call_subagent(event, agent_name, input)

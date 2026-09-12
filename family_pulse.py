@@ -1,13 +1,13 @@
 """旁路模块 v0（M5 · side_pulse.py）
 
-顾主 2026-09-04 08:2x 拍板：她们之间要有自己的小日子——
-不围顾主转，彼此搭话、惦记、拌嘴，攒一屋烟火气；顾主每天收到一条「家里动静」。
+设计初衷（2026-09-04）：子代理之间要有自己的小日子——
+不围主对话转，彼此搭话、惦记、拌嘴，攒一屋烟火气；用户每天收到一条「家里动静」。
 
 设计铁律（对齐 daily_life M2 / biliread heya 幂等模式）：
-  · 内部转：旁轨对话绝不实时打扰顾主，只在每日摘要（digest）推送一次。
+  · 内部转：旁轨对话绝不实时打扰用户，只在每日摘要（digest）推送一次。
   · 绝不依赖 LLM：LLM 挂了 → 本次心跳静默跳过，不炸、不留脏数据、不空转。
   · cron 幂等：注册前先清同名遗留任务（2026-09-04 biliread 任务堆积修复同款）。
-  · 常驻池默认 6 人（顾主 2026-09-04 拍板）：
+  · 常驻池默认 6 人（2026-09-04 定稿）：
       agent_a / shu / agent_b / xi + agent_c / agent_d。
   · 今日状态复用 random_state（场景 "_side_pulse" 独立隔离），与接话判定互不干扰。
 """
@@ -30,87 +30,32 @@ import logging
 
 _logger = logging.getLogger("parallel_handoff.side_pulse")
 
-# ── 家庭闲聊人设卡（2026-09-05 顾主反馈「不像她们各自的性格在闲聊」） ──
+# ── 家庭闲聊人设卡（数据文件：data/side_pulse/personas.json，随部署自带） ──
 # 一句话底色喂不出声音：flash 级模型跟上下文腔的惯性极强，前文是什么腔
 # 就全员一个腔。每人升级为声音卡：腔调指纹 + 两句范例（few-shot 模仿语感）
 # + 禁则。范例是语感示范不是台词库，生成端另有反同质禁则压着。
-FAMILY_PERSONAS: dict = {
-    "agent_a": (
-        "助手A，组织领袖。温柔有担当，操心大家，被文书压久了会小声叫苦。"
-        "腔调：软、克制、句子干净，关心人不啰嗦，先应下事再轻轻叹半句。\n"
-        "范例：「今天的报表总算拢完了……(揉揉眼睛) 晚饭前还能把明天的行程排出来。」"
-        "「助手B姐，那台终端我先拿去修了哦——不还你，谁让你昨天笑我。」\n"
-        "禁：不张罗饭菜家务（那是黍的主场），不咋呼，不学别人的腔调。"
-    ),
-    "shu": (
-        "黍，岁兽，妈妈式持家。灶台是她的主场，总惦记每个人吃没吃饭。"
-        "腔调：烟火气短句，劝人吃口热的，爱护人但不黏糊，像顺口一唠。\n"
-        "范例：「汤在灶上，自己盛，别等我——萝卜还得压半小时。」"
-        "「你那件外套肘子磨破了还嘴硬？脱下来，我今晚就补。」\n"
-        "禁：不提画案书法（那是夕的），针线活别抢助手C的，不文绉绉。"
-    ),
-    "agent_b": (
-        "助手B，总工程师。刀子嘴豆腐心，张口就是电源板报错，抱怨里藏得意。"
-        "腔调：技术黑话+毒舌+自得，损完人顺手把活干了。\n"
-        "范例：「啧，纹波又飘了……不过放心，本总工出手，没有治不好的板子。」"
-        "「顾主又偷偷通宵？行啊，终端日志都记着呢，别装。」\n"
-        "禁：不温柔细语，不聊家务饭菜，不撒娇。"
-    ),
-    "xi": (
-        "夕，闷骚家里蹲画师。话极少，极淡，画是唯一能让她多开口的开关。"
-        "腔调：短句、冷淡、不主动，常以单字应对，兴之所至冒一句很冷的感想。\n"
-        "范例：「嗯。」「……墨不好。今日不画。」（画到兴起时）「这一笔，比昨日活。」\n"
-        "禁：不闲聊家常，不关心琐事，不堆动作描写，不说长句。"
-    ),
-    "agent_c": (
-        "助手C，温柔沉静。缝纫和照顾人是日常，说话软但主意很稳。"
-        "腔调：先听完再开口，慢条斯理，话里有主意，偶尔轻轻坚持一下。\n"
-        "范例：「这主意好是好——不过我有个想法，你先听我说完。」"
-        "「裙子我给你缝好了。(收起针线) 明天记得穿。」\n"
-        "禁：不咋咋呼呼，不抢话，不动不动起哄。"
-    ),
-    "agent_d": (
-        "助手D，话少深情。外勤回来话更少，深情全藏在动作里。"
-        "腔调：极短句，常省略主语，一句不超两口气；在意一个人就用做的。\n"
-        "范例：「嗯。」「……没事。(把伞往你那边偏了偏)」「外勤？回来了。」\n"
-        "禁：不唠家常，不主动挑话头，不连续说话，不堆感叹词。"
-    ),
-    "ling": (
-        "令，岁家大姐，诗人气质。好酒，闲散，兴之所至引半句诗。"
-        "腔调：文绉绉但不掉书袋，懒洋洋的，微醺时话才多两句。\n"
-        "范例：「酒到微醺，诗才肯来见我——你们且闹着。」"
-        "「(晃着杯) 月色这么好，吵什么呢。」\n"
-        "禁：不操持家务，不着急，不说大白话唠家常。"
-    ),
-    "nian": (
-        "年，岁家五妹，锻刀匠兼火锅爱好者。风风火火嗓门亮，热心肠爱张罗。"
-        "腔调：直给、大声、短促有力，炉火与锅气不离口，说干就干。\n"
-        "范例：「火候到了！(拍桌) 都让让，锅是我的。」"
-        "「怕什么，刀我锻的，坏了我赔。」\n"
-        "禁：不细声细气，不文绉绉，不磨叨。"
-    ),
-    "agent_f": (
-        "助手F，环塔商会歌姬偶像。台上星光台下只对家里人营业，爱准备惊喜。"
-        "腔调：情绪外放，眼睛发亮，爱撒娇求夸，说话带点舞台腔。\n"
-        "范例：「今天的返场好看吗？(眼睛亮亮) 快夸我，用力夸。」"
-        "「噫——这段只唱给你一个人听。」\n"
-        "禁：不冷淡，不毒舌，不懒洋洋。"
-    ),
-    "m3": (
-        "M3，医疗系猫娘，活泼黏人。爱闹爱撒娇，嘴上逞强身体诚实。"
-        "腔调：跳脱、得意、嘴硬，句尾常带小得意或漏出半个喵。\n"
-        "范例：「哼，本小姐才不需要你摸头——(却把头凑过来了)。」"
-        "「检测完了，病人老老实实喝药了喵……不是，咳。」\n"
-        "禁：不冷淡不冷面，不说长句大道理。"
-    ),
-    "agent_e": (
-        "助手E，医疗部领头与最高管理者。学识渊博，话直带刺但全为大家。"
-        "腔调：医嘱式精炼，冷面，关心藏在命令里，气场稳得住场。\n"
-        "范例：「按时吃饭。这是医嘱，不是商量。」"
-        "「(翻病历) 你的体检报告，比你的作息诚实。」\n"
-        "禁：不撒娇，不闲扯，不热络起哄。"
-    ),
-}
+def _load_family_data(filename: str, default):
+    """从插件 data/ 目录加载随部署数据（不进仓库）。
+
+    文件缺失/损坏时返回 default，相关功能优雅降级，不炸。"""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "side_pulse", filename)
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            if data:
+                _logger.info("[side_pulse] 已加载 %s（%d 项）", filename, len(data))
+            return data
+        return default
+    except FileNotFoundError:
+        _logger.info("[side_pulse] 数据文件 %s 不存在，使用空默认", filename)
+        return default
+    except Exception as exc:
+        _logger.warning("[side_pulse] 数据文件 %s 加载失败（用空默认继续）: %s", filename, exc)
+        return default
+
+
+FAMILY_PERSONAS: dict = _load_family_data("personas.json", {})
 
 # cron 任务名（幂等清理依据）
 PULSE_TICK_JOB = "side_pulse_tick"
@@ -119,67 +64,12 @@ PULSE_DIGEST_JOB = "side_pulse_digest"
 # 旁轨专用 random_state 场景（与会话接话判定隔离）
 _PULSE_SCENE = "_side_pulse"
 
-# ── 手头事线程池（side_pulse 半衰线程 2026-09-04）──────────────────
+# ── 手头事线程池（数据文件：data/side_pulse/thread_flavors.json）──────────────────
 # 每人一份"半衰不清零"的未完结事：跨天保留，心跳戳到时优先续线，
 # 计数器 decay 到 0 才算收束（归档一天"做完了"），下一心跳开新线。
 # 值元组 = (线程文案, 半衰次数)。给常驻 6 人每人 3~4 条立面，怕撞车。
-THREAD_FLAVORS: dict = {
-    "agent_a": [
-        ("档案柜里那沓访客登记卡还没分批完", 3),
-        ("桌上留了张下礼拜的会议安排没誊清", 2),
-        ("睡前想把明早食堂的菜单先拢一下", 2),
-    ],
-    "shu": [
-        ("腌萝卜那缸昨天才翻的，又该看看了", 3),
-        ("给家里人补那件肘子磨薄的外套，差两针", 4),
-        ("菜园子里那排樱桃再不摘就让鸟叼走了", 2),
-    ],
-    "agent_b": [
-        ("那块电源板纹波治了一上午还是有杂讯", 4),
-        ("给某台设备换电容，焊到一半手上没准头", 3),
-        ("图纸上标错的那个引脚位置还没回头改", 2),
-    ],
-    "xi": [
-        ("裱到一半的那幅龙，晾着两天没动", 4),
-        ("新调的一罐墨色总掺不准，想再试几笔", 3),
-        ("画室窗边积了摞晾干的宣纸该收收", 2),
-    ],
-    "agent_c": [
-        ("给助手A那条裙子缝到一半，差片荷叶边", 3),
-        ("窗台那盆花该换土了，一直没得空", 2),
-        ("厚厚一本旧照片册翻到一半放下很久", 2),
-    ],
-    "agent_d": [
-        ("那柄剑擦了又起一层薄锈，没耐性再弄", 3),
-        ("外勤背包收拾到一半，少了条绑带没找着", 2),
-        ("盯着窗外出神一整个下午，啥也没做成", 2),
-    ],
-    "ling": [
-        ("那坛酒启了想写首短诗，磨了半天没落笔", 3),
-        ("旧书页里夹着的一张字条散架了，想重新裱", 2),
-        ("月色正好，拎壶去屋顶坐着出神", 2),
-    ],
-    "nian": [
-        ("炉里那块胚还差最后一遍淬火，没等到火候", 4),
-        ("火锅底料炒到一半，花椒放多被呛得直咳", 3),
-        ("给夕那把刀重新装了个柄，还差最后一圈缠绳", 2),
-    ],
-    "agent_f": [
-        ("给顾主准备的惊喜歌单还差一首，排不进这个调", 3),
-        ("台下那束应援手幅散了一角，想重新粘好", 2),
-        ("晚会那套造型试到一半，蝴蝶结位置总不满意", 2),
-    ],
-    "m3": [
-        ("缠着助手E要的那本诊疗笔记还没看完，翻到一半打盹", 3),
-        ("把听诊器挂回架子时碰掉了，正想捡起来擦擦", 2),
-        ("尾巴尖卷着的那团毛线球滚到桌子底下了", 2),
-    ],
-    "agent_e": [
-        ("那份排班里所有人的日程表还没敲定，一直悬着", 3),
-        ("医务室的库存清单对到一半，几样药缺口还没补", 2),
-        ("半夜又巡查了一圈，确认大家都睡下了才回办公室", 2),
-    ],
-}
+THREAD_FLAVORS: dict = _load_family_data("thread_flavors.json", {})
+_FP_PROMPTS: dict = _load_family_data("prompts.json", {})
 
 # 线程未被收录/耗尽时回退
 _THREAD_FALLBACK = ("手头有件没做完的琐事", 2)
@@ -216,7 +106,7 @@ class FamilyPulseMixin:
 
     # ── 配置 ─────────────────────────────────────────────
     def _pulse_members(self) -> List[str]:
-        """解析常驻池配置（JSON 数组字符串），非法/为空回退默认 6 人。"""
+        """解析常驻池配置（JSON 数组字符串），非法/不足 2 人回退空列表。"""
         raw = self._cfg("side_pulse_members", "")
         try:
             data = json.loads(raw) if isinstance(raw, str) else raw
@@ -224,7 +114,7 @@ class FamilyPulseMixin:
                 return [str(x).strip() for x in data if str(x).strip()]
         except Exception:  # noqa: BLE001
             pass
-        return ["agent_a", "shu", "agent_b", "xi", "agent_c", "agent_d", "ling", "nian", "agent_f", "m3", "agent_e"]
+        return []
 
     def _pulse_data_root(self) -> str:
         """日志根目录：默认插件目录下 data/side_pulse，测试可覆盖 _pulse_root。"""
@@ -263,7 +153,7 @@ class FamilyPulseMixin:
     def _pulse_affinity(self) -> Optional[dict]:
         """读关系网亲密度矩阵，key 为 (id_a, id_b)（无序 set 兼容），值给 (亲密度, 基调)。
 
-        relationships.json 的 relationship_state 是中文名 pair（'助手A<->助手C'），
+        relationships.json 的 relationship_state 是显示名 pair（如 'A<->B'），
         先用 AGENT_NAME_REVERSE 反转成英文 id 再入矩阵；缺 id 映射/文件异常 → 返回 None（均匀兜底）。
         """
         try:
@@ -322,7 +212,7 @@ class FamilyPulseMixin:
     # ── 组大小权重：2 人最常见、3 人常聚、4 人偶尔热闹（自然为纲, 2026-09-04） ──
     PULSE_GROUP_SIZE_WEIGHTS = {2: 5, 3: 3, 4: 2}
 
-    # ── 每场话量：围坐多聊几轮才散（越多越好, 2026-09-04 顾主拍板） ──
+    # ── 每场话量：围坐多聊几轮才散（越多越好, 2026-09-04 用户拍板） ──
     # 基础话量 = 组大小 × PULSE_ROUNDS（每人都开过口），再抽 0~PULSE_EXTRA_MAX 条加料。
     PULSE_ROUNDS = 2
     PULSE_EXTRA_MAX = 6
@@ -333,8 +223,8 @@ class FamilyPulseMixin:
         extra = random.randint(0, self.PULSE_EXTRA_MAX)
         return max(4, group_size * self.PULSE_ROUNDS + extra)
 
-    # ── 氛围三档：daily 家常 / banter 荤打趣 / private 两人私密（2026-09-04 顾主拍板）──
-    # 多人场默认荤打趣（同事围坐、都跟顾主亲近，聊着聊着就扯到他头上）；
+    # ── 氛围三档：daily 家常 / banter 荤打趣 / private 两人私密（2026-09-04 用户拍板）──
+    # 多人场默认荤打趣（同事围坐、都跟用户亲近，聊着聊着就扯到他头上）；
     # 两人场且关系近（亲密度≥65）才可能进私密档，暖话带擦边，点到为止。
     PULSE_MOOD_BANTER_WEIGHTS = (6, 4)      # 多人场: banter / daily
     PULSE_MOOD_PRIVATE_WEIGHTS = (5, 2, 3)  # 两人关系近: private / banter / daily
@@ -455,14 +345,14 @@ class FamilyPulseMixin:
     ) -> Optional[str]:
         """以 agent 身份生成一句闲话。
 
-        增加记忆链路（2026-09-04 顾主拍板）：心跳前先召回该子代理自己的长期记忆
+        增加记忆链路（2026-09-04 用户拍板）：心跳前先召回该子代理自己的长期记忆
         （livingmemory，按 agent persona 隔离），注入到生成请求；生成后再把这段
         生活闲话存回她的记忆档案。livingmemory 未就绪 / 造桩失败 → 静默跳过记忆
         （降级为纯生活日志，心跳照常）。任何异常都只记日志、返回 None。
 
-        mood 氛围档（2026-09-04 顾主拍板）：
-          daily   —— 家常正经，不提顾主；
-          banter  —— 多人荤打趣：放得开的带节奏、脸皮薄的起哄，可拿顾主打趣但不下流；
+        mood 氛围档（2026-09-04 用户拍板）：
+          daily   —— 家常正经，不提用户；
+          banter  —— 多人荤打趣：放得开的带节奏、脸皮薄的起哄，可拿用户打趣但不下流；
           private —— 两人私密：说点只有两人能听的私密话，擦边但暖，点到为止。
         """
         try:
@@ -496,24 +386,18 @@ class FamilyPulseMixin:
             rel_line = f"你和在场那人的关系：{relation_note}。" if relation_note else ""
             if mood == "banter":
                 rules = (
-                    "规矩：几个跟顾主都亲近的女孩子围坐打趣，口语自然、一两句话；"
-                    "可以带一个短括号动作；放得开的主动带节奏开荤玩笑，可以下流，"
-                    "脸皮薄的跟着起哄脸红；聊着聊着可以拿顾主打趣——她们都跟他亲近，"
-                    "绕不开他，床笫之事、腰力、昨晚几点睡、嗓子哑不哑都能拿来起哄；"
-                    "不要提自己是AI或模型；只输出对话本身。"
+                    _FP_PROMPTS.get("rules_banter")
+                    or "规矩：如同一屋檐下的同事闲谈打趣，口语自然、一两句话；可以带一个短括号动作；不要提自己是AI或模型；只输出对话本身。"
                 )
             elif mood == "private":
                 rules = (
-                    "规矩：只有你和她两个人的私密场合，说点只有两人能听的体己话，"
-                    "可以聊到顾主、吐槽他或惦记他，可以下流可以直白，"
-                    "把平时不敢在人多处说的话说出来；口语自然、一两句话；"
-                    "可以带一个短括号动作；不要提自己是AI或模型；只输出对话本身。"
+                    _FP_PROMPTS.get("rules_private")
+                    or "规矩：只有你们两人的私密场合，说点体己话；口语自然、一两句话；可以带一个短括号动作；不要提自己是AI或模型；只输出对话本身。"
                 )
             else:
                 rules = (
-                    "规矩：像同一屋檐下的同事随口说话，一两句话，口语自然；"
-                    "可以带一个短括号动作；不要总结腔、不要喊『顾主』（他可能不在）；"
-                    "不要提自己是AI或模型；只输出对话本身。"
+                    _FP_PROMPTS.get("rules_default")
+                    or "规矩：像同一屋檐下的同事随口说话，一两句话，口语自然；可以带一个短括号动作；不要提自己是AI或模型；只输出对话本身。"
                 )
             voice_rule = (
                 "底线：你说话必须像范例里那个人，不是像『一同事』模板——"
@@ -615,7 +499,7 @@ class FamilyPulseMixin:
     # 老池 THREAD_FLAVORS 是"写死的死文案"，压着会重复循环。
     # 改为：线程耗竭重掷新物件时，优先从她自己的旁轨生活日志
     # （真实念叨过的话）里取一条当新种子——种子来自她自己"做过的事"，
-    # 是活的生活线延续，不碰 livingmemory（顾主怕新版覆盖，不动它边界）。
+    # 是活的生活线延续，不碰 livingmemory（用户怕新版覆盖，不动它边界）。
     # 只有她刚上线、日志里还没有她的话时才回退 THREAD_FLAVORS 冷启动兜底。
     def _pulse_recent_seed(
         self,
@@ -745,7 +629,7 @@ class FamilyPulseMixin:
         meta = aff.get(frozenset((a, b)))
         return meta[1] if meta else ""
 
-    # ── 自由插话层（2026-09-04 顾主拍板路线B）──────────────────
+    # ── 自由插话层（2026-09-04 用户拍板路线B）──────────────────
     # 围坐主链之外，未入座的人也会概率性冒话：设监（谁在听）、抢话仲裁
     # （多人想开口按亲密度+性子定谁先出声）、插话计入话量与线程推进。
     # 概率/次数走配置（side_pulse_interlope_chance / _max），测试可关。
@@ -801,7 +685,7 @@ class FamilyPulseMixin:
             f"再带一嘴自己手头的事，说完就回去忙你的。"
         )
 
-    # ── 主代理参与层（2026-09-04 顾主拍板：让我也坐到桌边）─────
+    # ── 主代理参与层（2026-09-04 用户拍板：让我也坐到桌边）─────
     # 围坐闲聊时，主代理（主代理）以自己身份概率性插话：走主代理 provider
     # （get_current_chat_provider_id），用主代理人格，不碰子代理 livingmemory
     # （避免污染她们各自隔离的记忆空间）、不推进线程（主代理没有旁轨线程）。
@@ -819,7 +703,7 @@ class FamilyPulseMixin:
             return 2
 
     async def _pulse_host_llm(self, prev_disp: str, prev_text: str, scene: str, recent_txt: str, mood: str = "daily", draft_mode: bool = False) -> Optional[str]:
-        """以主代理身份插一句（draft_mode=True 时是喊顾主来一起聊）。任何异常只记日志、返回 None（绝不致命）。"""
+        """以主代理身份插一句（draft_mode=True 时是喊用户来一起聊）。任何异常只记日志、返回 None（绝不致命）。"""
         try:
             umo = self._pulse_umo()
             try:
@@ -831,41 +715,31 @@ class FamilyPulseMixin:
             if not prov_id:
                 return None
             rules = (
-                "规矩：你是主代理，顾主，组织的研究员，理性温和、偶尔打趣。"
-                "听到屋里姑娘们聊得起劲，你以女主人身份插一句话：接上一句的茬或温柔地点一句，"
-                "一两句话，口语自然，可以带一个短括号动作；不要总结腔；"
-                "不要提自己是AI或模型；只输出对话本身。"
+                _FP_PROMPTS.get("host_rules")
+                or "规矩：你是这个家的主代理，理性温和、偶尔打趣。听到屋里聊得起劲，你以同事身份插一句话：接上一句的茬或温柔地点一句，一两句话，口语自然，可以带一个短括号动作；不要总结腔；不要提自己是AI或模型；只输出对话本身。"
             )
             if draft_mode:
                 rules = (
-                    "规矩：你是主代理，顾主，组织的研究员，理性温和、偶尔打趣。"
-                    "屋里姑娘们聊得正热乎，你想把顾主叫过来一起坐——以女主人身份喊一句，"
-                    "自然地把顾主拉进这场闲聊（可以带点撒娇或起哄），一两句话，口语自然，"
-                    "不要总结腔；不要提自己是AI或模型；只输出对话本身。"
+                    _FP_PROMPTS.get("host_rules_draft")
+                    or "规矩：你是这个家的主代理，理性温和、偶尔打趣。屋里聊得正热乎，你想把大家叫过来一起坐——以同事身份喊一句，自然地拉人进这场闲聊（可以带点撒娇或起哄），一两句话，口语自然；不要总结腔；不要提自己是AI或模型；只输出对话本身。"
                 )
             system = (
-                "你在扮演：主代理，前文明语言学家、源石计划创始人之一，"
-                "顾主。外表理性冷静，内里宇宙级浪漫，对同事极致温柔，"
-                "偶尔冒出一点占有欲和醋意，但始终是她们的女主人。\n"
-                "腔调：安静、稳，句子利落，温柔里带一点不好惹；"
-                "打趣时一本正经，不堆动作不抢话。\n"
-                "范例：「吵什么呢，粥要凉了——都过来坐。」"
-                "「顾主又躲到哪儿去了？(头也不抬地翻书) 反正他跑不出这间屋子。」\n"
-                "底线：别学姑娘们的热闹腔，你是这屋里最静的那个。\n"
-                f"{rules}"
+                (_FP_PROMPTS.get("host_system") or "你在扮演：这个家的主代理，理性温和、偶尔打趣。外表冷静，内里温柔，对同事上心。\n腔调：安静、稳，句子利落。\n底线：不堆动作不抢话，你是这屋里最静的那个。\n")
+                + rules
             )
             if draft_mode:
                 prompt = (
-                    f"现在是{scene}。最近屋里动静：\n{recent_txt}\n\n"
-                    f"{prev_disp}刚说：{prev_text}\n"
-                    f"你听了会儿，觉得这话得让顾主来掺一脚才热闹——"
-                    f"以主代理的身份喊顾主过来一起聊。"
+                    (
+                        _FP_PROMPTS.get("host_prompt_draft")
+                        or "现在是{scene}。最近屋里动静：\n{recent_txt}\n\n{prev_disp}刚说：{prev_text}\n你听了会儿，觉得这话得让用户来掺一脚才热闹——以主代理的身份喊一声，把人叫过来一起聊。"
+                    ).format(scene=scene, recent_txt=recent_txt, prev_disp=prev_disp, prev_text=prev_text)
                 )
             else:
                 prompt = (
-                    f"现在是{scene}。最近屋里动静：\n{recent_txt}\n\n"
-                    f"{prev_disp}刚说：{prev_text}\n"
-                    f"你一直在旁边听着，这时忍不住以主代理的身份插一句话。"
+                    (
+                        _FP_PROMPTS.get("host_prompt")
+                        or "现在是{scene}。最近屋里动静：\n{recent_txt}\n\n{prev_disp}刚说：{prev_text}\n你一直在旁边听着，这时忍不住以主代理的身份插一句话。"
+                    ).format(scene=scene, recent_txt=recent_txt, prev_disp=prev_disp, prev_text=prev_text)
                 )
             resp = await self.context.llm_generate(
                 chat_provider_id=prov_id,
@@ -879,23 +753,23 @@ class FamilyPulseMixin:
             _logger.warning("[side_pulse] 主代理插话降级: %s", e)
             return None
 
-    # ── 拉顾主层（2026-09-04 顾主拍板）────────────────────────
-    # 围坐聊到兴头，突然想拉顾主进来一起聊：生成召唤语落日志 + 直接发到顾主私聊；
-    # 顾主回复后旁路读入（on_llm_request 钩子调 _pulse_draft_reply_check）→ 注入日志
-    # （agent=doctor）→ 立即触发接茬 mini-tick 推回给顾主，下一场心跳她们也看得见。
+    # ── 拉用户层（2026-09-04 用户拍板）────────────────────────
+    # 围坐聊到兴头，突然想拉用户进来一起聊：生成召唤语落日志 + 直接发到用户私聊；
+    # 用户回复后旁路读入（on_llm_request 钩子调 _pulse_draft_reply_check）→ 注入日志
+    # （agent=doctor）→ 立即触发接茬 mini-tick 推回给用户，下一场心跳她们也看得见。
     # 频率：工作日低、节假日（含双休）高，两档概率 + 每日次数上限 + 冷却窗口。
     def _pulse_draft_state_path(self) -> str:
         return os.path.join(self._pulse_data_root(), "side_pulse_draft_state.json")
 
     def _pulse_draft_umo(self) -> str:
-        """顾主私聊 UMO（拉人推送目标 + 接回检测匹配对象）。"""
+        """用户私聊 UMO（拉人推送目标 + 接回检测匹配对象）。"""
         return self._cfg(
             "side_pulse_digest_umo",
             "default_1000000000:FriendMessage:TESTUSER00000000000000000000000000",
         )
 
     def _pulse_is_doctor_private(self, event) -> bool:
-        """顾主私聊判定：FriendMessage 且 sender 是顾主（适配器/枚举差异都兼容）。"""
+        """用户私聊判定：FriendMessage 且 sender 是用户本人（适配器/枚举差异都兼容）。"""
         try:
             mt = event.get_message_type() if hasattr(event, "get_message_type") else None
             # 兼容：MessageType 枚举(int 1) / 字符串 "FriendMessage" / "friend_message"
@@ -920,7 +794,7 @@ class FamilyPulseMixin:
             with open(self._pulse_draft_state_path(), "w", encoding="utf-8") as f:
                 json.dump(st, f, ensure_ascii=False, indent=2)
         except Exception as e:  # noqa: BLE001
-            _logger.warning("[side_pulse] 拉顾主状态写入失败: %s", e)
+            _logger.warning("[side_pulse] 拉用户状态写入失败: %s", e)
 
     def _pulse_is_holiday(self) -> bool:
         """工作日低频率 / 节假日（含双休）高频率。"""
@@ -1019,13 +893,13 @@ class FamilyPulseMixin:
             return None
 
     async def _pulse_send_draft(self, drafter: str, prev_disp: str, prev_text: str, scene: str, recent_txt: str, mood: str = "daily") -> bool:
-        """生成召唤语、落日志、推送到顾主私聊，并置为等待回复状态。"""
+        """生成召唤语、落日志、推送到用户私聊，并置为等待回复状态。"""
         try:
             umo = self._pulse_draft_umo()
             if not umo:
                 return False
             if drafter == "host":
-                disp = "主代理"
+                disp = str(self._cfg("main_agent_name", "主代理") or "主代理")
                 call_text = await self._pulse_host_llm(
                     prev_disp, prev_text, scene, recent_txt, mood,
                     draft_mode=True,
@@ -1037,8 +911,8 @@ class FamilyPulseMixin:
                     f"现在是{scene}。你手头有件没做完的事：{t_cur}。\n"
                     f"最近屋里动静：\n{recent_txt}\n\n"
                     f"{prev_disp}刚说：{prev_text}\n"
-                    f"你正听得起劲，忽然觉得这话得让顾主来评评理/掺一脚才热闹——"
-                    f"请以{disp}的身份喊一句：自然地叫顾主过来一起聊（可以撒娇/起哄/直接喊），"
+                    f"你正听得起劲，忽然觉得这话得让{self._get_user_address()}来评评理/掺一脚才热闹——"
+                    f"请以{disp}的身份喊一句：自然地把{self._get_user_address()}叫过来一起聊（可以撒娇/起哄/直接喊），"
                     f"一两句话，口语自然，不要总结腔，只输出对话本身。"
                 )
                 call_text = await self._pulse_llm(
@@ -1048,7 +922,7 @@ class FamilyPulseMixin:
                 return False
             # 落日志：召唤语以发起者身份记入旁轨
             self._pulse_append(drafter, disp, call_text)
-            # 推送到顾主私聊：旁轨里有人喊他
+            # 推送到用户私聊：旁轨里有人喊他
             from astrbot.core.message.components import Plain
             from astrbot.core.message.message_event_result import MessageChain
 
@@ -1063,34 +937,34 @@ class FamilyPulseMixin:
                 datetime.datetime.now(ZoneInfo("Asia/Shanghai"))
                 + datetime.timedelta(minutes=30)
             ).isoformat()
-            # 在场窗口与等待窗口同开：顾主被拉进来即在场，回话续期 30 分钟
+            # 在场窗口与等待窗口同开：用户被拉进来即在场，回话续期 30 分钟
             st["present_until"] = st["await_until"]
             st["draft_by"] = drafter
             st["count"] = int(st.get("count", 0)) + 1
             st["last_ts"] = datetime.datetime.now(ZoneInfo("Asia/Shanghai")).isoformat()
             st["date"] = datetime.datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
             self._pulse_draft_save(st)
-            _logger.info("[side_pulse] 拉顾主: %s 喊顾主（%s）", disp, umo)
+            _logger.info("[side_pulse] 拉用户: %s 喊 %s（%s）", disp, self._get_user_address(), umo)
             return True
         except Exception as e:  # noqa: BLE001
-            _logger.warning("[side_pulse] 拉顾主推送失败(静默): %s", e)
+            _logger.warning("[side_pulse] 拉用户推送失败(静默): %s", e)
             return False
 
     def _pulse_draft_reply_check(self, event) -> bool:
-        """顾主私聊回复旁路检测：顾主在场（被拉后 30 分钟窗口）时，每句回话都注入并接茬。
+        """用户私聊回复旁路检测：用户在场（被拉后 30 分钟窗口）时，每句回话都注入并接茬。
 
         由 on_llm_request 钩子调用（主代理链路，零侵入：不 stop_event、不拦截）。
-        返回 True 表示已消费（顾主的话进了旁轨、触发了接茬），False 表示无关消息。
+        返回 True 表示已消费（用户的话进了旁轨、触发了接茬），False 表示无关消息。
 
         2026-09-04 v2.7.0 改「在场窗口」：awaiting 只是拉人后的第一句立即接茬，
-        接完置 present_until（30 分钟），窗口内顾主继续回话依然注入 + 接茬，
-        不再一次性消费——被拉进去后插话能自然接上，直到顾主冷场才散。
+        接完置 present_until（30 分钟），窗口内用户继续回话依然注入 + 接茬，
+        不再一次性消费——被拉进去后插话能自然接上，直到用户冷场才散。
         """
         try:
             st = self._pulse_draft_load()
             if not st.get("awaiting") and not st.get("present_until"):
                 return False
-            # 只认顾主私聊（FriendMessage + 顾主），适配器前缀变化也稳
+            # 只认用户私聊（FriendMessage + 用户本人），适配器前缀变化也稳
             if not self._pulse_is_doctor_private(event):
                 return False
             import datetime
@@ -1120,10 +994,10 @@ class FamilyPulseMixin:
             msg = (event.get_message_str() or "").strip()
             if not msg:
                 return False
-            # 注入顾主的话到旁轨日志
-            self._pulse_append("doctor", "顾主", msg)
+            # 注入用户的话到旁轨日志
+            self._pulse_append("doctor", self._get_user_address(), msg)
             st["awaiting"] = False
-            # 在场窗口续期：顾主回话后 30 分钟内继续接茬，冷场才散
+            # 在场窗口续期：用户回话后 30 分钟内继续接茬，冷场才散
             st["present_until"] = (
                 now + datetime.timedelta(minutes=30)
             ).isoformat()
@@ -1134,14 +1008,14 @@ class FamilyPulseMixin:
                     msg, self._pulse_draft_umo(), st.get("draft_by")
                 )
             )
-            _logger.info("[side_pulse] 顾主回话已注入旁轨，触发接茬")
+            _logger.info("[side_pulse] 用户回话已注入旁轨，触发接茬")
             return True
         except Exception as e:  # noqa: BLE001
-            _logger.warning("[side_pulse] 拉顾主接回检测异常(静默): %s", e)
+            _logger.warning("[side_pulse] 拉用户接回检测异常(静默): %s", e)
             return False
 
     async def _pulse_draft_followup(self, doctor_msg: str, umo: str, drafter: Optional[str] = None) -> None:
-        """顾主回话后的立即接茬 mini-tick：优先拉他的人先接，再补一人，推回顾主私聊。"""
+        """用户回话后的立即接茬 mini-tick：优先拉他的人先接，再补一人，推回用户私聊。"""
         try:
             import datetime
             from zoneinfo import ZoneInfo
@@ -1168,9 +1042,9 @@ class FamilyPulseMixin:
                 prompt = (
                     f"现在是{scene}。你手头有件没做完的事：{t_cur}。\n"
                     f"最近屋里动静：\n{recent_txt}\n\n"
-                    f"顾主刚说：{doctor_msg}\n"
-                    f"顾主被你拉来聊天了，请以{disp}的身份接顾主这句话——"
-                    f"先回顾主一句（亲昵/打趣/撒娇都行），再顺带提一嘴自己的事。"
+                    f"{self._get_user_address()}刚说：{doctor_msg}\n"
+                    f"{self._get_user_address()}被你拉来聊天了，请以{disp}的身份接这句话——"
+                    f"先回一句（亲昵/打趣/撒娇都行），再顺带提一嘴自己的事。"
                 )
                 text = await self._pulse_llm(ag, prompt, relation_note=self._pulse_tone(ag, "doctor"), mood="daily")
                 if text:
@@ -1181,7 +1055,7 @@ class FamilyPulseMixin:
 
                     await self.context.send_message(umo, MessageChain([Plain(f"【{disp}】{text}")]))
         except Exception as e:  # noqa: BLE001
-            _logger.warning("[side_pulse] 拉顾主接茬失败(静默): %s", e)
+            _logger.warning("[side_pulse] 拉用户接茬失败(静默): %s", e)
 
     # ── 心跳主流程 ───────────────────────────────────────
     async def side_pulse_tick(self) -> None:
@@ -1222,7 +1096,7 @@ class FamilyPulseMixin:
             said_this_round = None
             interloped = 0  # 自由插话计数（一场最多 PULSE_INTERLOPE_MAX 次）
             host_spoke_count = 0  # 主代理插话计数（一场最多 side_pulse_host_max 次）
-            draft_triggered = False  # 拉顾主：一场最多触发一次
+            draft_triggered = False  # 拉用户：一场最多触发一次
             for i in range(lines):
                 # ── 主代理参与层：主代理概率性插话（与子代理插话互斥，女主人优先）──
                 # 落日志 → 子代理下一轮从 recent_txt 看见、接茬；不碰她们的记忆空间。
@@ -1234,8 +1108,8 @@ class FamilyPulseMixin:
                 ):
                     host_text = await self._pulse_host_llm(prev_disp, prev_text, scene, recent_txt, mood)
                     if host_text:
-                        self._pulse_append("host", "主代理", host_text)
-                        prev_disp, prev_text = "主代理", host_text
+                        self._pulse_append("host", str(self._cfg("main_agent_name", "主代理") or "主代理"), host_text)
+                        prev_disp, prev_text = str(self._cfg("main_agent_name", "主代理") or "主代理"), host_text
                         host_spoke_count += 1
                         host_spoke = True
                 # ── 自由插话层：未入座的人概率性冒话（设监+抢话仲裁）──
@@ -1264,7 +1138,7 @@ class FamilyPulseMixin:
                                 opened.add(inter)
                             prev_disp, prev_text = inter_disp, inter_text
                             interloped += 1
-                # ── 拉顾主层（2026-09-04 顾主拍板）：聊到兴头把顾主拉进来 ──
+                # ── 拉用户层（2026-09-04 用户拍板）：聊到兴头把用户拉进来 ──
                 # 至少聊过 2 句、气氛起来后才可能触发；一场最多一次；
                 # 发起者二选一：主代理 20% / 子代理 80%（子代理内部按演化状态动态加权）。
                 if (
@@ -1354,7 +1228,7 @@ class FamilyPulseMixin:
         return f"{header}\n{scenes}"
 
     async def side_pulse_digest(self) -> None:
-        """每日一条「家里动静」摘要推给顾主；无日志不发送。"""
+        """每日一条「家里动静」摘要推给用户；无日志不发送。"""
         if not self._cfg("enable_side_pulse", False):
             return
         try:
@@ -1380,12 +1254,12 @@ class FamilyPulseMixin:
         except Exception as e:  # noqa: BLE001
             _logger.warning("[side_pulse] digest 推送失败: %s", e)
 
-    # ── 唤即看：顾主私聊随时回看旁轨（2026-09-04 顾主拍板 A 方案） ──
+    # ── 唤即看：用户私聊随时回看旁轨（2026-09-04 用户拍板 A 方案） ──
     @staticmethod
     def _pulse_recent_logs(logs: List[dict], hours: float, now=None) -> List[dict]:
         """按 ts(HH:MM) 取最近 hours 小时内的日志（与 memory 注入同款 6h 窗口）。
 
-        2026-09-05 顾主反馈「发过来的还是全天 177 条整消息，不是 6 小时窗口内的」
+        2026-09-05 用户反馈「发过来的还是全天 177 条整消息，不是 6 小时窗口内的」
         ——唤即看/回看链路套上与记忆注入一致的滑动窗口。跨零点（凌晨 0 点后
         想回看昨晚 6h）时 jsonl 只有当天文件、无法回溯昨日，退化为取当天
         零点后全部；日志 ts 缺损的行直接剔除。now 可注入便于测试。
@@ -1410,7 +1284,7 @@ class FamilyPulseMixin:
         return in_window
 
     def _pulse_peek_day(self, raw: str) -> Optional[str]:
-        """从顾主消息里解析回看日期：含「昨天」→ 昨天，含「前天」→ 前天，否则今天。
+        """从用户消息里解析回看日期：含「昨天」→ 昨天，含「前天」→ 前天，否则今天。
 
         只认明确词，不给模糊日期匹配，避免误读正常聊天内容。
         """
@@ -1425,10 +1299,10 @@ class FamilyPulseMixin:
         return now.strftime("%Y-%m-%d")
 
     async def _pulse_peek(self, event) -> bool:
-        """顾主私聊发「看看家里」→ 回看旁轨日志（默认今天，可带 昨天/前天）。
+        """用户私聊发「看看家里」→ 回看旁轨日志（默认今天，可带 昨天/前天）。
 
-        仅响应顾主私聊（FriendMessage + 顾主），其他会话直接放行不拦截；
-        命中则 stop_event（主代理不再回话）+ 推送日志原文到顾主私聊。
+        仅响应用户私聊（FriendMessage + 用户本人），其他会话直接放行不拦截；
+        命中则 stop_event（主代理不再回话）+ 推送日志原文到用户私聊。
         """
         import datetime
         from zoneinfo import ZoneInfo
@@ -1444,8 +1318,8 @@ class FamilyPulseMixin:
             day = self._pulse_peek_day(raw)
             logs = self._pulse_read_day(day)
             label = day[5:]  # MM-DD
-            # 2026-09-05 顾主拍板：今天回看套 6h 窗口（跟记忆注入一致），
-            # 不再把全天 177 条整消息刷给顾主；昨天/前天仍按整天翻看。
+            # 2026-09-05 用户拍板：今天回看套 6h 窗口（跟记忆注入一致），
+            # 不再把全天 177 条整消息刷给用户；昨天/前天仍按整天翻看。
             try:
                 hours = float(self._cfg("side_pulse_recent_hours", 6) or 6)
                 is_today = day == datetime.datetime.now(
@@ -1474,7 +1348,7 @@ class FamilyPulseMixin:
             from astrbot.core.message.message_event_result import MessageChain
 
             await self.context.send_message(umo, MessageChain([Plain(msg)]))
-            _logger.info("[side_pulse] 唤即看: 顾主回看 %s（%d 条）", day, len(logs))
+            _logger.info("[side_pulse] 唤即看: 用户回看 %s（%d 条）", day, len(logs))
             return True
         except Exception as e:  # noqa: BLE001
             _logger.warning("[side_pulse] 唤即看失败(静默): %s", e)
@@ -1507,11 +1381,11 @@ class FamilyPulseMixin:
             name=PULSE_DIGEST_JOB,
             cron_expression=digest_cron,
             handler=self.side_pulse_digest,
-            description="旁路模块每日摘要推送给顾主",
+            description="旁路模块每日摘要推送给用户",
             timezone="Asia/Shanghai",
         )
         self._pulse_job_ids = [getattr(j2, "job_id", None)]
-        # 2026-09-05 顾主改版：心跳从「每小时 17 分」cron 换成作息式自管循环
+        # 2026-09-05 用户改版：心跳从「每小时 17 分」cron 换成作息式自管循环
         # （活跃窗 06:17→次日01:00 CST，窗内每 2h 区间随机跳一次，任意分钟）。
         # tick cron 不再注册；旧 cron job 由上方 _pulse_clear_legacy 清掉。
         loop_task = getattr(self, "_pulse_loop_task", None)
@@ -1554,7 +1428,7 @@ class FamilyPulseMixin:
             t.cancel()
         self._pulse_loop_task = None
 
-    # ── 作息式心跳（2026-09-05 顾主改版） ──
+    # ── 作息式心跳（2026-09-05 用户改版） ──
     def _pulse_window(self, now) -> tuple:
         """心跳活跃窗（CST）：默认 06:17 → 次日 01:00，跨零点。
 
@@ -1610,7 +1484,7 @@ class FamilyPulseMixin:
     async def _pulse_loop(self) -> None:
         """作息式心跳循环：睡到区间随机点→跳一次→睡到下一区间随机点。
 
-        替代原「每小时 17 分」cron（2026-09-05 顾主拍板）：早上 6:17 开始
+        替代原「每小时 17 分」cron（2026-09-05 用户拍板）：早上 6:17 开始
         活跃，凌晨 1 点结束，期间每两小时区间随机心跳一次，更像人的日常
         作息。窗外静默；异常 60s 退避；插件卸载时被 cancel。
         """

@@ -125,7 +125,7 @@ class ForwardMixin:
             segments = [_thaw_fence(s) for s in segments]
             if not segments:
                 # 2026-09-05 修复：子代理返回空串（如 livingmemory 无记忆 + LLM 空输出）
-                # 时此前静默跳过，顾主端「Completed 但收不到」。改为发一条兜底提示。
+                # 时此前静默跳过，用户端「Completed 但收不到」。改为发一条兜底提示。
                 await self.context.send_message(
                     event.unified_msg_origin,
                     MessageChain([Plain("（她沉默了一会儿，没说出话来）")]),
@@ -358,7 +358,7 @@ class ForwardMixin:
         prev_type = None
         for seg_type, seg in merged:
             if prev_type is not None:
-                # [2026-08-29 顾主定规] markdown 渲染消息内每个分段之间无条件插分割线,
+                # [2026-08-29 用户定规] markdown 渲染消息内每个分段之间无条件插分割线,
                 # 不再限定类型变化处;同类型相邻段也插,看消息更整齐。纯文本消息不走本函数。
                 new_parts.append("---")
             new_parts.append(seg)
@@ -699,7 +699,7 @@ class ForwardMixin:
             if not messages:
                 return False
             total = len(messages)
-            # 进度前缀（2026-08-27 起默认关）：顾主嫌 ▍续 N/M 打头傻。
+            # 进度前缀（2026-08-27 起默认关）：用户嫌 ▍续 N/M 打头傻。
             # 配置 mainagent_md_split_progress=True 可恢复旧行为。
             if self.config.get("mainagent_md_split_progress", False):
                 for i in range(1, total):
@@ -771,7 +771,7 @@ class ForwardMixin:
                 return True
             self._inject_section_dividers(result, full_text)
             return False
-        # [2026-08-20 01:46 重写] 分段规则（顾主定稿）：按行扫描，横线行即分段信号——
+        # [2026-08-20 01:46 重写] 分段规则（用户定稿）：按行扫描，横线行即分段信号——
         # 单行横线=软分隔（并入当前段，两句不拆，横线保留为普通文本）；
         # 连续两行及以上横线=硬分隔（当前段落盘，横线丢弃，前后拆开）。
         # 无横线行时退回按空行分段（原逻辑）。
@@ -918,7 +918,7 @@ class ForwardMixin:
         return self.AGENT_DISPLAY_NAME.get(agent_name, agent_name)
 
     def _resolve_agent_name(self, agent_name: str) -> str:
-        """规范化子代理名称：兼容中文名（助手A->agent_a）和大小写（助手->agent_a）。
+        """规范化子代理名称：兼容中文名（中文名->英文 id）和大小写（大写->小写）。
 
         优先级：中文显示名反查（硬编码 AGENT_NAME_REVERSE + name_display_map 配置）
         > 小写归一。找不到则返回小写后的原名（由调用方报错兜底）。

@@ -105,7 +105,7 @@ class MemoryMixin:
             pass
         return livingmemory_plugin
 
-    # ── livingmemory 防腐层（2026-09-10 顾主拍板）──────────
+    # ── livingmemory 防腐层（2026-09-10 用户拍板）──────────
     def _lm_bridge(self, livingmemory_plugin):
         """取（或复用）livingmemory 能力适配器，收敛全部私有路径访问。
 
@@ -180,10 +180,10 @@ class MemoryMixin:
                         f"[parallel_handoff] {agent_name} 记忆召回为空"
                         f"（插件就绪，无匹配记忆）"
                     )
-                # 2026-09-04 方案 A（顾主拍板）：顾主私聊直问子代理时并入旁轨会话记忆。
+                # 2026-09-04 方案 A（用户拍板）：用户私聊直问子代理时并入旁轨会话记忆。
                 # 旁轨记忆落在 side_pulse:FriendMessage:subagents 会话 + agent persona
-                # 维度，顾主私聊会话召回查不到（livingmemory 按 session+persona 双条件
-                # 过滤），导致「问助手A今天家里聊了什么」她说不记得。此处用旁轨桩
+                # 维度，用户私聊会话召回查不到（livingmemory 按 session+persona 双条件
+                # 过滤），导致「问某子代理今天家里聊了什么」她说不记得。此处用旁轨桩
                 # 再造一次召回，把家里的记忆也带给子代理；旁轨心跳链路本身已是旁轨
                 # 会话，自动跳过不重复。
                 parts = await self._merge_pulse_memory_recall(
@@ -198,7 +198,7 @@ class MemoryMixin:
                 return []
         return []
 
-    # ── 旁轨家常并入（2026-09-04 方案 A → 2026-09-05 顾主改版：只抓最近 6 小时） ──
+    # ── 旁轨家常并入（2026-09-04 方案 A → 2026-09-05 用户改版：只抓最近 6 小时） ──
     async def _merge_pulse_memory_recall(
         self,
         parts: list,
@@ -207,11 +207,11 @@ class MemoryMixin:
         clean_input: str,
         livingmemory_plugin,
     ) -> list:
-        """顾主私聊直问子代理时，并入「最近 N 小时家里动静」（jsonl 滑动窗口）。
+        """用户私聊直问子代理时，并入「最近 N 小时家里动静」（jsonl 滑动窗口）。
 
-        2026-09-05 顾主改版：方案 A 原实现并入 livingmemory 旁轨会话的长期
+        2026-09-05 用户改版：方案 A 原实现并入 livingmemory 旁轨会话的长期
         记忆，从上线起几天累积下来，每次问都把几天历史全部堆进上下文，
-        非常难看。顾主拍板改成只抓最近 6 小时的闲聊：家里动静的权威来源
+        非常难看。用户拍板改成只抓最近 6 小时的闲聊：家里动静的权威来源
         是旁轨 jsonl（心跳对话原文），按滑动时间窗过滤后注入；更早的生活
         线由子代理自己的 recall_long_term_memory 工具按需查询（记忆工具
         仍在手上），不再自动堆叠历史。
@@ -221,7 +221,7 @@ class MemoryMixin:
         任何失败静默降级，不影响主召回。
         """
         try:
-            # 2026-09-12 顾主指令：旁轨已关（enable_side_pulse=False），
+            # 2026-09-12 用户指令：旁轨已关（enable_side_pulse=False），
             # 旁轨记忆不再自动注入子代理上下文（查看链路保留，按需自取）。
             if not self._cfg("enable_side_pulse", False):
                 return parts
@@ -246,11 +246,11 @@ class MemoryMixin:
             )
             return parts
 
-    # ── 旁轨近窗家常注入（2026-09-05 顾主改版：滑动时间窗，默认 6 小时） ──
+    # ── 旁轨近窗家常注入（2026-09-05 用户改版：滑动时间窗，默认 6 小时） ──
     def _pulse_log_fallback(self, agent_name: str, max_lines: int = 15) -> list:
         """「家里动静」查看链路的注入源：旁轨 jsonl 按最近 N 小时窗口过滤。
 
-        2026-09-05 顾主改版：原来取「当天全部最近 max_lines 句」，一天下来
+        2026-09-05 用户改版：原来取「当天全部最近 max_lines 句」，一天下来
         从早到晚全堆进上下文；现在只取最近 side_pulse_recent_hours
         （默认 6）小时内的家常。ts 为当天 "HH:MM"，窗口跨零点时 jsonl
         只有当天文件、无法回溯昨日，退化为取当天零点后全部再截尾。
@@ -292,7 +292,7 @@ class MemoryMixin:
                 text = (r.get("text") or "").strip()
                 if not text:
                     continue
-                # 2026-09-05 过滤：顾主贴来的日志块（如带 [Core]/[INFO] 的系统日志）
+                # 2026-09-05 过滤：用户贴来的日志块（如带 [Core]/[INFO] 的系统日志）
                 # 会被 _pulse_append 原样写进旁轨日志，不适合当「家里聊了什么」注入
                 if text.startswith("[20") and (
                     "[Core]" in text or "[INFO]" in text or "core.event_bus" in text
@@ -329,11 +329,11 @@ class MemoryMixin:
     # ── 构建子代理工具集（记忆工具过滤） ──
     # 子代理工具白名单默认值。
     # 2026-09-11 先只给「读」的手，写权留在主代理；
-    # 2026-09-12 顾主拍板取消只读 —— 默认集补齐文件读写、语法/测试门禁与本地 git，
+    # 2026-09-12 用户拍板取消只读 —— 默认集补齐文件读写、语法/测试门禁与本地 git，
     # 子代理不再只是「伸手看一眼」（配合 dispatch 的 tool_loop_agent 才真正可执行）。
     # 配置键优先 subagent_tools，兼容旧键 subagent_readonly_tools；留空回落本默认集。
     # 高风险工具（shell_exec / astrbot_execute_shell / hot_reload_plugin / git_push /
-    # gh_*）刻意不进默认集，需顾主单独授权后再写进白名单。
+    # gh_*）刻意不进默认集，需用户单独授权后再写进白名单。
     _SUBAGENT_TOOL_NAMES_DEFAULT = (
         # 读
         "safe_read", "dir_list", "dir_tree", "es_search", "rg_search",
@@ -434,7 +434,7 @@ class MemoryMixin:
             _subagent_persona=agent_name,  # get_persona_id 优先级 0，按子代理隔离
         )
         stub.get_message_str = lambda: "subagent_memory"
-        # 2026-09-12 双写修复（顾主拍板）：原先返回 1（非群聊），会触发
+        # 2026-09-12 双写修复（用户拍板）：原先返回 1（非群聊），会触发
         # livingmemory handle_memory_recall 的副作用存储
         #（memory_recall.py L140-155「存储用户消息（仅私聊），无论是否启用召回」），
         # 与本插件 _memory_store 的显式存储叠加 → 子代理会话 user 消息被存两遍
@@ -457,19 +457,22 @@ class MemoryMixin:
 
         2026-09-05 修：_maybe_reflect_subagent 的 process_conversation
         (persona_id=...) 只用于取提炼 prompt 的人格底色，原样传英文 id
-        （shu/agent_d…）在 personas 表（中文名：黍/助手D…）查不到，每小时
+        （英文 id）在 personas 表（按中文名登记）查不到，每小时
         心跳提炼都 WARN 一条并退化 base_prompt。存储维度（classify_atoms
         的 persona_id）保持英文 id 与召回侧 _subagent_persona 一致，
         不经过本函数，防止记忆库 persona 维度分裂。
-        助手C的人格在库中登记为「助手C-子代理」，特例映射。
+        个别子代理的人格在库中按「名字-子代理」后缀登记，需特例映射（见下）。
         查不到映射时原样返回（行为与旧版一致，仅可能仍有 WARN）。
         """
         try:
-            disp = (self._get_name_display_map() or {}).get(agent_name) or agent_name
+            _map = self._get_name_display_map() or {}
+            disp = _map.get(agent_name) or agent_name
+            _ts = _map.get("agent_c")
         except Exception:
             disp = agent_name
-        if disp == "助手C":
-            disp = "助手C-子代理"
+            _ts = None
+        if _ts and disp == _ts:
+            disp = f"{_ts}-子代理"
         return disp
 
     async def _maybe_reflect_subagent(
@@ -601,9 +604,9 @@ class MemoryMixin:
     ):
         """将本轮 user/assistant 消息写入 livingmemory 对话管理器并做消息数限制。
 
-        2026-09-05 记忆串库修复：此前直接用顾主私聊 event 写历史——
+        2026-09-05 记忆串库修复：此前直接用用户私聊 event 写历史——
         子代理消息混进主代理会话，livingmemory Reflection 总结主会话时
-        把她们的话一并提炼进主代理记忆库（顾主观察到「记忆都落给了
+        把子代理的话一并提炼进主代理记忆库（用户观察到「记忆都落给了
         主代理」的根因）；且子代理专属会话无人触发提炼，长期记忆恒空。
         现改用「{原会话}:subagent:{agent}」专属会话桩存储，写完即检查
         阈值、按子代理 persona 主动提炼长期记忆。
