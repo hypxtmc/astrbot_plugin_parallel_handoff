@@ -948,7 +948,7 @@ Args:
             calls = []
 
         # ── 场景注入前缀（scene.py） ──────────
-        scene_prefix = self._build_scene_prefix(event, enable_scene_inject)
+        scene_prefix = await self._build_scene_prefix(event, enable_scene_inject)
 
         # ── 长期记忆插件查找（memory.py） ────────────────────
         livingmemory_plugin = self._find_livingmemory_plugin()
