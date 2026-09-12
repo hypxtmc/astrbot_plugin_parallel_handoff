@@ -58,6 +58,30 @@ sys.modules["astrbot.api.event.filter"] = _fake_event_filter
 sys.modules["astrbot.api.star"] = _fake_star
 sys.modules["astrbot.api.provider"] = _fake_api.provider
 
+# [2026-09-13] memory.py 顶层有 `from astrbot.api.platform import MessageType`
+# （v2.10 起存在）；桩缺 platform 层会让 _load_plugin_class 整链失败。
+# [2026-09-13 隔离修复] 与真环境混跑时（如 pytest 同进程里 test_lm_bridge.py
+# 先执行、真 astrbot + 真 memory 已入 sys.modules），插件模块绑定的是真
+# MessageType 枚举，若此处仍注入字符串桩，测试侧断言会以
+# 「真枚举 != 'GROUP_MESSAGE'」误挂 2 条——故先探测真模块，探测到则直接
+# 复用真枚举类，保证"测试断言侧"与"插件模块侧"同源；纯桩环境维持字符串桩。
+_fake_platform = MagicMock()
+_real_mt = None
+_mod = sys.modules.get("astrbot.core.platform.message_type")
+if _mod is not None and hasattr(_mod, "MessageType"):
+    _real_mt = _mod.MessageType
+else:
+    _mod2 = sys.modules.get("astrbot.api.platform")
+    if _mod2 is not None and not isinstance(_mod2, MagicMock) and hasattr(_mod2, "MessageType"):
+        _real_mt = _mod2.MessageType
+if _real_mt is not None:
+    _fake_platform.MessageType = _real_mt
+else:
+    _fake_platform.MessageType = MagicMock()
+    _fake_platform.MessageType.GROUP_MESSAGE = "GROUP_MESSAGE"
+    _fake_platform.MessageType.FRIEND_MESSAGE = "FRIEND_MESSAGE"
+sys.modules["astrbot.api.platform"] = _fake_platform
+
 _fake_core = MagicMock()
 _fake_core.agent = MagicMock()
 _fake_core.agent.tool = MagicMock()
@@ -1769,7 +1793,7 @@ class TestContextEngine:
         import asyncio
         from ctx_engine import ContextEngine
 
-        eng = ContextEngine(enabled=True, max_turns=5, keep_recent=5)
+        eng = ContextEngine(enabled=True, max_turns=5)
         # 存储一轮对话
         eng.append("amiya", "sess1", "你好", "你好呀博士")
         hist = eng.histories.get("amiya:sess1")
@@ -1813,12 +1837,12 @@ class TestContextEngine:
         assert ctx2[0] is ctx1[0]
         assert ctx2[1] is ctx1[1]
 
-    def test_compress_fallback_without_llm(self):
+    def test_truncate_by_turns(self):
+        """max_turns=1：超过窗口即纯截断——只保留最近 1 轮（2 条），不抛不报"""
         import asyncio
         from ctx_engine import ContextEngine
 
-        # max_turns=1：第2轮起触发截断；未绑定 llm → 纯截断降级，不抛
-        eng = ContextEngine(enabled=True, max_turns=1, keep_recent=1, llm_generate=None)
+        eng = ContextEngine(enabled=True, max_turns=1)
         for i in range(3):
             eng.append("theresia", "s9", f"问{i}", f"答{i}")
         prompt, contexts = asyncio.run(eng.inject("theresia", "s9", "继续"))
@@ -1827,7 +1851,6 @@ class TestContextEngine:
         assert prompt == "继续"
         # 截断后留下的是最近一轮（内容正确性看存储侧）
         assert eng.histories["theresia:s9"][-2]["content"] == "问2"
-        assert "历史摘要" not in eng._format(contexts and eng.histories["theresia:s9"])
 
     def test_disabled_noop(self):
         import asyncio
@@ -4688,6 +4711,71 @@ class TestCmdLockHardGroup(unittest.TestCase):
         self.assertIn("已锁定", text)
         self.assertIn("主代理", text)
 
+    def test_agent_lock_receipt_text(self):
+        """[命令锁回执 2026-09-13 博士实测 bug] lock_agents 回执含「已锁定」标识
+        与中文显示名（对齐 lock_main 柜台文案）。"""
+        p = self._fresh()
+        ev = MagicMock()
+        ev.unified_msg_origin = "sess-agent-receipt"
+        p._record_cmd_lock(ev, ["closure"])
+        text = p._admin_reply_text(ev, "lock_agents")
+        self.assertIn("已锁定", text)
+        self.assertIn("可露希尔", text)
+
+    def test_smart_agent_lock_receipt_and_no_call(self):
+        """[命令锁回执 2026-09-13 博士实测 bug] smart 端 /名字 强锁：
+        回执 + 建锁 + 短路，不再把命令消息直接调用子代理（旧行为触发其直接回复）。"""
+        import asyncio as _aio
+        from unittest.mock import AsyncMock, patch as _patch
+        p = self._fresh()
+        ev = MagicMock()
+        ev.unified_msg_origin = "sess-cmd-receipt"
+        ev.get_message_str.return_value = "/可露希尔"
+        ev.is_at_or_wake_command = True
+        with _patch.object(type(p), "_resolve_command_text", return_value="/可露希尔"), \
+             _patch.object(type(p), "_parse_agent_command", return_value=(["closure"], False)), \
+             _patch.object(type(p), "_router_enabled", return_value=True), \
+             _patch.object(type(p), "_record_user_msg"), \
+             _patch.object(type(p), "_dedup_shortcircuit", return_value=False), \
+             _patch.object(type(p), "parallel_handoff", new=AsyncMock()) as m_ph, \
+             _patch.object(type(p), "_send_admin_reply", new=AsyncMock()) as m_reply:
+            res = _aio.run(p._smart_router_check(ev))
+        self.assertTrue(res)
+        m_ph.assert_not_called()               # 不再直接调用子代理
+        m_reply.assert_called_once()           # 回执已发
+        self.assertEqual(m_reply.call_args.args[1], "lock_agents")
+        ev.stop_event.assert_called_once()
+        self.assertEqual(p._cmd_locked_group(ev), ["closure"])   # 锁已建立
+
+    def test_busy_agent_lock_receipt_and_no_call(self):
+        """[命令锁回执 2026-09-13 博士实测 bug] busy 端 /名字 强锁同款：
+        回执 + 建锁 + 短路，不再把命令消息直接直发子代理。"""
+        import asyncio as _aio
+        import router as router_mod
+        from unittest.mock import AsyncMock, patch as _patch
+        p = self._fresh()
+        old_runners = getattr(router_mod, "_ACTIVE_AGENT_RUNNERS", None)
+        router_mod._ACTIVE_AGENT_RUNNERS = {"sess-busy-receipt": object()}
+        try:
+            ev = MagicMock()
+            ev.unified_msg_origin = "sess-busy-receipt"
+            ev.get_message_str.return_value = "/可露希尔"
+            ev.is_at_or_wake_command = True
+            with _patch.object(type(p), "_resolve_command_text", return_value="/可露希尔"), \
+                 _patch.object(type(p), "_parse_agent_command", return_value=(["closure"], False)), \
+                 _patch.object(type(p), "_router_enabled", return_value=True), \
+                 _patch.object(type(p), "parallel_handoff", new=AsyncMock()) as m_ph, \
+                 _patch.object(type(p), "_send_admin_reply", new=AsyncMock()) as m_reply:
+                res = _aio.run(p._busy_bypass_check(ev))
+            self.assertTrue(res)
+            m_ph.assert_not_called()
+            m_reply.assert_called_once()
+            self.assertEqual(m_reply.call_args.args[1], "lock_agents")
+            ev.stop_event.assert_called_once()
+            self.assertEqual(p._cmd_locked_group(ev), ["closure"])
+        finally:
+            router_mod._ACTIVE_AGENT_RUNNERS = old_runners
+
     def test_main_lock_wake_rewrite_not_treated_as_command(self):
         """[2026-09-12 21:25 治本] 唤醒重写的斜杠普通消息（/你和可露希尔...）
         必须被识别为「非真命令」——否则主代理锁会把它当命令放行，
@@ -4896,7 +4984,7 @@ class TestSwitchLockOnNewMention(unittest.TestCase):
 
 
 class TestSubagentToolWhitelistConfig(unittest.TestCase):
-    """2026-09-11：工具白名单抽成配置项；2026-09-12 博士拍板取消只读，默认集含写工具"""
+    """2026-09-11：工具白名单抽成配置项；2026-09-12 取消只读；2026-09-13 收权——只读档（只读+网页搜索）"""
 
     @classmethod
     def setUpClass(cls):
@@ -4909,19 +4997,23 @@ class TestSubagentToolWhitelistConfig(unittest.TestCase):
         return self.PluginClass(context=mock_context, config=cfg)
 
     def test_default_when_config_empty(self):
-        """配置留空 → 回落内置默认 37 项（读写档）"""
+        """配置留空 → 回落内置默认 26 项（只读档：只读 + 网页搜索）"""
         p = self._plugin({})
         names = p._subagent_tool_names()
         self.assertEqual(names, p._SUBAGENT_TOOL_NAMES_DEFAULT)
-        self.assertEqual(len(names), 37)
+        self.assertEqual(len(names), 26)
         self.assertIn("safe_read", names)
-        # 2026-09-12 取消只读：默认集必须含写工具与门禁工具
-        self.assertIn("safe_edit", names)
-        self.assertIn("multi_edit", names)
-        self.assertIn("safe_write", names)
-        self.assertIn("file_patch", names)
-        self.assertIn("test_runner", names)
-        # 高风险工具不进默认集
+        self.assertIn("web_search", names)
+        # 2026-09-13 收权：默认集不得含写/执行类工具
+        self.assertNotIn("safe_edit", names)
+        self.assertNotIn("multi_edit", names)
+        self.assertNotIn("safe_write", names)
+        self.assertNotIn("file_patch", names)
+        self.assertNotIn("file_remove", names)
+        self.assertNotIn("test_runner", names)
+        self.assertNotIn("git_commit", names)
+        self.assertNotIn("code_index", names)
+        # 高风险工具同样不进默认集
         self.assertNotIn("shell_exec", names)
         self.assertNotIn("astrbot_execute_shell", names)
         self.assertNotIn("hot_reload_plugin", names)
@@ -5436,6 +5528,126 @@ class TestAuditBlindSpots(unittest.TestCase):
         bot.call_action = call_action
         ev.bot = bot
         return ev
+
+    # ── ⑤e [2026-09-13] 关系注入修复 + 缓存稳定性（进 system 稳定层）──
+    @staticmethod
+    def _handoff(instructions):
+        agent = type("Agent", (), {"instructions": instructions})()
+        return type("Handoff", (), {"agent": agent})()
+
+    def _write_rel(self, rel):
+        with open(os.path.join(self._tmp, "relationships.json"), "w", encoding="utf-8") as f:
+            json.dump(rel, f, ensure_ascii=False)
+
+    def test_rel_inject_english_id_hits_chinese_keys(self):
+        """⑤e-1 真实口径：英文 id（amiya）必须命中中文 key，含对方名/亲密度/基调。"""
+        p = self._make_plugin()
+        p._relationship_root = self._tmp
+        self._write_rel(
+            {
+                "relationship_edges": {
+                    "阿米娅<->特蕾西娅": {
+                        "type": "传承师徒/知心姐妹",
+                        "双向": "阿米娅: 敬她依赖她; 特蕾西娅: 温言护她长大",
+                    }
+                },
+                "relationship_state": {
+                    "阿米娅<->特蕾西娅": {
+                        "亲密度": 95,
+                        "基调": "敬+依恋",
+                        "最近互动": "刚重逢",
+                    }
+                },
+                "family_roles": {},
+            }
+        )
+        out = p._relationship_inject("amiya", "")
+        self.assertIn("【家庭关系】", out)
+        self.assertIn("特蕾西娅", out)
+        self.assertIn("95", out)
+        self.assertIn("敬+依恋", out)
+        self.assertIn("敬她依赖她", out)
+
+    def test_rel_inject_state_sorted_by_intimacy(self):
+        """⑤e-2 近况按亲密度降序（95 在 90 前），排序确定。"""
+        p = self._make_plugin()
+        p._relationship_root = self._tmp
+        self._write_rel(
+            {
+                "relationship_edges": {
+                    "阿米娅<->凯尔希": {"type": "师生", "双向": "阿米娅: 信赖; 凯尔希: 守护"}
+                },
+                "relationship_state": {
+                    "M3<->阿米娅": {"亲密度": 90, "基调": "守护"},
+                    "阿米娅<->特蕾西娅": {"亲密度": 95, "基调": "敬+依恋"},
+                },
+                "family_roles": {},
+            }
+        )
+        out = p._relationship_inject("amiya", "")
+        state_part = out.split("【家里的近况】")[-1]
+        self.assertLess(state_part.index("特蕾西娅"), state_part.index("M3"))
+
+    def test_rel_inject_deterministic_for_cache(self):
+        """⑤e-3 缓存铁律：同一文件下两次组装逐字节相同。"""
+        p = self._make_plugin()
+        p._relationship_root = self._tmp
+        self._write_rel(
+            {
+                "relationship_edges": {
+                    "阿米娅<->特蕾西娅": {"type": "姐妹", "双向": "阿米娅: 敬她; 特蕾西娅: 护她"}
+                },
+                "relationship_state": {"阿米娅<->特蕾西娅": {"亲密度": 95, "基调": "敬+依恋"}},
+                "family_roles": {},
+            }
+        )
+        a = p._relationship_inject("amiya", "")
+        b = p._relationship_inject("amiya", "")
+        self.assertTrue(a)
+        self.assertEqual(a, b)
+
+    def test_system_prompt_carries_relation_block(self):
+        """⑤e-4 system 稳定层携带关系档案：人格在前，纪律仍在。"""
+        p = self._make_plugin()
+        p._relationship_root = self._tmp
+        self._write_rel(
+            {
+                "relationship_edges": {
+                    "阿米娅<->特蕾西娅": {"type": "姐妹", "双向": "阿米娅: 敬她; 特蕾西娅: 护她"}
+                },
+                "relationship_state": {},
+                "family_roles": {},
+            }
+        )
+        out = p._subagent_system_prompt(self._handoff("你是阿米娅"), "amiya")
+        self.assertTrue(out.startswith("你是阿米娅"))
+        self.assertIn("【家庭关系】", out)
+        self.assertIn("特蕾西娅", out)
+        self.assertIn("工具检索纪律", out)
+
+    def test_system_prompt_stable_across_calls(self):
+        """⑤e-5 缓存铁律：同 agent 两次 system prompt 逐字节相同。"""
+        p = self._make_plugin()
+        p._relationship_root = self._tmp
+        self._write_rel(
+            {
+                "relationship_edges": {
+                    "阿米娅<->特蕾西娅": {"type": "姐妹", "双向": "阿米娅: 敬她; 特蕾西娅: 护她"}
+                },
+                "relationship_state": {"阿米娅<->特蕾西娅": {"亲密度": 95, "基调": "敬+依恋"}},
+                "family_roles": {"阿米娅": {"定位": "王女", "角色": "女儿"}},
+            }
+        )
+        a = p._subagent_system_prompt(self._handoff("你是阿米娅"), "amiya")
+        b = p._subagent_system_prompt(self._handoff("你是阿米娅"), "amiya")
+        self.assertEqual(a, b)
+
+    def test_system_prompt_no_name_skips_relation(self):
+        """⑤e-6 向后兼容：不传 agent_name 时无关系段（旧调用不受影响）。"""
+        p = self._make_plugin()
+        out = p._subagent_system_prompt(self._handoff("你是老调用"))
+        self.assertTrue(out.startswith("你是老调用"))
+        self.assertNotIn("【家庭关系】", out)
 
     def test_scene_identity_timeout_degrades_no_cache(self):
         """⑥a 超时：4s 超时降级返回空串、不抛、耗时 <6s、不写缓存。"""

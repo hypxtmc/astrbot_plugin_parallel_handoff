@@ -115,7 +115,7 @@ def _save_main_lock_file(lock: dict) -> None:
 
 _ROUTER_TABLES = _load_router_tables()
 # [发布泛化 2026-09-12 用户指定] "主代理"是全体部署者通用的强锁入口词，不依赖
-# 各自部署的主代理名（如"普瑞赛斯"）；两者并存，重复去重。别的用户装插件直接用
+# 各自部署的主代理名（如"小助手"）；两者并存，重复去重。别的用户装插件直接用
 # /主代理 即可建锁，无需知道部署者的主代理叫什么。
 _GENERIC_MAIN_TOKENS = ("主代理", "主agent")
 _MAIN_TOKEN_SET = tuple(
@@ -447,6 +447,18 @@ class RouterMixin:
                 "（消息直通主代理，提子代理名也不会切 · 换人：/名字 · 放开：/复位）"
             )
 
+        if cmd == "lock_agents":
+            # [命令锁回执 2026-09-13 博士要求] /名字 强锁明确回报已锁定，
+            # 而不是默默把命令消息落进子代理触发其直接回复（对齐 lock_main 柜台行为）。
+            locked = []
+            if getattr(self, "_cmd_lock", None):
+                locked = [a for a in self._cmd_lock.get(event.unified_msg_origin, {})]
+            names = " + ".join(_cn(a) for a in locked) if locked else "（未记录）"
+            return (
+                f"🔒 已锁定：{names}\n"
+                f"（消息直通{names}，提其他子代理名也不会切 · 换人：/名字 · 放开：/复位）"
+            )
+
         pool = self._router_agent_pool()
         names = " · ".join(_cn(a) for a in pool)
         return f"📋 可点名：{names}\n（发 /名字 直接锁定）"
@@ -732,7 +744,7 @@ class RouterMixin:
 
         动机（2026-09-12 博士反馈）：消息里提到子代理名（如「叫个子代理一起
         陪你看 bug」）会被 T1 抢走路由——用户明明是在对主代理说话。
-        /主代理（或 /普瑞赛斯）一经建立，整个会话直通主代理；
+        /主代理（或部署者自己的主代理名）一经建立，整个会话直通主代理；
         仅新命令（/子代理名）或 /复位 能解除。与子代理命令锁互斥。
         """
         lock = self._main_lock_data()
@@ -762,7 +774,7 @@ class RouterMixin:
         """锁仲裁用：raw_message 是否「真命令」——带 / 且能解析出已知目标。
 
         [2026-09-12 21:25 根因修复] 唤醒层会把「被唤醒消息」重写为 '/原文'
-        （"你和可露希尔..." → "/你和可露希尔..."）。此时 startswith("/") 为真、
+        （"你和某某..." → "/你和某某..."）。此时 startswith("/") 为真、
         但解析不出任何已知代理/管理命令——那是被重写的普通消息，对主代理锁
         必须按「非命令」处理（直通主代理），否则消息会被 T0/T1 扫出子代理名
         路由走（21:06 实测 bug：锁在场仍被转给 closure）。
@@ -1176,24 +1188,12 @@ class RouterMixin:
         # 主代理正干活时，/黍、/黍+年 等显式命令仍锁定并短路，不被 follow-up 吞。
         cmd_agents, cmd_presis = self._parse_agent_command(raw_message)
         if cmd_agents and not cmd_presis:
+            # [命令锁回执 2026-09-13 博士要求] 同 smart 端：回执「🔒 已锁定：xxx」
+            # + 建锁 + 短路，不再把命令消息直接转给子代理（旧行为触发其直接回复）。
             logger.info(
                 f"[parallel_handoff] BusyBypass: T0 命令式 {cmd_agents} → "
-                f"锁定并短路（runner active 同样生效）"
+                f"建立命令锁，回执并短路（runner active 同样生效）"
             )
-            calls = [{"agent_name": a, "input": message} for a in cmd_agents]
-            try:
-                await self.parallel_handoff(
-                    event,
-                    calls=calls,
-                    call_mode="chained" if len(calls) > 1 else "direct",
-                    route_mode="direct",
-                    mode="affection",
-                )
-            except Exception as e:
-                logger.error(
-                    f"[parallel_handoff] BusyBypass: T0 命令式调用失败 {e}; release to main"
-                )
-                return False
             # [审查修复 2026-09-12] 仅覆盖当前会话旧命令锁（原为全局重置，
             # 多会话场景会抹掉其他会话的锁）；换人命令同时解除主代理锁
             # （对齐 docstring「新命令（/子代理名）能解除」——否则残锁换人换不出去）。
@@ -1201,6 +1201,7 @@ class RouterMixin:
                 self._cmd_lock.pop(event.unified_msg_origin, None)
             self._record_cmd_lock(event, cmd_agents)
             self._clear_main_lock(event)
+            await self._send_admin_reply(event, "lock_agents")
             event.stop_event()
             return True
         # 含主代理的命令（busy 时主代理在场优先；纯主代理建锁+回执短路，20:57 强化）
@@ -1418,26 +1419,14 @@ class RouterMixin:
         cmd_agents, cmd_presis = self._parse_agent_command(raw_message)
         if cmd_agents or cmd_presis:
             if cmd_agents and not cmd_presis:
-                # 纯子代理命令：短路调度（单人或多人 chained），并写命令强制锁。
-                # 命令锁后续消息永远锁定这组，对话里出现其他子代理名也不切换（治本）。
+                # [命令锁回执 2026-09-13 博士要求] /名字 强锁改柜台式：
+                # 回执「🔒 已锁定：xxx」+ 建锁 + 短路，对齐 /主代理 行为。
+                # 旧行为「锁定并短路」会把命令消息直接转给子代理、触发其直接回复
+                # （博士实测：没有锁定标识、命令被当对话落进子代理——严重 bug）。
                 logger.info(
                     f"[parallel_handoff] SmartRouter: T0 命令式 {cmd_agents} → "
-                    f"锁定并短路（跳过 T1/T0.5/T2）"
+                    f"建立命令锁，回执并短路（不再直接调用子代理）"
                 )
-                calls = [{"agent_name": a, "input": message} for a in cmd_agents]
-                try:
-                    await self.parallel_handoff(
-                        event,
-                        calls=calls,
-                        call_mode="chained" if len(calls) > 1 else "direct",
-                        route_mode="direct",
-                        mode="affection",
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"[parallel_handoff] SmartRouter: T0 命令式调用失败 {e}; release to main"
-                    )
-                    return False
                 # 写命令强制锁（覆盖该会话旧命令锁，不动其他会话——审查修复 2026-09-12）
                 # → 此后 messages 按锁组强制路由
                 if getattr(self, "_cmd_lock", None):
@@ -1445,6 +1434,7 @@ class RouterMixin:
                 self._record_cmd_lock(event, cmd_agents)
                 # [审查修复] 换人命令即解除主代理锁（对齐 docstring 语义）
                 self._clear_main_lock(event)
+                await self._send_admin_reply(event, "lock_agents")
                 event.stop_event()
                 return True
             # 含主代理（/主代理 或 /主代理+张三）：主代理在场。
@@ -1464,7 +1454,7 @@ class RouterMixin:
                 self._record_route_suggestions(cmd_agents)
             else:
                 # [主代理锁 2026-09-12 用户指定；回执强化 20:57 博士要求]
-                # 纯 /主代理（/普瑞赛斯）→ 建立会话级主代理锁 + 回执并短路，
+                # 纯 /主代理（或部署者主代理名）→ 建立会话级主代理锁 + 回执并短路，
                 # 与 /谁在 同款柜台行为：明确回报「已锁定」，不再默默放行让消息
                 # 落进主代理 LLM（博士原话：要报出已锁定 xxx 的标识消息）。
                 logger.info(
