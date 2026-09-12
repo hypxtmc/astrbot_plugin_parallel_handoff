@@ -1,4 +1,4 @@
-"""test_lm_bridge.py — livingmemory 私有路径防腐层测试（2026-09-10 博士拍板）
+"""test_lm_bridge.py — livingmemory 私有路径防腐层测试（2026-09-10 老师拍板）
 
 覆盖：
   1) dig 安全下钻
@@ -279,15 +279,15 @@ def test_memory_store_via_bridge():
     m, event, lm, cm, me, added, enforce_calls = _make_fixture(
         count=40, last=0, threshold=10
     )
-    asyncio.run(m._memory_store(lm, event, "amiya", "本轮输入", "本轮回复"))
+    asyncio.run(m._memory_store(lm, event, "nova", "本轮输入", "本轮回复"))
 
     assert [row[1] for row in cm.added] == ["user", "assistant"]
     assert cm.added[0][2] == "本轮输入"
-    assert cm.added[0][0] == "s1:FriendMessage:u1:subagent:amiya"
-    assert enforce_calls == ["s1:FriendMessage:u1:subagent:amiya"]
+    assert cm.added[0][0] == "s1:FriendMessage:u1:subagent:nova"
+    assert enforce_calls == ["s1:FriendMessage:u1:subagent:nova"]
     # 达阈值 → 提炼落库，persona 用子代理英文 id
     assert len(added) == 1
-    assert added[0]["persona_id"] == "amiya"
+    assert added[0]["persona_id"] == "nova"
     assert cm.meta["last_summarized_index"] == 40
 
 
@@ -298,7 +298,7 @@ def test_memory_store_message_utils_missing_still_reflects():
     )
     log = _RecLogger()
     lm.initializer = ts.SimpleNamespace(is_initialized=True, is_failed=False)
-    asyncio.run(m._memory_store(lm, event, "amiya", "本轮输入", "本轮回复"))
+    asyncio.run(m._memory_store(lm, event, "nova", "本轮输入", "本轮回复"))
 
     assert len(cm.added) == 2
     assert enforce_calls == []  # 限流跳过
@@ -310,6 +310,6 @@ def test_memory_store_conversation_manager_missing_no_crash():
     m, event, lm, cm, me, added, enforce_calls = _make_fixture()
     del lm.command_handler
     del lm.event_handler
-    asyncio.run(m._memory_store(lm, event, "amiya", "输入", "回复"))
+    asyncio.run(m._memory_store(lm, event, "nova", "输入", "回复"))
     assert cm.added == []
     assert added == []

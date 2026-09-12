@@ -124,20 +124,20 @@ class _Harness(DispatchMixin):
 class TestRunOneAsText:
     def test_success_wraps_dict_as_json(self):
         h = _Harness()
-        out = _run(h._run_one_as_text({"agent_name": "closure"}))
+        out = _run(h._run_one_as_text({"agent_name": "bell"}))
         data = json.loads(out)
         assert data["success"] is True
-        assert data["agent_name"] == "closure"
+        assert data["agent_name"] == "bell"
         assert data["response"] == "干活结果"
 
     def test_exception_becomes_json_not_traceback(self):
         """异常必须变成 JSON——否则 task_result 里只有一个空洞的错误。"""
         h = _Harness()
-        out = _run(h._run_one_as_text({"agent_name": "closure", "boom": True}))
+        out = _run(h._run_one_as_text({"agent_name": "bell", "boom": True}))
         data = json.loads(out)
         assert data["success"] is False
         assert "ValueError" in data["error"] and "炸了" in data["error"]
-        assert data["agent_name"] == "closure"
+        assert data["agent_name"] == "bell"
 
     def test_passes_kwargs_through(self):
         captured = {}
@@ -171,7 +171,7 @@ class TestTaskTools:
             async def slow():
                 await asyncio.sleep(5)
 
-            tid, _ = h._task_runner.submit("test_session", "closure", "慢", slow)
+            tid, _ = h._task_runner.submit("test_session", "bell", "慢", slow)
             data = json.loads(await h.task_status(_FakeEvent()))
             assert any(t["task_id"] == tid for t in data["active"])
             h._task_runner.stop(tid)
@@ -182,12 +182,12 @@ class TestTaskTools:
         async def main():
             h = _Harness(runner=TaskRunner())
             tid, _ = h._task_runner.submit(
-                "test_session", "closure", "快", lambda: _ok("x")
+                "test_session", "bell", "快", lambda: _ok("x")
             )
             await h._task_runner.wait(tid, timeout=5)
             data = json.loads(await h.task_status(_FakeEvent(), tid))
             assert data["status"] == "done"
-            assert data["agent"] == "closure"
+            assert data["agent"] == "bell"
 
         _run(main())
 
@@ -201,7 +201,7 @@ class TestTaskTools:
         async def main():
             h = _Harness(runner=TaskRunner())
             tid, _ = h._task_runner.submit(
-                "test_session", "closure", "x", lambda: _ok('{"a":1}')
+                "test_session", "bell", "x", lambda: _ok('{"a":1}')
             )
             data = json.loads(await h.task_result(_FakeEvent(), tid, timeout=5))
             assert data["status"] == "done"

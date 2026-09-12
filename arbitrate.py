@@ -259,8 +259,16 @@ class ArbitrationMixin:
         #      c1 恒为 0，条件永不成立。
         # 修法：提到 R2 之前独立判定 + 键名对齐 MAIN_SPEAKER。
         c_main = sum(1 for a in recent_agents if a == MAIN_SPEAKER)
-        c_kaltsit = sum(1 for a in recent_agents if a == "kaltsit" or a == self._display_name("kaltsit"))
-        if c_main >= 2 and c_kaltsit >= 2:
+        # 旧怨特例从配置读（arbitrate_old_grudge_agent，逗号分隔 id；默认空 =
+        # 该规则关闭）——部署方自行声明自家角色，代码侧不内置任何名单。
+        _grudge_raw = str(self._cfg("arbitrate_old_grudge_agent", "")).strip()
+        _grudge_ids = {a.strip().lower() for a in _grudge_raw.split(",") if a.strip()}
+        c_grudge = sum(
+            1
+            for a in recent_agents
+            if a in _grudge_ids or self._display_name(a).lower() in _grudge_ids
+        ) if _grudge_ids else 0
+        if c_main >= 2 and c_grudge >= 2:
             return True
         # R1 主代理刚回过话 → 倾向让主代理继续，别抢
         # [段五 2026-09-10 修复] R1 依赖 last_speaker == MAIN_SPEAKER，而旧代码里

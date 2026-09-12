@@ -506,7 +506,7 @@ class RouterMixin:
     # ── T1 规则层 ────────────────────────────────────────
     # 报错/日志/代码强特征：命中且整条无呼叫词（找/叫/让/喊…）→ 判定为技术文本，
     # 子代理名此时多为报错主体/路径/引用，不构成点名，直接放行 main/T2；
-    # 防止 "module 'theresia' not found" 这类把日志里的名字当呼叫乱路由
+    # 防止 "module 'xxx' not found" 这类把日志里的名字当呼叫乱路由
     _T1_ERR_RE = re.compile(
         r"(?:traceback|exception|error|failed|failure|report|warning|panic|crash|"
         r"stderr|stdout|报错|异常|超时|timeout|not\s+found|import\s+error|"
@@ -581,7 +581,7 @@ class RouterMixin:
             if len(name_s) >= 2:
                 # 多字名：前置边界只排字母数字——允许"叫李四""找张三"；
                 # 防叙述交给语境判定（名后 的/了/过/说过/提到…）。
-                # ASCII 英文 id（xi/nian…）加后置边界，防 "axios" 里误匹配 "xi"
+                # ASCII 英文 id（短组合）加后置边界，防 "axis" 里误匹配
                 if name_s.isascii():
                     pattern = re.compile(
                         rf"(?<![0-9A-Za-z]){re.escape(name_s)}(?![0-9A-Za-z])"
@@ -720,7 +720,7 @@ class RouterMixin:
         """惰性初始化会话级路由记忆（main.py __init__ 不感知 mixin 私有状态）。
 
         2026-09-07 方案①升级：_route_last 从「单 agent 锁」升级为「在场者组」，
-        支持 3P/多P 场次后无点名消息按多人组接龙（根因：旧结构只留最后一个 agent，
+        支持多人场次后无点名消息按多人组接龙（根因：旧结构只留最后一个 agent，
         部分子代理在多角色场次里天然掉队）。
         """
         if not hasattr(self, "_route_last"):
@@ -807,7 +807,7 @@ class RouterMixin:
         （"你和某某..." → "/你和某某..."）。此时 startswith("/") 为真、
         但解析不出任何已知代理/管理命令——那是被重写的普通消息，对主代理锁
         必须按「非命令」处理（直通主代理），否则消息会被 T0/T1 扫出子代理名
-        路由走（21:06 实测 bug：锁在场仍被转给 closure）。
+        路由走（21:06 实测 bug：锁在场仍被转给子代理）。
         """
         if not raw_message.startswith(self._CMD_PREFIXES):
             return False
@@ -860,7 +860,7 @@ class RouterMixin:
     ) -> bool:
         """会话级消息去重屏障（2026-09-09 用户 bug 治本）。
 
-        bug 复现：/年+夕 命令锁 → 发"继续做爱"，T0.5 粘滞命中 nian+xi chained，
+        bug 复现：多点名命令锁 → 发承接句，T0.5 粘滞命中多人组 chained，
         但夕回了两遍。根因：_smart_router_check 挂在 OnWaitingLLMRequestEvent 上，
         同一条用户消息可能被顺序触发两次（follow-up / 管道二次遍历），且代码里
         唯一防重 _suppress_mainagent_prefix 只管"主代理工具续写尾巴"那个特定场景，
@@ -920,7 +920,7 @@ class RouterMixin:
 
         2026-09-07 方案①升级：_route_last 现为「在场者组」（session -> {aid: ts}）。
         返回：单人组 -> str（该 agent）；多人组（≥2 全在池）-> list[str]（整组，
-        由 _smart_router_check 识别后走 chained 接龙，多P不掉队）；空/失效 -> None。
+        由 _smart_router_check 识别后走 chained 接龙，多人不掉队）；空/失效 -> None。
         """
         if not message:
             return None
@@ -944,7 +944,7 @@ class RouterMixin:
             return None
         # 4) 未点名 → 按在场者组粘滞
         if len(live) >= 2:
-            # 多P场次：返回整组，交 _smart_router_check 走 chained 接龙（不掉队）
+            # 多人场次：返回整组，交 _smart_router_check 走 chained 接龙（不掉队）
             return list(live.keys())
         # 单人：返回该 agent 直发
         return next(iter(live))
@@ -969,25 +969,25 @@ class RouterMixin:
         group = last.get(event.unified_msg_origin, {})
         if aid in group:
             # [多代理保组 2026-09-09] 点名者是旧在场者组成员（如多场次中点名）→ 只刷新
-            # 时间戳、不拆散整组。多P场次后续无点名消息仍按整组 chained 续接不掉队
+            # 时间戳、不拆散整组。多人场次后续无点名消息仍按整组 chained 续接不掉队
             # （记忆#4 Bug B 修复语义，防 regression）。
             group[aid] = time.time()
             return
         # [点名=换锁 2026-09-09 用户 bug 治本] 单点名命中新面孔 → 覆盖在场者组为仅此
-        # 一人。旧实现是并入（group[aid]=ts 不清旧成员），导致锁 nian+xi 后自然语言点
+        # 一人。旧实现是并入（group[aid]=ts 不清旧成员），导致锁多人组后自然语言点
         # 「赵六」被 T1 当单点名追加进旧组，而不是换锁成赵六（用户 2026-09-09
         # 报：点名换锁失效，仍停在旧组）。用户心智：点名新面孔 = 换锁到 TA，
-        # 旧在场者退出；点名在场者 = 只是跟 TA 说话，不拆 3P。
+        # 旧在场者退出；点名在场者 = 只是跟 TA 说话，不拆组。
         last[event.unified_msg_origin] = {aid: time.time()}
 
     def _record_route_hits(self, event: AstrMessageEvent, agents) -> None:
-        """[方案① 2026-09-07] 把一整组在场者写入粘滞记忆（多P场次用）。
+        """[方案① 2026-09-07] 把一整组在场者写入粘滞记忆（多人场次用）。
 
         行内注意：agents 可为 list/tuple 等多点名返回值，统一并入同组。
         2026-09-09 用户 bug 治本（点名=换组）：整组覆盖写入，清掉旧在场者。
         与 _record_route_hit 对齐——多点名（如「张三，赵六，一起来玩」）就是
         重新定义在场者组；若沿用并入，则「甲+乙」后再点「丙+丁」会变成
-        4P 而用户心智是要换到新组。
+        四人组而用户心智是要换到新组。
         """
         last, _ = self._route_mem()
         disp_map = self._get_name_display_map() or {}
@@ -1308,13 +1308,13 @@ class RouterMixin:
             event.stop_event()
             return True
         # [方案① 2026-09-07] 忙路旁路补 T0.5 粘滞多人组续接：
-        # 主代理 busy 时，多P场次的「继续做爱/再来」等无点名承接句也会被 follow-up 吞，
+        # 主代理 busy 时，多人场次的「继续/再来」等无点名承接句也会被 follow-up 吞，
         # 需在此（follow-up 捕获之前）按在场者组 chained 续接，不掉队、不靠手动调。
         sticky_multi = self._t1_sticky_route(event, message)
         if isinstance(sticky_multi, list) and len(sticky_multi) >= 2:
             logger.info(
                 f"[parallel_handoff] BusyBypass: T0.5 粘滞多人组 {sticky_multi} → "
-                f"短路 chained 接龙（多P场次续接，runner active 不掉队）"
+                f"短路 chained 接龙（多人场次续接，runner active 不掉队）"
             )
             calls = [{"agent_name": a, "input": message} for a in sticky_multi]
             try:
@@ -1560,7 +1560,7 @@ class RouterMixin:
                     f"[parallel_handoff] SmartRouter: 多点名接龙调用失败 {e}; release to main"
                 )
                 return False
-            # [方案① 2026-09-07] 多P场次：把整组写入粘滞记忆，供后续无点名消息按组续接。
+            # [方案① 2026-09-07] 多人场次：把整组写入粘滞记忆，供后续无点名消息按组续接。
             self._record_route_hits(event, multi)
             event.stop_event()
             return True
@@ -1584,10 +1584,10 @@ class RouterMixin:
             sticky = self._t1_sticky_route(event, message)
             if isinstance(sticky, list) and len(sticky) >= 2:
                 # [方案① 2026-09-07] 粘滞命中多人组 → 按整组 chained 接龙，不掉队。
-                # 与上方多点名短路同构：主代理不下场，多P场次后续轮次按组延续。
+                # 与上方多点名短路同构：主代理不下场，多人场次后续轮次按组延续。
                 logger.info(
                     f"[parallel_handoff] SmartRouter: T0.5 粘滞多人组 {sticky} → "
-                    f"短路 chained 接龙（多P场次续接，主代理不下场）"
+                    f"短路 chained 接龙（多人场次续接，主代理不下场）"
                 )
                 calls = [{"agent_name": a, "input": message} for a in sticky]
                 try:

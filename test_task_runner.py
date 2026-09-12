@@ -29,7 +29,7 @@ class TestBasicLifecycle:
     def test_submit_and_complete(self):
         async def main():
             r = TaskRunner()
-            tid, err = r.submit("s1", "closure", "干活", lambda: _ok("结果"))
+            tid, err = r.submit("s1", "bell", "干活", lambda: _ok("结果"))
             assert err == "" and tid
             rec = await r.wait(tid, timeout=5)
             assert rec.status == DONE
@@ -49,7 +49,7 @@ class TestBasicLifecycle:
                 return "慢活"
 
             t0 = time.time()
-            tid, err = r.submit("s1", "closure", "慢活", slow)
+            tid, err = r.submit("s1", "bell", "慢活", slow)
             submit_cost = time.time() - t0
             assert err == ""
             # submit 必须是毫秒级，不能被任务本身拖住
@@ -69,7 +69,7 @@ class TestBasicLifecycle:
                 await asyncio.sleep(5)
                 return "x"
 
-            tid, _ = r.submit("s1", "closure", "慢", slow)
+            tid, _ = r.submit("s1", "bell", "慢", slow)
             rec = await r.wait(tid, timeout=0.3)
             assert rec.status in (RUNNING, "pending")
             assert rec.result == ""  # 还没结果
@@ -80,7 +80,7 @@ class TestBasicLifecycle:
     def test_result_available_after_completion(self):
         async def main():
             r = TaskRunner()
-            tid, _ = r.submit("s1", "closure", "快", lambda: _ok("ok"))
+            tid, _ = r.submit("s1", "bell", "快", lambda: _ok("ok"))
             await r.wait(tid, timeout=5)
             # 完成之后 wait 立刻返回，不再等
             t0 = time.time()
@@ -152,7 +152,7 @@ class TestFailureModes:
             async def forever():
                 await asyncio.sleep(10)
 
-            tid, _ = r.submit("s1", "closure", "卡死", forever)
+            tid, _ = r.submit("s1", "bell", "卡死", forever)
             rec = await r.wait(tid, timeout=5)
             assert rec.status == INTERRUPTED
             assert "超时" in rec.error
@@ -166,7 +166,7 @@ class TestFailureModes:
             async def boom():
                 raise ValueError("炸了")
 
-            tid, _ = r.submit("s1", "closure", "报错", boom)
+            tid, _ = r.submit("s1", "bell", "报错", boom)
             rec = await r.wait(tid, timeout=5)
             assert rec.status == FAILED
             assert "ValueError" in rec.error and "炸了" in rec.error
@@ -181,7 +181,7 @@ class TestFailureModes:
                 await asyncio.sleep(10)
                 return "x"
 
-            tid, _ = r.submit("s1", "closure", "取消我", slow)
+            tid, _ = r.submit("s1", "bell", "取消我", slow)
             assert r.stop(tid) is True
             rec = await r.wait(tid, timeout=5)
             assert rec.status == STOPPED

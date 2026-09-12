@@ -7,8 +7,7 @@
   · 内部转：旁轨对话绝不实时打扰用户，只在每日摘要（digest）推送一次。
   · 绝不依赖 LLM：LLM 挂了 → 本次心跳静默跳过，不炸、不留脏数据、不空转。
   · cron 幂等：注册前先清同名遗留任务（2026-09-04 biliread 任务堆积修复同款）。
-  · 常驻池默认 6 人（2026-09-04 定稿）：
-      amiya / shu / closure / xi + theresia / skadi。
+  · 常驻池由部署配置（family_pulse_members）声明，代码侧不内置名单。
   · 今日状态复用 random_state（场景 "_family_pulse" 独立隔离），与接话判定互不干扰。
 """
 
@@ -763,8 +762,14 @@ class FamilyPulseMixin:
     # 概率/次数走配置（family_pulse_interlope_chance / _max），测试可关。
     PULSE_INTERLOPE_CHANCE = 0.45     # 每轮插话概率
     PULSE_INTERLOPE_MAX = 2           # 一场最多插几次
-    # 放得开的性子：抢话时权重加成，像真人里总有爱接话的
-    PULSE_BOLD_AGENTS = {"closure", "shu", "nian", "liino"}
+    # 放得开的性子：抢话时权重加成（部署在 family_pulse_bold_agents 配置声明；
+    # 默认空 = 不加成，抢话纯按亲密度+随机）
+    PULSE_BOLD_AGENTS: set = set()
+
+    def _pulse_bold_set(self) -> set:
+        """放得开的子代理集合（抢话加成）：family_pulse_bold_agents 配置，逗号分隔。"""
+        raw = str(self._cfg("family_pulse_bold_agents", "")).strip()
+        return {a.strip().lower() for a in raw.split(",") if a.strip()}
 
     def _pulse_interlope_chance(self) -> float:
         try:
@@ -796,7 +801,7 @@ class FamilyPulseMixin:
             meta = aff.get(frozenset((c, prev_disp)))
             if meta:
                 w += meta[0] / 100.0 * 2.0
-            if c in self.PULSE_BOLD_AGENTS:
+            if c in self._pulse_bold_set():
                 w += 1.5
             w += random.random() * 2.0
             weights.append(w)
@@ -1005,7 +1010,7 @@ class FamilyPulseMixin:
             meta = aff.get(frozenset((c, prev_disp)))
             if meta:
                 w += meta[0] / 100.0
-            if c in self.PULSE_BOLD_AGENTS:
+            if c in self._pulse_bold_set():
                 w += 0.8
             w += random.random() * 1.5
             weights.append(w)

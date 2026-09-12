@@ -1,4 +1,8 @@
-"""test_plugin.py — parallel_handoff 插件单元测试"""
+"""test_plugin.py — parallel_handoff 插件单元测试
+
+测试数据统一使用通用示例名：小星/小夜/小铃/小汐/小鹭/小歌/小玖，单字辰/晴/岚/禾。
+每个部署自己的名字留在各自的 data/ 里——这里只留一组安静的星与夜。
+"""
 import asyncio
 import json
 import os
@@ -111,16 +115,65 @@ if ASTRBOT_ROOT not in sys.path:
     sys.path.insert(0, ASTRBOT_ROOT)
 
 
+# ── 测试样本数据（与部署数据解耦）──────────────────────────────
+# 这批用例验证「名字映射 / 命令解析 / 关系网解析」逻辑本身；真实数据在
+# 部署侧由 data/*.json 与插件配置提供，各机名字不同。这里为每次加载的
+# 独立模块补一组样本名，保证用例在任何环境（本机 / CI / 用户机）结果一致。
+_TEST_SAMPLE_DISPLAY = {
+    "nova": "小星",
+    "luna": "小夜",
+    "bell": "小铃",
+    "tide": "小汐",
+    "heron": "小鹭",
+    "song": "小歌",
+    "nine": "小玖",
+    "chen": "辰",
+    "qing": "晴",
+    "lan": "岚",
+    "he": "禾",
+}
+_TEST_SAMPLE_ALIASES = {"nova": ["星星"], "nine": ["九九"]}
+_TEST_SAMPLE_MAIN_TOKENS = ("领航",)
+_TEST_SAMPLE_BRIEF = {k: "样本子代理" for k in _TEST_SAMPLE_DISPLAY}
+
+
 def _load_plugin_class():
-    """通过文件路径直接加载插件类，避免与 /root/AstrBot/main.py 冲突"""
+    """通过文件路径直接加载插件类，避免与 /root/AstrBot/main.py 冲突。
+
+    加载后补一组测试样本（示例显示名 / 爱称别名 / 主代理令牌样本 / 路由池）：
+    _display_name、_parse_agent_command、_pulse_affinity 等用例的断言依赖
+    「映射表里存在样本名」，部署数据各机各异，这里统一补齐、互不覆盖。
+    """
     import importlib.util
+
     main_path = os.path.join(PLUGIN_DIR, "main.py")
     spec = importlib.util.spec_from_file_location(
         "parallel_handoff_plugin", main_path
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.ParallelHandoffPlugin
+
+    cls = module.ParallelHandoffPlugin
+    # 样本：显示名映射（id → 显示名）与反向表（显示名 → id）
+    cls.AGENT_DISPLAY_NAME = {**cls.AGENT_DISPLAY_NAME, **_TEST_SAMPLE_DISPLAY}
+    cls.AGENT_NAME_REVERSE = {v: k for k, v in cls.AGENT_DISPLAY_NAME.items()}
+    # 样本：爱称别名（结构 {id: [别名...]}）
+    try:
+        cls.T1_ALIASES = {**getattr(cls, "T1_ALIASES", {}), **_TEST_SAMPLE_ALIASES}
+    except Exception:  # noqa: BLE001 — 类属性结构异常时不影响其他用例
+        pass
+    # 样本：路由池职责简介（_router_agent_pool 兜底池的来源）
+    try:
+        cls.T2_AGENT_BRIEF = {**getattr(cls, "T2_AGENT_BRIEF", {}), **_TEST_SAMPLE_BRIEF}
+    except Exception:  # noqa: BLE001
+        pass
+    # 样本：主代理令牌（定义在 router 模块命名空间，_parse_agent_command 运行时读取）
+    _router_mod = getattr(module, "_router_mod", None)
+    if _router_mod is not None and hasattr(_router_mod, "_MAIN_TOKEN_SET"):
+        _router_mod._MAIN_TOKEN_SET = tuple(
+            dict.fromkeys([*_router_mod._MAIN_TOKEN_SET, *_TEST_SAMPLE_MAIN_TOKENS])
+        )
+    return cls
 
 
 class TestSchema(unittest.TestCase):
@@ -188,22 +241,22 @@ class TestDisplayName(unittest.TestCase):
     def test_display_name_fallback(self):
         """name_display_map 为空时回退到硬编码 AGENT_DISPLAY_NAME"""
         plugin = self._make_plugin({"name_display_map": "{}"})
-        self.assertEqual(plugin._display_name("amiya"), "阿米娅")
-        self.assertEqual(plugin._display_name("theresia"), "特蕾西娅")
+        self.assertEqual(plugin._display_name("nova"), "小星")
+        self.assertEqual(plugin._display_name("luna"), "小夜")
         self.assertEqual(plugin._display_name("demo"), "demo")  # tech 已移除映射，回退原名
 
     def test_display_name_config(self):
         """name_display_map 配置值生效，覆盖硬编码"""
         plugin = self._make_plugin({
             "name_display_map": json.dumps({
-                "amiya": "小阿米娅",
+                "nova": "小小星",
                 "demo": "技术小哥",
             })
         })
-        self.assertEqual(plugin._display_name("amiya"), "小阿米娅")
+        self.assertEqual(plugin._display_name("nova"), "小小星")
         self.assertEqual(plugin._display_name("demo"), "技术小哥")
         # 未在配置中，回退到硬编码
-        self.assertEqual(plugin._display_name("theresia"), "特蕾西娅")
+        self.assertEqual(plugin._display_name("luna"), "小夜")
         # 既不在配置也不在硬编码，返回原名
         self.assertEqual(plugin._display_name("unknown_agent"), "unknown_agent")
 
@@ -211,14 +264,14 @@ class TestDisplayName(unittest.TestCase):
         """name_display_map 为非法 JSON 时优雅降级"""
         plugin = self._make_plugin({"name_display_map": "{invalid json"})
         # 应回退到硬编码
-        self.assertEqual(plugin._display_name("amiya"), "阿米娅")
+        self.assertEqual(plugin._display_name("nova"), "小星")
 
     def test_display_name_dict_format(self):
         """name_display_map 直接传 dict 也能正常工作"""
         plugin = self._make_plugin({
-            "name_display_map": {"amiya": "兔兔"}
+            "name_display_map": {"nova": "星星"}
         })
-        self.assertEqual(plugin._display_name("amiya"), "兔兔")
+        self.assertEqual(plugin._display_name("nova"), "星星")
 
 
 class TestPrefixOverrides(unittest.TestCase):
@@ -244,18 +297,18 @@ class TestPrefixOverrides(unittest.TestCase):
     def test_get_prefix_overrides_string(self):
         """JSON 字符串格式的覆盖表"""
         plugin = self._make_plugin({
-            "name_prefix_overrides": json.dumps({"amiya": False, "demo": True})
+            "name_prefix_overrides": json.dumps({"nova": False, "demo": True})
         })
         result = plugin._get_name_prefix_overrides()
-        self.assertEqual(result, {"amiya": False, "demo": True})
+        self.assertEqual(result, {"nova": False, "demo": True})
 
     def test_get_prefix_overrides_dict(self):
         """直接传 dict 格式也能正确读取"""
         plugin = self._make_plugin({
-            "name_prefix_overrides": {"amiya": False}
+            "name_prefix_overrides": {"nova": False}
         })
         result = plugin._get_name_prefix_overrides()
-        self.assertEqual(result, {"amiya": False})
+        self.assertEqual(result, {"nova": False})
 
     def test_get_prefix_overrides_invalid_json(self):
         """非法 JSON 返回空 dict"""
@@ -304,10 +357,10 @@ class TestMainagentPrefix(unittest.TestCase):
         """使用 main_agent_name 配置自定义名"""
         plugin = self._make_plugin({
             "enable_mainagent_name_prefix": True,
-            "main_agent_name": "博士",
+            "main_agent_name": "老师",
         })
-        result = plugin.format_mainagent_message("测试消息", "博士")
-        self.assertEqual(result, "【博士】\n测试消息")
+        result = plugin.format_mainagent_message("测试消息", "老师")
+        self.assertEqual(result, "【老师】\n测试消息")
 
     def test_format_mainagent_name_display_map(self):
         """name_display_map 中的主代理名优先生效"""
@@ -338,21 +391,21 @@ class TestPrefixDedup(unittest.TestCase):
         """子代理回复已含前缀时，_display_name 逻辑不应重复"""
         plugin = self._make_plugin({
             "enable_subagent_name_prefix": True,
-            "name_display_map": json.dumps({"amiya": "阿米娅"}),
+            "name_display_map": json.dumps({"nova": "小星"}),
         })
         # 模拟子代理已返回带前缀的文本
-        text_with_prefix = "【阿米娅】\n这是子代理的回复"
-        display_name = plugin._display_name("amiya")
+        text_with_prefix = "【小星】\n这是子代理的回复"
+        display_name = plugin._display_name("nova")
         prefix_str = f"【{display_name}】\n"
 
         # 验证去重逻辑：如果已有前缀不再添加
         if not text_with_prefix.startswith(prefix_str):
             text_with_prefix = prefix_str + text_with_prefix
         # 前缀应该仍然只出现一次
-        self.assertTrue(text_with_prefix.startswith("【阿米娅】\n"))
+        self.assertTrue(text_with_prefix.startswith("【小星】\n"))
         # 前缀后面不应该再出现第二次
-        after_prefix = text_with_prefix[len("【阿米娅】\n"):]
-        self.assertFalse(after_prefix.startswith("【阿米娅】"))
+        after_prefix = text_with_prefix[len("【小星】\n"):]
+        self.assertFalse(after_prefix.startswith("【小星】"))
 
     def test_prefix_added_when_not_present(self):
         """子代理回复无前缀时正常添加"""
@@ -360,12 +413,12 @@ class TestPrefixDedup(unittest.TestCase):
             "enable_subagent_name_prefix": True,
         })
         text = "纯文本回复"
-        display_name = plugin._display_name("amiya")
+        display_name = plugin._display_name("nova")
         prefix_str = f"【{display_name}】\n"
 
         if not text.startswith(prefix_str):
             text = prefix_str + text
-        self.assertTrue(text.startswith("【阿米娅】\n"))
+        self.assertTrue(text.startswith("【小星】\n"))
         # 前缀后内容应与原文一致
         self.assertEqual(text[len(prefix_str):], "纯文本回复")
 
@@ -388,12 +441,12 @@ class TestRouteDirective(unittest.TestCase):
         plugin = self._make_plugin({
             "route_mode": "direct",
             "call_mode": "parallel",
-            "direct_delivery_agents": "amiya,closure,liino,unmapped_agent",
+            "direct_delivery_agents": "nova,bell,song,unmapped_agent",
             "enable_route_directive": True,
         })
         d = plugin._build_route_directive()
-        self.assertIn("阿米娅、可露希尔", d)      # 显示名映射生效
-        self.assertIn("梨诺", d)                  # 映射 id 显示为内置中文名
+        self.assertIn("小星、小铃", d)      # 显示名映射生效
+        self.assertIn("小歌", d)                  # 映射 id 显示为内置中文名
         self.assertIn("unmapped_agent", d)        # 未映射 id 保留原名
         self.assertIn("direct", d)
         self.assertIn("parallel", d)
@@ -405,7 +458,7 @@ class TestRouteDirective(unittest.TestCase):
         plugin = self._make_plugin({
             "route_mode": "relay",
             "call_mode": "chained",
-            "direct_delivery_agents": "amiya,closure",
+            "direct_delivery_agents": "nova,bell",
         })
         d = plugin._build_route_directive()
         self.assertIn("relay", d)
@@ -428,7 +481,7 @@ class TestRouteDirective(unittest.TestCase):
         plugin = self._make_plugin({
             "route_mode": "direct",
             "call_mode": "parallel",
-            "direct_delivery_agents": "amiya,closure",
+            "direct_delivery_agents": "nova,bell",
             "handoff_blacklist_agents": "demo,canary",
         })
         d = plugin._build_route_directive()
@@ -444,7 +497,7 @@ class TestRouteDirective(unittest.TestCase):
         plugin = self._make_plugin({
             "route_mode": "relay",
             "call_mode": "parallel",
-            "direct_delivery_agents": "amiya,closure",
+            "direct_delivery_agents": "nova,bell",
             "handoff_blacklist_agents": "demo,canary",
         })
         d = plugin._build_route_directive()
@@ -472,7 +525,7 @@ class TestRouteDirectiveInject(unittest.TestCase):
         plugin = self._make_plugin({
             "route_mode": "direct",
             "call_mode": "parallel",
-            "direct_delivery_agents": "amiya,closure,demo",
+            "direct_delivery_agents": "nova,bell,demo",
             "enable_route_directive": True,
         })
         req = MagicMock()
@@ -492,7 +545,7 @@ class TestRouteDirectiveInject(unittest.TestCase):
         plugin = self._make_plugin({
             "route_mode": "direct",
             "call_mode": "parallel",
-            "direct_delivery_agents": "amiya",
+            "direct_delivery_agents": "nova",
             "enable_route_directive": True,
         })
         req = MagicMock()
@@ -509,7 +562,7 @@ class TestRouteDirectiveInject(unittest.TestCase):
         plugin = self._make_plugin({
             "route_mode": "direct",
             "call_mode": "parallel",
-            "direct_delivery_agents": "amiya",
+            "direct_delivery_agents": "nova",
             "enable_route_directive": False,
         })
         req = MagicMock()
@@ -526,13 +579,13 @@ class TestRouteDirectiveInject(unittest.TestCase):
         plugin = self._make_plugin({
             "route_mode": "direct",
             "call_mode": "parallel",
-            "direct_delivery_agents": "amiya,closure",
-            "name_display_map": '{"amiya": "阿米娅", "closure": "可露希尔"}',
+            "direct_delivery_agents": "nova,bell",
+            "name_display_map": '{"nova": "小星", "bell": "小铃"}',
             "enable_route_directive": True,
             "directive_inject_mode": "smart",
         })
         event = MagicMock()
-        event.get_message_str.return_value = "我想找阿米娅聊聊天"
+        event.get_message_str.return_value = "我想找小星聊聊天"
         req = MagicMock()
         req.system_prompt = "原 prompt"
         req.extra_user_content_parts = []
@@ -547,8 +600,8 @@ class TestRouteDirectiveInject(unittest.TestCase):
         plugin = self._make_plugin({
             "route_mode": "direct",
             "call_mode": "parallel",
-            "direct_delivery_agents": "amiya,closure",
-            "name_display_map": '{"amiya": "阿米娅", "closure": "可露希尔"}',
+            "direct_delivery_agents": "nova,bell",
+            "name_display_map": '{"nova": "小星", "bell": "小铃"}',
             "enable_route_directive": True,
             "directive_inject_mode": "smart",
         })
@@ -567,7 +620,7 @@ class TestRouteDirectiveInject(unittest.TestCase):
         plugin = self._make_plugin({
             "route_mode": "direct",
             "call_mode": "parallel",
-            "direct_delivery_agents": "amiya",
+            "direct_delivery_agents": "nova",
             "enable_route_directive": True,
             "directive_inject_mode": "smart",
         })
@@ -640,7 +693,7 @@ class TestDedupGuard(unittest.TestCase):
         plugin = self._make_plugin()
         ev = self._make_event()
         self.assertIsNone(
-            plugin._dedup_guard(ev, calls=[{"agent_name": "amiya", "input": "问题A"}])
+            plugin._dedup_guard(ev, calls=[{"agent_name": "nova", "input": "问题A"}])
         )
         self.assertIsNone(
             plugin._dedup_guard(ev, calls=[{"agent_name": "demo", "input": "问题A"}])
@@ -654,7 +707,7 @@ class TestDedupGuard(unittest.TestCase):
             plugin._dedup_guard(
                 ev,
                 calls=[
-                    {"agent_name": "amiya", "input": "问题A"},
+                    {"agent_name": "nova", "input": "问题A"},
                     {"agent_name": "demo", "input": "问题B"},
                 ],
             )
@@ -663,7 +716,7 @@ class TestDedupGuard(unittest.TestCase):
             ev,
             calls=[
                 {"agent_name": "demo", "input": "问题B"},
-                {"agent_name": "amiya", "input": "问题A"},
+                {"agent_name": "nova", "input": "问题A"},
             ],
         )
         self.assertIsNotNone(ret)
@@ -681,7 +734,7 @@ class TestDedupGuard(unittest.TestCase):
         plugin = self._make_plugin()
         ev = self._make_event()
         self.assertIsNone(plugin._dedup_guard(ev, message="继续问 demo"))
-        self.assertIsNone(plugin._dedup_guard(ev, message="换成问 amiya"))
+        self.assertIsNone(plugin._dedup_guard(ev, message="换成问 nova"))
 
 
 class TestHandoffBlacklist(unittest.TestCase):
@@ -752,22 +805,22 @@ class TestHandoffBlacklist(unittest.TestCase):
         self.assertIn("transfer_to_demo", data["results"][0]["response"])
 
     def test_call_one_allows_non_blacklist(self):
-        """非黑名单代理（amiya）不受拦截，进入实际调用流程"""
+        """非黑名单代理（nova）不受拦截，进入实际调用流程"""
         mock_context = MagicMock()
         class _FakeAgent:
-            name = "amiya"
+            name = "nova"
             instructions = ""
             tools = None
             begin_dialogs = None
         class _FakeHandoff:
             agent = _FakeAgent()
             provider_id = None
-            name = "transfer_to_amiya"
+            name = "transfer_to_nova"
         mock_context.subagent_orchestrator.handoffs = [_FakeHandoff()]
         mock_context.get_all_stars.return_value = []
         # llm_generate 返回 fake 响应（async 版本，parallel_handoff 内 await 它）
         class _FakeLLMResp:
-            completion_text = "阿米娅的回复"
+            completion_text = "小星的回复"
         from unittest.mock import AsyncMock
         mock_context.llm_generate = AsyncMock(return_value=_FakeLLMResp())
         # 2026-09-11：子代理调用改走 tool_loop_agent（带工具循环），mock 同步跟进
@@ -784,34 +837,34 @@ class TestHandoffBlacklist(unittest.TestCase):
         plugin.context = mock_context  # mock Star.__init__ 不存 context，手动补
         ev = MagicMock()
         ev.unified_msg_origin = "session-test"
-        ev.message_obj.message_id = "msg-amiya-test"
+        ev.message_obj.message_id = "msg-nova-test"
         raw = asyncio.run(plugin.parallel_handoff(
             ev,
-            calls=[{"agent_name": "amiya", "input": "你好"}],
+            calls=[{"agent_name": "nova", "input": "你好"}],
         ))
         data = json.loads(raw)
         self.assertEqual(data["results"][0]["success"], True)
-        self.assertEqual(data["results"][0]["agent_name"], "amiya")
-        self.assertIn("阿米娅的回复", data["results"][0]["response"])
+        self.assertEqual(data["results"][0]["agent_name"], "nova")
+        self.assertIn("小星的回复", data["results"][0]["response"])
 
     def test_call_one_without_livingmemory_degrades(self):
-        """[发布就绪 2026-09-13 博士问「没装 livingmemory 怎么办」] 未安装 livingmemory：
+        """[发布就绪 2026-09-13 老师问「没装 livingmemory 怎么办」] 未安装 livingmemory：
         子代理调用全链路正常完成，记忆链路静默跳过——find→None、零报错、零注入。
         这是发布给第三方用户的关键保障：livingmemory 是可选增强，不是硬依赖。"""
         mock_context = MagicMock()
         class _FakeAgent:
-            name = "amiya"
+            name = "nova"
             instructions = ""
             tools = None
             begin_dialogs = None
         class _FakeHandoff:
             agent = _FakeAgent()
             provider_id = None
-            name = "transfer_to_amiya"
+            name = "transfer_to_nova"
         mock_context.subagent_orchestrator.handoffs = [_FakeHandoff()]
         mock_context.get_all_stars.return_value = []          # ★ 插件列表里没有 livingmemory
         class _FakeLLMResp:
-            completion_text = "阿米娅的回复"
+            completion_text = "小星的回复"
         from unittest.mock import AsyncMock
         mock_context.llm_generate = AsyncMock(return_value=_FakeLLMResp())
         mock_context.tool_loop_agent = AsyncMock(return_value=_FakeLLMResp())
@@ -832,15 +885,15 @@ class TestHandoffBlacklist(unittest.TestCase):
         ev.message_obj.message_id = "msg-no-lm"
         raw = asyncio.run(plugin.parallel_handoff(
             ev,
-            calls=[{"agent_name": "amiya", "input": "你好"}],
+            calls=[{"agent_name": "nova", "input": "你好"}],
         ))
         data = json.loads(raw)
         self.assertEqual(data["results"][0]["success"], True)
-        self.assertIn("阿米娅的回复", data["results"][0]["response"])
+        self.assertIn("小星的回复", data["results"][0]["response"])
         # 3) 记忆召回 / 存储：None 插件时静默返回空/跳过，不抛异常
-        recall = asyncio.run(plugin._memory_recall(ev, "amiya", "你好", None))
+        recall = asyncio.run(plugin._memory_recall(ev, "nova", "你好", None))
         self.assertEqual(recall, [])
-        asyncio.run(plugin._memory_store(None, ev, "amiya", "你好", "回复"))  # 不应抛出
+        asyncio.run(plugin._memory_store(None, ev, "nova", "你好", "回复"))  # 不应抛出
 
 
 
@@ -852,8 +905,8 @@ class TestBlacklistIsolation(unittest.TestCase):
     def setUpClass(cls):
         cls.PluginClass = _load_plugin_class()
 
-    def _make_plugin(self, config=None, handoff_names=("amiya", "demo")):
-        """构造插件实例；默认含 amiya + tech 两个 handoff（黑名单检查在 handoff 检查之后）"""
+    def _make_plugin(self, config=None, handoff_names=("nova", "demo")):
+        """构造插件实例；默认含 nova + tech 两个 handoff（黑名单检查在 handoff 检查之后）"""
         from unittest.mock import AsyncMock
         mock_context = MagicMock()
         handoffs = []
@@ -873,7 +926,7 @@ class TestBlacklistIsolation(unittest.TestCase):
         mock_context.subagent_orchestrator.handoffs = handoffs
         mock_context.get_all_stars.return_value = []
         class _FakeLLMResp:
-            completion_text = "阿米娅的回复"
+            completion_text = "小星的回复"
         mock_context.llm_generate = AsyncMock(return_value=_FakeLLMResp())
         # 2026-09-11：子代理调用改走 tool_loop_agent（带工具循环），mock 同步跟进
         mock_context.tool_loop_agent = AsyncMock(return_value=_FakeLLMResp())
@@ -896,7 +949,7 @@ class TestBlacklistIsolation(unittest.TestCase):
         ev = MagicMock()
         ev.unified_msg_origin = "session-baseline"
         ev.message_obj.message_id = "msg-baseline"
-        ev.get_sender_name.return_value = "博士"
+        ev.get_sender_name.return_value = "老师"
         ev.get_sender_id.return_value = "u-1"
         mt = MagicMock()
         mt.value = "friend"
@@ -923,7 +976,7 @@ class TestBlacklistIsolation(unittest.TestCase):
         """自定义黑名单子代理被拦截，提示 transfer_to 直连"""
         plugin, mock_context = self._make_plugin({
             "handoff_blacklist_agents": "bb",
-        }, handoff_names=("amiya", "bb"))
+        }, handoff_names=("nova", "bb"))
         ev = self._make_event()
         raw = asyncio.run(plugin.parallel_handoff(
             ev,
@@ -950,7 +1003,7 @@ class TestBuildScenePrefix(unittest.TestCase):
 
     def _make_event(self):
         ev = MagicMock()
-        ev.get_sender_name.return_value = "博士"
+        ev.get_sender_name.return_value = "老师"
         ev.get_sender_id.return_value = "u-1"
         mt = MagicMock()
         mt.value = "friend"
@@ -1062,8 +1115,8 @@ class TestTailSuppressFix(unittest.TestCase):
         p = self._fresh_router()
         p._suppress_mainagent_prefix = True
         p._suppress_mainagent_ts = _t.time() - 30   # 超 15s 窗口（37s 场景）
-        p._suppress_mainagent_msg = "特蕾西娅，你的脚好舒服"
-        ev = self._plain_event("我们继续足交吧")
+        p._suppress_mainagent_msg = "小夜，今天辛苦了"
+        ev = self._plain_event("我们继续忙吧")
         # 吞尾分支判据：same_msg=False → 绝不提前 return，必须进入路由链（_record_user_msg 被调用）
         p._record_user_msg = MagicMock()
         with unittest.mock.patch.object(p, "_record_user_msg", wraps=p._record_user_msg):
@@ -1076,8 +1129,8 @@ class TestTailSuppressFix(unittest.TestCase):
         p = self._fresh_router()
         p._suppress_mainagent_prefix = True
         p._suppress_mainagent_ts = _t.time() - 2    # 窗口内
-        p._suppress_mainagent_msg = "特蕾西娅，你的脚好舒服"
-        ev = self._plain_event("特蕾西娅，你的脚好舒服")
+        p._suppress_mainagent_msg = "小夜，今天辛苦了"
+        ev = self._plain_event("小夜，今天辛苦了")
         ev.stop_event = MagicMock()
         # 吞尾分支判据：同消息+窗口内 → 直接 stop_event 返回，不进入路由链
         p._record_user_msg = MagicMock()
@@ -1095,15 +1148,15 @@ class TestBusyBypass(unittest.TestCase):
             config={
                 "enable_smart_router": True,
                 "name_display_map": json.dumps({
-                    "amiya": "阿米娅",
-                    "theresia": "特蕾西娅",
-                    "closure": "可露希尔",
-                    "skadi": "斯卡蒂",
-                    "xi": "夕",
-                    "shu": "黍",
-                    "nian": "年",
-                    "ling": "令",
-                    "liino": "梨诺",
+                    "nova": "小星",
+                    "luna": "小夜",
+                    "bell": "小铃",
+                    "tide": "小汐",
+                    "chen": "辰",
+                    "he": "禾",
+                    "qing": "晴",
+                    "lan": "岚",
+                    "song": "小歌",
                 }),
             },
         )
@@ -1128,7 +1181,7 @@ class TestBusyBypass(unittest.TestCase):
             },
         )
         router_mod._ACTIVE_AGENT_RUNNERS = {"sess-busy": object()}
-        ev = self._plain_event("特蕾西娅，在吗")
+        ev = self._plain_event("小夜，在吗")
         p.call_subagent = MagicMock()
         res = asyncio.run(p._busy_bypass_check(ev))
         self.assertFalse(res)
@@ -1140,7 +1193,7 @@ class TestBusyBypass(unittest.TestCase):
         import router as router_mod
         p = self._fresh_router()
         router_mod._ACTIVE_AGENT_RUNNERS = {}
-        ev = self._plain_event("特蕾西娅，在吗")
+        ev = self._plain_event("小夜，在吗")
         p.call_subagent = MagicMock()
         res = asyncio.run(p._busy_bypass_check(ev))
         self.assertFalse(res)
@@ -1152,13 +1205,13 @@ class TestBusyBypass(unittest.TestCase):
         import router as router_mod
         p = self._fresh_router()
         router_mod._ACTIVE_AGENT_RUNNERS = {"sess-busy": object()}
-        ev = self._plain_event("特蕾西娅，帮我看看这个")
+        ev = self._plain_event("小夜，帮我看看这个")
         p.call_subagent = AsyncMock()
         res = asyncio.run(p._busy_bypass_check(ev))
         self.assertTrue(res)
         p.call_subagent.assert_called_once()
         kwargs = p.call_subagent.call_args.kwargs
-        self.assertEqual(kwargs["agent_name"], "theresia")
+        self.assertEqual(kwargs["agent_name"], "luna")
         self.assertIn("帮我看看这个", kwargs["input"])
         ev.stop_event.assert_called_once()
 
@@ -1179,7 +1232,7 @@ class TestBusyBypass(unittest.TestCase):
         import router as router_mod
         p = self._fresh_router()
         router_mod._ACTIVE_AGENT_RUNNERS = {"sess-busy": object()}
-        ev = self._plain_event("阿米娅，抱抱")
+        ev = self._plain_event("小星，抱抱")
         async def _boom(event, agent_name, input):
             raise RuntimeError("boom")
         p.call_subagent = _boom
@@ -1189,24 +1242,24 @@ class TestBusyBypass(unittest.TestCase):
 
     def test_active_runner_sticky_multi_group_chained(self):
         """[方案① 2026-09-07] 活跃 runner + 无点名承接句 → 粘滞多人组按整组 chained 续接。
-        复现博士 00:10 现场 bug：夕+年 3P 进行中，博士发「继续做爱」，
+        复现现场 bug：辰+晴 多人组进行中，收到承接消息「继续吧」，
         此前 _busy_bypass_check 无粘滞多人分支，返回 False 被 follow-up 吞（靠主代理手动调）。
         现在应在 follow-up 捕获之前按整组 parallel_handoff chained 续接。"""
         import router as router_mod
         p = self._fresh_router()
         router_mod._ACTIVE_AGENT_RUNNERS = {"sess-busy": object()}
-        # 先记录夕+年在场者组（等价上轮多点名后 _record_route_hits 写入）
-        ev0 = self._plain_event("夕和年，来做爱3p吧", umo="sess-busy")
-        p._record_route_hits(ev0, ["xi", "nian"])
+        # 先记录辰+晴在场者组（等价上轮多点名后 _record_route_hits 写入）
+        ev0 = self._plain_event("辰和晴，一起过来吧", umo="sess-busy")
+        p._record_route_hits(ev0, ["chen", "qing"])
         # 无点名承接句
-        ev = self._plain_event("继续做爱", umo="sess-busy")
+        ev = self._plain_event("继续吧", umo="sess-busy")
         p.parallel_handoff = AsyncMock()
         res = asyncio.run(p._busy_bypass_check(ev))
         self.assertTrue(res)
         p.parallel_handoff.assert_called_once()
         kwargs = p.parallel_handoff.call_args.kwargs
         calls = kwargs["calls"]
-        self.assertEqual({c["agent_name"] for c in calls}, {"xi", "nian"})
+        self.assertEqual({c["agent_name"] for c in calls}, {"chen", "qing"})
         self.assertEqual(kwargs["call_mode"], "chained")
         self.assertEqual(kwargs["route_mode"], "direct")
         self.assertEqual(kwargs["mode"], "affection")
@@ -1217,14 +1270,14 @@ class TestBusyBypass(unittest.TestCase):
         import router as router_mod
         p = self._fresh_router()
         router_mod._ACTIVE_AGENT_RUNNERS = {"sess-busy": object()}
-        ev0 = self._plain_event("特蕾西娅聊正事", umo="sess-busy")
-        p._record_route_hit(ev0, "theresia")
+        ev0 = self._plain_event("小夜聊正事", umo="sess-busy")
+        p._record_route_hit(ev0, "luna")
         ev = self._plain_event("继续", umo="sess-busy")
         p.call_subagent = AsyncMock()
         res = asyncio.run(p._busy_bypass_check(ev))
         self.assertTrue(res)
         kwargs = p.call_subagent.call_args.kwargs
-        self.assertEqual(kwargs["agent_name"], "theresia")
+        self.assertEqual(kwargs["agent_name"], "luna")
         ev.stop_event.assert_called_once()
 
     def test_busy_filter_matches(self):
@@ -1309,7 +1362,7 @@ class TestModeConfig(unittest.TestCase):
 
 
 class TestResolveModeParams(unittest.TestCase):
-    """博士配置永远优先：mode 命中时模式配置无条件覆盖显式传参（v2.3.1）"""
+    """老师配置永远优先：mode 命中时模式配置无条件覆盖显式传参（v2.3.1）"""
 
     def _make_plugin(self, cfg: dict):
         _cls = _load_plugin_class()
@@ -1318,7 +1371,7 @@ class TestResolveModeParams(unittest.TestCase):
         return inst
 
     def test_tech_config_overrides_explicit_args(self):
-        # 博士配置 direct+chained+60，模型显式传 relay/parallel/999 → 博士配置胜
+        # 老师配置 direct+chained+60，模型显式传 relay/parallel/999 → 老师配置胜
         cfg = {"tech_mode_config": '{"route_mode": "direct", "call_mode": "chained", "timeout": 60}'}
         inst = self._make_plugin(cfg)
         r, c, t = inst.resolve_mode_params("tech", "relay", "parallel", 999)
@@ -1331,7 +1384,7 @@ class TestResolveModeParams(unittest.TestCase):
         assert r == "relay" and c == "parallel" and t == 45
 
     def test_timeout_override_no_longer_needs_default_sentinel(self):
-        # 旧逻辑只有 timeout==120 才让位；现在显式传 120 也按博士配置 300
+        # 旧逻辑只有 timeout==120 才让位；现在显式传 120 也按老师配置 300
         cfg = {"tech_mode_config": '{"timeout": 300}'}
         inst = self._make_plugin(cfg)
         r, c, t = inst.resolve_mode_params("tech", None, None, 120)
@@ -1362,9 +1415,9 @@ class TestModeShortcutDecision(unittest.TestCase):
         cfg = {
             "enable_smart_router": True,
             "name_display_map": json.dumps({
-                "amiya": "阿米娅", "closure": "可露希尔", "theresia": "特蕾西娅",
+                "nova": "小星", "bell": "小铃", "luna": "小夜",
             }),
-            "direct_delivery_agents": "amiya,closure,theresia",
+            "direct_delivery_agents": "nova,bell,luna",
         }
         if mode_cfg:
             cfg.update(mode_cfg)
@@ -1385,35 +1438,35 @@ class TestModeShortcutDecision(unittest.TestCase):
     def test_tech_task_release_to_main(self):
         """技术干活任务（含 tech 特征）：2026-09-07 方案A 起短路直发被点名者，不放行主代理"""
         p = self._fresh_router()
-        msg = "阿米娅帮我查一下这个报错的traceback"
-        assert p._mode_shortcut_decision(self._plain_event(msg), msg, "amiya") is True
+        msg = "小星帮我查一下这个报错的traceback"
+        assert p._mode_shortcut_decision(self._plain_event(msg), msg, "nova") is True
 
     def test_affection_direct_shortcut(self):
         """贴贴任务 + affection 默认 direct：短路直发"""
         p = self._fresh_router()
-        msg = "阿米娅，抱抱"
-        assert p._mode_shortcut_decision(self._plain_event(msg), msg, "amiya") is True
+        msg = "小星，抱抱"
+        assert p._mode_shortcut_decision(self._plain_event(msg), msg, "nova") is True
 
     def test_affection_relay_release(self):
-        """贴贴任务 + 博士配置 affection relay：放行主代理收卷"""
+        """贴贴任务 + 老师配置 affection relay：放行主代理收卷"""
         p = self._fresh_router(mode_cfg={
             "affection_mode_config": '{"route_mode": "relay", "call_mode": "parallel", "timeout": 60}'
         })
-        msg = "阿米娅，抱抱"
-        assert p._mode_shortcut_decision(self._plain_event(msg), msg, "amiya") is False
+        msg = "小星，抱抱"
+        assert p._mode_shortcut_decision(self._plain_event(msg), msg, "nova") is False
 
     def test_unclassified_default_shortcut(self):
         """无 tech 特征也无点名（分类 None）：保持原行为短路（兜底）"""
         p = self._fresh_router()
         msg = "今天天气不错"
         # None 分类时裁决返回 True（原行为短路兜底）
-        assert p._mode_shortcut_decision(self._plain_event(msg), msg, "amiya") is True
+        assert p._mode_shortcut_decision(self._plain_event(msg), msg, "nova") is True
 
     # ── 集成：_smart_router_check 完整链路 ──
     def test_smart_router_tech_release_no_direct(self):
         """T1 命中 tech 任务 + 点名 → 2026-09-07 方案A 起短路直发被点名者，不落主代理"""
         p = self._fresh_router()
-        ev = self._plain_event("阿米娅帮我查一下这个报错的traceback")
+        ev = self._plain_event("小星帮我查一下这个报错的traceback")
         p.call_subagent = AsyncMock()
         res = asyncio.run(p._smart_router_check(ev))
         assert res is True
@@ -1423,7 +1476,7 @@ class TestModeShortcutDecision(unittest.TestCase):
     def test_smart_router_affection_direct_shortcut(self):
         """T1 命中贴贴任务（affection direct 默认）→ 短路直发"""
         p = self._fresh_router()
-        ev = self._plain_event("阿米娅，抱抱")
+        ev = self._plain_event("小星，抱抱")
         p.call_subagent = AsyncMock()
         res = asyncio.run(p._smart_router_check(ev))
         assert res is True
@@ -1438,9 +1491,9 @@ class TestRouteSuggestionHandoff(unittest.TestCase):
         cfg = {
             "enable_smart_router": True,
             "name_display_map": json.dumps({
-                "amiya": "阿米娅", "closure": "可露希尔", "theresia": "特蕾西娅",
+                "nova": "小星", "bell": "小铃", "luna": "小夜",
             }),
-            "direct_delivery_agents": "amiya,closure,theresia",
+            "direct_delivery_agents": "nova,bell,luna",
         }
         if extra:
             cfg.update(extra)
@@ -1457,7 +1510,7 @@ class TestRouteSuggestionHandoff(unittest.TestCase):
     def test_tech_release_records_suggestion(self):
         """tech 任务 + 点名 2026-09-07 方案A 起短路直发，不暂存判向目标（不经主代理）"""
         p = self._fresh_router()
-        ev = self._plain_event("阿米娅帮我查一下这个报错的traceback")
+        ev = self._plain_event("小星帮我查一下这个报错的traceback")
         p.call_subagent = AsyncMock()
         res = asyncio.run(p._smart_router_check(ev))
         assert res is True
@@ -1466,7 +1519,7 @@ class TestRouteSuggestionHandoff(unittest.TestCase):
     def test_shortcut_does_not_record_suggestion(self):
         """短路直发（affection direct）不暂存判向目标——直发不经主代理"""
         p = self._fresh_router()
-        ev = self._plain_event("阿米娅，抱抱")
+        ev = self._plain_event("小星，抱抱")
         p.call_subagent = AsyncMock()
         res = asyncio.run(p._smart_router_check(ev))
         assert res is True
@@ -1480,7 +1533,7 @@ class TestRouteSuggestionHandoff(unittest.TestCase):
         router_mod._ACTIVE_AGENT_RUNNERS = {"sess-sug": object()}
         try:
             p = self._fresh_router()
-            ev = self._plain_event("可露希尔帮我改一下这段代码的逻辑")
+            ev = self._plain_event("小铃帮我改一下这段代码的逻辑")
             p.call_subagent = AsyncMock()
             res = asyncio.run(p._busy_bypass_check(ev))
             assert res is True  # tech 短路直发
@@ -1491,10 +1544,10 @@ class TestRouteSuggestionHandoff(unittest.TestCase):
     def test_suggestion_expires_after_30s(self):
         """判向目标 30s 过期清除，不污染后续消息"""
         p = self._fresh_router()
-        p._record_route_suggestion("amiya")
-        assert p._pop_route_suggestion() == "amiya"
+        p._record_route_suggestion("nova")
+        assert p._pop_route_suggestion() == "nova"
         # 模拟过期
-        p._route_suggestion = ("amiya", __import__("time").time() - 31)
+        p._route_suggestion = ("nova", __import__("time").time() - 31)
         assert p._pop_route_suggestion() is None
         # 过期后属性被清
         assert p._route_suggestion is None
@@ -1502,8 +1555,8 @@ class TestRouteSuggestionHandoff(unittest.TestCase):
     def test_directive_appends_suggestion(self):
         """directive 注入时把判向目标附加进指令文本"""
         p = self._fresh_router()
-        p._record_route_suggestion("amiya")
-        ev = self._plain_event("阿米娅帮我查一下这个报错的traceback")
+        p._record_route_suggestion("nova")
+        ev = self._plain_event("小星帮我查一下这个报错的traceback")
         req = MagicMock()
         req.extra_user_content_parts = []
         asyncio.run(p._route_directive_inject(ev, req))
@@ -1511,8 +1564,8 @@ class TestRouteSuggestionHandoff(unittest.TestCase):
         assert len(parts) == 1
         text = parts[0].text
         assert "路由目标建议" in text
-        assert "阿米娅" in text
-        assert "amiya" in text
+        assert "小星" in text
+        assert "nova" in text
 
 
 class TestReadAirArbitrate(unittest.TestCase):
@@ -1524,10 +1577,10 @@ class TestReadAirArbitrate(unittest.TestCase):
         cfg = {
             "enable_smart_router": True,
             "name_display_map": json.dumps({
-                "amiya": "阿米娅", "closure": "可露希尔", "theresia": "特蕾西娅",
-                "kaltsit": "凯尔希", "presis": "普瑞赛斯",
+                "nova": "小星", "bell": "小铃", "luna": "小夜",
+                "heron": "小鹭", "pilot": "领航",
             }),
-            "direct_delivery_agents": "amiya,closure,theresia",
+            "direct_delivery_agents": "nova,bell,luna",
             "enable_read_air_arbitrate": read_air,
             "read_air_enforce": enforce,
             "read_air_presence_window": 6,
@@ -1556,37 +1609,37 @@ class TestReadAirArbitrate(unittest.TestCase):
         from arbitrate import MAIN_SPEAKER
 
         p = self._fresh_plugin()
-        p._presence_get(self._plain_event("阿米娅帮我看看")).record(MAIN_SPEAKER, "main", "我回了一句")
-        assert p._read_air_wants_quiet("阿米娅帮我看看", p._presence_get(self._plain_event("阿米娅帮我看看")))
+        p._presence_get(self._plain_event("小星帮我看看")).record(MAIN_SPEAKER, "main", "我回了一句")
+        assert p._read_air_wants_quiet("小星帮我看看", p._presence_get(self._plain_event("小星帮我看看")))
 
     def test_read_air_not_quiet_when_subagent_owns_floor(self):
         """主代理没接话、单条子代理在正常回 → 不加戏克制"""
         p = self._fresh_plugin()
-        p._presence_get(self._plain_event("夕，过来帮我")).record("xi", "forward", "夕先回")
-        assert not p._read_air_wants_quiet("夕，过来帮我", p._presence_get(self._plain_event("夕，过来帮我")))
+        p._presence_get(self._plain_event("辰，过来帮我")).record("chen", "forward", "辰先回")
+        assert not p._read_air_wants_quiet("辰，过来帮我", p._presence_get(self._plain_event("辰，过来帮我")))
 
     def test_read_air_quiet_on_old_rivalry(self):
-        """R4：旧怨组（普瑞赛斯×凯尔希）近条密集互抛 → 倾向主代理兜，避免针锋相对"""
+        """R4：旧怨组（领航×小鹭）近条密集互抛 → 倾向主代理兜，避免针锋相对"""
         p = self._fresh_plugin()
         pp = p._presence_get(self._plain_event("两位在争什么"))
-        pp.record("presis", "forward", "普一句")
-        pp.record("kaltsit", "forward", "凯一句")
-        pp.record("presis", "forward", "普二句")
-        pp.record("kaltsit", "forward", "凯二句")
+        pp.record("pilot", "forward", "普一句")
+        pp.record("heron", "forward", "凯一句")
+        pp.record("pilot", "forward", "普二句")
+        pp.record("heron", "forward", "凯二句")
         assert p._read_air_wants_quiet("两位在争什么", pp)
 
     def test_arbitrate_directive_default_off_no_intercept(self):
         """默认关：_arbitrate_directive 返回 None，不拦截路由、零行为变化"""
         p = self._fresh_plugin(read_air=False)
-        ev = self._plain_event("阿米娅帮我查报错")
-        assert p._arbitrate_directive(ev, "阿米娅帮我查报错", "amiya", True) is None
+        ev = self._plain_event("小星帮我查报错")
+        assert p._arbitrate_directive(ev, "小星帮我查报错", "nova", True) is None
 
     def test_arbitrate_directive_on_observe_only(self):
         """开启后也是 observe-only：仍返回 None，绝不实际拦截短路"""
         p = self._fresh_plugin(read_air=True)
-        ev = self._plain_event("阿米娅帮我查报错")
-        # 命中 T1 -> amiya 且 mode 放行短路
-        assert p._arbitrate_directive(ev, "阿米娅帮我查报错", "amiya", True) is None
+        ev = self._plain_event("小星帮我查报错")
+        # 命中 T1 -> nova 且 mode 放行短路
+        assert p._arbitrate_directive(ev, "小星帮我查报错", "nova", True) is None
 
     # ── 段五·宁静权落地与两条死规则修复（2026-09-10） ──────────
     # 背景：段二落地后，R1/R4 两条规则实际从未生效过——
@@ -1604,21 +1657,21 @@ class TestReadAirArbitrate(unittest.TestCase):
         assert p._read_air_wants_quiet("今天就先这样吧", pp)
 
     def test_read_air_r4_fires_with_real_main_key(self):
-        """R4 修复：主代理用真实记录键 MAIN_SPEAKER（而非测试专用的 'presis'）也能触发旧怨收敛
+        """R4 修复：主代理用真实记录键 MAIN_SPEAKER（而非测试专用的 'pilot'）也能触发旧怨收敛
 
-        回归背景：生产代码永远不写 'presis'（主代理记录键是 '__main__'），
-        旧测试用手工 record('presis') 造数据掩盖了该缺陷——测试绿、功能死。
+        回归背景：生产代码永远不写 'pilot'（主代理记录键是 '__main__'），
+        旧测试用手工 record('pilot') 造数据掩盖了该缺陷——测试绿、功能死。
         """
         from arbitrate import MAIN_SPEAKER
 
         p = self._fresh_plugin()
         pp = p._presence_get(self._plain_event("两位在争什么"))
         pp.record(MAIN_SPEAKER, "main", "主一句")
-        pp.record("kaltsit", "forward", "凯一句")
+        pp.record("heron", "forward", "凯一句")
         # 让 R1 不成立（最后一条不是主代理）且 R4 成立，单独坐实旧怨判据
         pp.record(MAIN_SPEAKER, "main", "主二句")
-        pp.record("kaltsit", "forward", "凯二句")
-        assert pp.last_speaker == "kaltsit"
+        pp.record("heron", "forward", "凯二句")
+        assert pp.last_speaker == "heron"
         assert p._read_air_wants_quiet("两位在争什么", pp)
 
     def test_presence_mark_main_resets_active_chain(self):
@@ -1632,7 +1685,7 @@ class TestReadAirArbitrate(unittest.TestCase):
         p = self._fresh_plugin(read_air=True)
         ev = self._plain_event("x")
         pp = p._presence_get(ev)
-        pp.record("amiya", "forward", "阿米娅接话")
+        pp.record("nova", "forward", "小星接话")
         assert pp.active_chain is True
         p._presence_mark_main(ev, "我插一句")
         assert pp.active_chain is False
@@ -1643,18 +1696,18 @@ class TestReadAirArbitrate(unittest.TestCase):
         from arbitrate import MAIN_SPEAKER
 
         p = self._fresh_plugin(read_air=True, enforce=True)
-        ev = self._plain_event("阿米娅帮我查报错")
+        ev = self._plain_event("小星帮我查报错")
         p._presence_get(ev).record(MAIN_SPEAKER, "main", "我刚说过话")
-        assert p._arbitrate_directive(ev, "阿米娅帮我查报错", "amiya", True) == "main"
+        assert p._arbitrate_directive(ev, "小星帮我查报错", "nova", True) == "main"
 
     def test_arbitrate_directive_enforce_off_behaves_like_observe(self):
         """段五：enforce 默认关时与段二行为完全一致——只观察、返回 None、绝不拦截"""
         from arbitrate import MAIN_SPEAKER
 
         p = self._fresh_plugin(read_air=True, enforce=False)
-        ev = self._plain_event("阿米娅帮我查报错")
+        ev = self._plain_event("小星帮我查报错")
         p._presence_get(ev).record(MAIN_SPEAKER, "main", "我刚说过话")
-        assert p._arbitrate_directive(ev, "阿米娅帮我查报错", "amiya", True) is None
+        assert p._arbitrate_directive(ev, "小星帮我查报错", "nova", True) is None
 
     def test_presence_mark_main_safe_when_updater_missing(self):
         """_presence_mark_main 在缺 _presence_update 时静默返回，绝不影响发送主流程"""
@@ -1673,16 +1726,16 @@ class TestReadAirArbitrate(unittest.TestCase):
     def test_arbitrate_tool_default_off_passthrough(self):
         """默认关：_arbitrate_tool 原样返回 calls，零行为变化且不改调用"""
         p = self._fresh_plugin(read_air=False)
-        calls = [{"agent_name": "amiya", "input": "x"}, {"agent_name": "closure", "input": "y"}]
-        ev = self._tool_event("阿米娅帮我看看报错")
+        calls = [{"agent_name": "nova", "input": "x"}, {"agent_name": "bell", "input": "y"}]
+        ev = self._tool_event("小星帮我看看报错")
         out = p._arbitrate_tool(ev, calls)
         assert out is calls  # 原对象原样返回，绝不复制或过滤
 
     def test_arbitrate_tool_on_still_passthrough(self):
         """开启后也绝不砍 calls（V2 关键约束）：多人并行原样返回"""
         p = self._fresh_plugin(read_air=True)
-        calls = [{"agent_name": "amiya", "input": "x"}, {"agent_name": "closure", "input": "y"}]
-        ev = self._tool_event("阿米娅帮我看看报错")
+        calls = [{"agent_name": "nova", "input": "x"}, {"agent_name": "bell", "input": "y"}]
+        ev = self._tool_event("小星帮我看看报错")
         out = p._arbitrate_tool(ev, calls)
         assert out is calls
         assert len(out) == 2
@@ -1690,23 +1743,23 @@ class TestReadAirArbitrate(unittest.TestCase):
     def test_arbitrate_tool_updates_pending_batch(self):
         """开启时更新 pending_batch，记录本批候选供路径 A 读空气参考"""
         p = self._fresh_plugin(read_air=True)
-        calls = [{"agent_name": "amiya", "input": "x"}, {"agent_name": "closure", "input": "y"}]
-        ev = self._tool_event("阿米娅帮我看看报错")
+        calls = [{"agent_name": "nova", "input": "x"}, {"agent_name": "bell", "input": "y"}]
+        ev = self._tool_event("小星帮我看看报错")
         p._arbitrate_tool(ev, calls)
-        assert p._presence_get(ev).pending_batch == ["amiya", "closure"]
+        assert p._presence_get(ev).pending_batch == ["nova", "bell"]
 
     def test_arbitrate_tool_converge_hint_on_single_mention(self):
-        """博士只点名一人、calls 误带多人 → 日志给收敛建议（不砍 calls）"""
+        """老师只点名一人、calls 误带多人 → 日志给收敛建议（不砍 calls）"""
         import logging
 
         p = self._fresh_plugin(read_air=True)
-        calls = [{"agent_name": "amiya", "input": "x"}, {"agent_name": "closure", "input": "y"}]
-        ev = self._tool_event("阿米娅帮我看看报错")
-        # 断言触发收敛日志（点名 amiya 但 calls 带 amiua+closure 两人）
+        calls = [{"agent_name": "nova", "input": "x"}, {"agent_name": "bell", "input": "y"}]
+        ev = self._tool_event("小星帮我看看报错")
+        # 断言触发收敛日志（点名 nova 但 calls 带 amiua+bell 两人）
         out = p._arbitrate_tool(ev, calls)
         assert out is calls  # 仍原样返回
         # pending_batch 已更新
-        assert p._presence_get(ev).pending_batch == ["amiya", "closure"]
+        assert p._presence_get(ev).pending_batch == ["nova", "bell"]
 
 
 class TestDirectiveTaskClassify(unittest.TestCase):
@@ -1717,8 +1770,8 @@ class TestDirectiveTaskClassify(unittest.TestCase):
         inst = _cls.__new__(_cls)
         # 默认带 name_display_map，T1 点名判定依赖它
         base = {
-            "name_display_map": '{"amiya": "阿米娅", "closure": "可露希尔", "theresia": "特蕾西娅"}',
-            "direct_delivery_agents": "amiya,closure,theresia",
+            "name_display_map": '{"nova": "小星", "bell": "小铃", "luna": "小夜"}',
+            "direct_delivery_agents": "nova,bell,luna",
         }
         base.update(cfg)
         inst.config = base
@@ -1743,11 +1796,11 @@ class TestDirectiveTaskClassify(unittest.TestCase):
 
     def test_affection_mention(self):
         inst = self._make_plugin({})
-        assert inst._classify_directive_task(self._fake_event("阿米娅，多和博士亲亲")) == "affection"
+        assert inst._classify_directive_task(self._fake_event("小星，多陪我说说话")) == "affection"
 
     def test_affection_domain_word(self):
         inst = self._make_plugin({})
-        assert inst._classify_directive_task(self._fake_event("找可露希尔聊聊")) == "affection"
+        assert inst._classify_directive_task(self._fake_event("找小铃聊聊")) == "affection"
 
     def test_plain_chat_no_inject(self):
         inst = self._make_plugin({})
@@ -1760,7 +1813,7 @@ class TestDirectiveTaskClassify(unittest.TestCase):
     def test_tech_wins_over_mention(self):
         # 技术关键词优先：点名同时技术任务 → tech（统帅收卷，不直发）
         inst = self._make_plugin({})
-        assert inst._classify_directive_task(self._fake_event("阿米娅，帮我整理这份数据表格")) == "tech"
+        assert inst._classify_directive_task(self._fake_event("小星，帮我整理这份数据表格")) == "tech"
 
 
 class TestBuildRouteDirectiveMode(unittest.TestCase):
@@ -1773,7 +1826,7 @@ class TestBuildRouteDirectiveMode(unittest.TestCase):
         return inst
 
     def test_tech_directive_contains_mode_label(self):
-        cfg = {"direct_delivery_agents": "amiya,closure"}
+        cfg = {"direct_delivery_agents": "nova,bell"}
         inst = self._make_plugin(cfg)
         d = inst._build_route_directive("tech")
         assert "技术干活" in d
@@ -1781,7 +1834,7 @@ class TestBuildRouteDirectiveMode(unittest.TestCase):
         assert "relay" in d
 
     def test_affection_directive_contains_mode_label(self):
-        cfg = {"direct_delivery_agents": "amiya,closure"}
+        cfg = {"direct_delivery_agents": "nova,bell"}
         inst = self._make_plugin(cfg)
         d = inst._build_route_directive("affection")
         assert "日常贴贴" in d
@@ -1789,7 +1842,7 @@ class TestBuildRouteDirectiveMode(unittest.TestCase):
         assert "direct" in d
 
     def test_always_mode_no_task_kind(self):
-        cfg = {"direct_delivery_agents": "amiya,closure"}
+        cfg = {"direct_delivery_agents": "nova,bell"}
         inst = self._make_plugin(cfg)
         d = inst._build_route_directive(None)
         assert "【本次任务分类" not in d
@@ -1801,7 +1854,7 @@ class TestBuildRouteDirectiveMode(unittest.TestCase):
             assert inst._build_route_directive("tech") == ""
 
     def test_need_route_directive_delegates(self):
-        inst = self._make_plugin({"direct_delivery_agents": "amiya,closure"})
+        inst = self._make_plugin({"direct_delivery_agents": "nova,bell"})
         ev = MagicMock()
         ev.get_message_str.return_value = "帮我看看这段代码报错"
         assert inst._need_route_directive(ev) is True
@@ -1845,8 +1898,8 @@ class TestContextEngine:
 
         eng = ContextEngine(enabled=True, max_turns=5)
         # 存储一轮对话
-        eng.append("amiya", "sess1", "你好", "你好呀博士")
-        hist = eng.histories.get("amiya:sess1")
+        eng.append("nova", "sess1", "你好", "你好呀老师")
+        hist = eng.histories.get("nova:sess1")
         assert hist and len(hist) == 2
         assert hist[0]["role"] == "user" and hist[0]["content"] == "你好"
 
@@ -1854,7 +1907,7 @@ class TestContextEngine:
         # 注：本测试环境把 astrbot.core.agent.message 整体 mock 了，Message 实例是
         # MagicMock，故只能断言「结构与长度」，不能断言 role/content 的值；
         # 历史内容正确性由上面的 histories 断言负责。
-        prompt, contexts = asyncio.run(eng.inject("amiya", "sess1", "新的问题"))
+        prompt, contexts = asyncio.run(eng.inject("nova", "sess1", "新的问题"))
         # 核心契约：prompt 必须干净——历史不再拼进去（这是缓存能命中的前提）
         assert prompt == "新的问题"
         assert "对话历史" not in prompt and "新的输入" not in prompt
@@ -1862,7 +1915,7 @@ class TestContextEngine:
         assert len(contexts) == 2
 
         # 无历史时：prompt 原样、contexts 为空
-        prompt2, ctx2 = asyncio.run(eng.inject("closure", "sess1", "独自"))
+        prompt2, ctx2 = asyncio.run(eng.inject("bell", "sess1", "独自"))
         assert prompt2 == "独自" and ctx2 == []
 
     def test_inject_second_round_keeps_prefix_stable(self):
@@ -1875,11 +1928,11 @@ class TestContextEngine:
         from ctx_engine import ContextEngine
 
         eng = ContextEngine(enabled=True, max_turns=10)
-        eng.append("closure", "s", "第一问", "第一答")
-        _, ctx1 = asyncio.run(eng.inject("closure", "s", "第二问"))
+        eng.append("bell", "s", "第一问", "第一答")
+        _, ctx1 = asyncio.run(eng.inject("bell", "s", "第二问"))
 
-        eng.append("closure", "s", "第二问", "第二答")
-        _, ctx2 = asyncio.run(eng.inject("closure", "s", "第三问"))
+        eng.append("bell", "s", "第二问", "第二答")
+        _, ctx2 = asyncio.run(eng.inject("bell", "s", "第三问"))
 
         # 前缀稳定：老的 messages 一条不多一条不少，且首条对象身份不变
         assert len(ctx1) == 2
@@ -1894,22 +1947,22 @@ class TestContextEngine:
 
         eng = ContextEngine(enabled=True, max_turns=1)
         for i in range(3):
-            eng.append("theresia", "s9", f"问{i}", f"答{i}")
-        prompt, contexts = asyncio.run(eng.inject("theresia", "s9", "继续"))
+            eng.append("luna", "s9", f"问{i}", f"答{i}")
+        prompt, contexts = asyncio.run(eng.inject("luna", "s9", "继续"))
         # 3轮(6条) > 1轮 → 只保留最近 1 轮完整 = 2 条
         assert len(contexts) == 2
         assert prompt == "继续"
         # 截断后留下的是最近一轮（内容正确性看存储侧）
-        assert eng.histories["theresia:s9"][-2]["content"] == "问2"
+        assert eng.histories["luna:s9"][-2]["content"] == "问2"
 
     def test_disabled_noop(self):
         import asyncio
         from ctx_engine import ContextEngine
 
         eng = ContextEngine(enabled=False)
-        eng.append("amiya", "sx", "甲", "乙")
+        eng.append("nova", "sx", "甲", "乙")
         assert eng.histories == {}
-        prompt, contexts = asyncio.run(eng.inject("amiya", "sx", "原样"))
+        prompt, contexts = asyncio.run(eng.inject("nova", "sx", "原样"))
         assert prompt == "原样" and contexts == []
 
     def test_ctx_injection_stripped_for_memory_store(self):
@@ -1920,15 +1973,15 @@ class TestContextEngine:
         # 模拟 inject 产物（带用户身份注入 + 历史块）
         injected = (
             "--- 对话历史 ---\n"
-            "user: 你好\nassistant: 你好呀博士\n"
+            "user: 你好\nassistant: 你好呀老师\n"
             "--- 新的输入 ---\n"
             "[用户身份] 当前对话用户 user_id=TESTUSER00000000000000000000000000\n"
-            "阿米娅，多和博士亲亲"
+            "小星，多陪我说说话"
         )
         stored = _strip_chain_injection(_strip_ctx_injection(injected))
         assert stored == (
             "[用户身份] 当前对话用户 user_id=TESTUSER00000000000000000000000000\n"
-            "阿米娅，多和博士亲亲"
+            "小星，多陪我说说话"
         )
         assert "对话历史" not in stored
 
@@ -2024,10 +2077,10 @@ class TestContextEngine:
             unified_msg_origin="s1:FriendMessage:u1",
             get_platform_name=lambda: "qq_restapi",
         )
-        stub = m._subagent_event_stub(ev, "amiya")
-        assert stub.unified_msg_origin == "s1:FriendMessage:u1:subagent:amiya"
-        assert stub._subagent_persona == "amiya"
-        assert stub.persona_id == "amiya"
+        stub = m._subagent_event_stub(ev, "nova")
+        assert stub.unified_msg_origin == "s1:FriendMessage:u1:subagent:nova"
+        assert stub._subagent_persona == "nova"
+        assert stub.persona_id == "nova"
         # 2026-09-12 双写修复：改报群聊值，屏蔽 livingmemory 召回钩子的副作用存储
         #（钩子内 is_group=False 时会顺带存一遍用户消息，与本插件 _memory_store 叠加成双写）
         from astrbot.api.platform import MessageType
@@ -2045,14 +2098,14 @@ class TestContextEngine:
             self._make_subagent_memory_fixture(count=3, last=0, threshold=10)
         )
         asyncio.run(
-            m._memory_store(lm, orig_event, "amiya", "博士你好", "博士好呀")
+            m._memory_store(lm, orig_event, "nova", "老师你好", "老师好呀")
         )
         # 两条消息都写进专属会话
-        assert all(sid.endswith(":subagent:amiya") for sid, _, _ in cm.added)
-        assert cm.added[0][1] == "user" and "博士你好" in cm.added[0][2]
+        assert all(sid.endswith(":subagent:nova") for sid, _, _ in cm.added)
+        assert cm.added[0][1] == "user" and "老师你好" in cm.added[0][2]
         assert cm.added[1][1] == "assistant"
         # 消息上限检查用专属会话 umo
-        assert enforce and enforce[0].endswith(":subagent:amiya")
+        assert enforce and enforce[0].endswith(":subagent:nova")
         # 未达阈值（1.5轮 < 10）→ 不提炼
         assert added == []
 
@@ -2063,13 +2116,13 @@ class TestContextEngine:
         m, orig_event, lm, cm, me, added, enforce = (
             self._make_subagent_memory_fixture(count=22, last=0, threshold=10)
         )
-        stub = m._subagent_event_stub(orig_event, "amiya")
-        asyncio.run(m._maybe_reflect_subagent(lm, stub, "amiya"))
+        stub = m._subagent_event_stub(orig_event, "nova")
+        asyncio.run(m._maybe_reflect_subagent(lm, stub, "nova"))
         assert len(added) == 1
         kw = added[0]
-        assert kw["persona_id"] == "amiya"
+        assert kw["persona_id"] == "nova"
         assert kw["content"] == "总结内容"
-        assert kw["session_id"].endswith(":subagent:amiya")
+        assert kw["session_id"].endswith(":subagent:nova")
         assert kw["atoms"] == [{"atom": "a"}]
         assert kw["metadata"]["source_window"]["triggered_by"] == "subagent_auto"
         # 总结索引推进 + pending 清空
@@ -2083,8 +2136,8 @@ class TestContextEngine:
         m, orig_event, lm, cm, me, added, enforce = (
             self._make_subagent_memory_fixture(count=6, last=0, threshold=10)
         )
-        stub = m._subagent_event_stub(orig_event, "amiya")
-        asyncio.run(m._maybe_reflect_subagent(lm, stub, "amiya"))
+        stub = m._subagent_event_stub(orig_event, "nova")
+        asyncio.run(m._maybe_reflect_subagent(lm, stub, "nova"))
         assert added == []
         assert "last_summarized_index" not in cm.meta
 
@@ -2096,9 +2149,9 @@ class TestContextEngine:
         m, orig_event, lm, cm, me, added, enforce = (
             self._make_subagent_memory_fixture(count=22, last=0, threshold=10)
         )
-        stub = m._subagent_event_stub(orig_event, "amiya")
+        stub = m._subagent_event_stub(orig_event, "nova")
         # command_handler 缺失
-        asyncio.run(m._maybe_reflect_subagent(ts.SimpleNamespace(), stub, "amiya"))
+        asyncio.run(m._maybe_reflect_subagent(ts.SimpleNamespace(), stub, "nova"))
         assert added == []
         # 组件不全（无 memory_engine）
         broken = ts.SimpleNamespace(
@@ -2106,7 +2159,7 @@ class TestContextEngine:
                 conversation_manager=cm, _memory_processor=None, config_manager=None
             )
         )
-        asyncio.run(m._maybe_reflect_subagent(broken, stub, "amiya"))
+        asyncio.run(m._maybe_reflect_subagent(broken, stub, "nova"))
         assert added == []
 
 class TestChainSummary(unittest.TestCase):
@@ -2138,8 +2191,8 @@ class TestChainSummary(unittest.TestCase):
     def test_short_text_returned_as_is(self):
         """首尾保留量已覆盖全文 → 原样返回，不调用模型。"""
         plugin = self._make_plugin({"chain_summary_keep_head_tail": 120})
-        text = "博士今天想喝哪一种咖啡" * 3
-        out = asyncio.run(plugin._summarize_chain_reply("阿米娅", text, "", 30))
+        text = "老师今天想喝哪一种咖啡" * 3
+        out = asyncio.run(plugin._summarize_chain_reply("小星", text, "", 30))
         self.assertEqual(out, text)
 
     def test_model_failure_falls_back_to_head_tail(self):
@@ -2149,7 +2202,7 @@ class TestChainSummary(unittest.TestCase):
             llm_generate=AsyncMock(side_effect=RuntimeError("provider down")),
         )
         text = "头" * 50 + "中" * 400 + "尾" * 50
-        out = asyncio.run(plugin._summarize_chain_reply("夕", text, "bad-provider", 30))
+        out = asyncio.run(plugin._summarize_chain_reply("辰", text, "bad-provider", 30))
         self.assertIn("头" * 50, out)
         self.assertIn("尾" * 50, out)
         self.assertIn("中段 400 字略", out)
@@ -2164,7 +2217,7 @@ class TestChainSummary(unittest.TestCase):
             llm_generate=AsyncMock(return_value=resp),
         )
         text = "头" * 50 + "中" * 400 + "尾" * 50
-        out = asyncio.run(plugin._summarize_chain_reply("可露希尔", text, "prov", 30))
+        out = asyncio.run(plugin._summarize_chain_reply("小铃", text, "prov", 30))
         self.assertIn("她把刀递过来", out)
         self.assertIn("头" * 50, out)
         self.assertIn("尾" * 50, out)
@@ -2188,7 +2241,7 @@ class TestChainSummary(unittest.TestCase):
 
 
 class TestChainMemoryPersist(unittest.TestCase):
-    """2026-09-07 3P/4P 接龙修复：
+    """2026-09-07 多人接龙修复：
 
     1. chained 注入升级为「全场脉络」，剥离函数须能把新注入剥干净（防污染记忆）
     2. 兼容旧的「接龙·上一位」注入（向后兼容，不破坏既有行为）
@@ -2207,50 +2260,50 @@ class TestChainMemoryPersist(unittest.TestCase):
 
     def test_new_full_scene_injection_stripped(self):
         """新「全场脉络」注入块必须被 _strip_chain_injection 剥净，只剩本轮真实输入。
-        这是防污染的关键：若剥不净，3P 接入会让临时上下文漏进长期记忆/存储链路。"""
+        这是防污染的关键：若剥不净，多人接龙会让临时上下文漏进长期记忆/存储链路。"""
         from memory import _strip_chain_injection
 
         injected = (
             "（接龙·全场脉络，到目前为止）：\n"
-            "▍博士：晚上好\n"
-            "【阿米娅】来啦\n"
+            "▍老师：晚上好\n"
+            "【小星】来啦\n"
             "\n"
-            "请接续上文，现在轮到你（【斯卡蒂】）回应，顺着全场的话茬自然往下："
-            "博士我们继续聊点刺激的"
+            "请接续上文，现在轮到你（【小汐】）回应，顺着全场的话茬自然往下："
+            "老师我们继续聊点刺激的"
         )
         out = _strip_chain_injection(injected)
-        self.assertEqual(out.strip(), "博士我们继续聊点刺激的")
+        self.assertEqual(out.strip(), "老师我们继续聊点刺激的")
         self.assertNotIn("全场脉络", out)
-        self.assertNotIn("博士：晚上好", out)
+        self.assertNotIn("老师：晚上好", out)
 
     def test_old_chain_injection_still_compatible(self):
         """旧的「接龙·上一位」注入仍能被剥离（向后兼容，不破坏既有行为）。"""
         from memory import _strip_chain_injection
 
         old = (
-            "（接龙·上一位）【阿米娅】的回复：\n"
+            "（接龙·上一位）【小星】的回复：\n"
             "刚才说啥\n"
             "\n"
             "请接续上文，现在轮到你回应：咱们继续"
         )
         out = _strip_chain_injection(old)
         self.assertEqual(out.strip(), "咱们继续")
-        self.assertNotIn("阿米娅", out)
+        self.assertNotIn("小星", out)
 
     def test_pov_text_not_stripped(self):
-        """3P 沉淀用纯视角文本不带接龙标记，不得被误剥。"""
+        """多人沉淀用纯视角文本不带接龙标记，不得被误剥。"""
         from memory import _strip_chain_injection
 
         pov = (
-            "这一天博士把我们凑到一块儿，他先起了个头：晚上好。\n"
-            "我还听到另一边：阿米娅对我说：…\n"
+            "这一天老师把我们凑到一块儿，他先起了个头：晚上好。\n"
+            "我还听到另一边：小星对我说：…\n"
             "\n（这是我们一起经历过的一段，我记得它，日子照常过着。）"
         )
         out = _strip_chain_injection(pov)
         self.assertEqual(out, pov)
 
     def test_persist_switch_exists_default_on(self):
-        """enable_chain_memory_persist 开关存在且默认开（3P 可留长期记忆）。"""
+        """enable_chain_memory_persist 开关存在且默认开（多人场可留长期记忆）。"""
         schema_path = os.path.join(PLUGIN_DIR, "_conf_schema.json")
         with open(schema_path, "r", encoding="utf-8") as f:
             schema = json.load(f)
@@ -2259,45 +2312,45 @@ class TestChainMemoryPersist(unittest.TestCase):
 
     def test_cross_round_injection_stripped(self):
         """跨轮续接「上一场脉络」注入块必须被 _strip_chain_injection 剥净。
-        2026-09-08 博士实测：夕+年3P 第二轮「继续做爱」首发者夕失忆拉错人，
+        2026-09-08 实测：辰+晴 多人第二轮「继续吧」首发者辰拉错人，
         修复引入上一轮脉络注入；该注入是临时上下文，绝不可漏进长期记忆。"""
         from memory import _strip_chain_injection
 
         injected = (
             "（接龙·上一场脉络，你们还没散场）：\n"
-            "【夕】我先进去了哦\n"
-            "【年】你倒是慢点\n"
+            "【辰】我先进去了哦\n"
+            "【晴】你倒是慢点\n"
             "\n"
-            "顺着上一场的话茬自然往下：博士我们接着来"
+            "顺着上一场的话茬自然往下：老师我们接着来"
         )
         out = _strip_chain_injection(injected)
-        self.assertEqual(out.strip(), "博士我们接着来")
+        self.assertEqual(out.strip(), "老师我们接着来")
         self.assertNotIn("上一场脉络", out)
-        self.assertNotIn("【年】", out)
+        self.assertNotIn("【晴】", out)
 
     def test_build_prev_round_note_same_group(self):
         """_build_prev_round_note：同场续接（本轮与上轮在场者有交集）返回脉络块，
         全新场次（无交集）返回空 —— 防止串场污染。"""
         plugin = TestChainMemoryPersist._make_plugin(self)
         plugin._chain_round_ctx = {}
-        plugin._chain_round_ctx["sess-3p"] = {
+        plugin._chain_round_ctx["sess-group"] = {
             "ts": time.time(),
-            "agents": ["xi", "nian"],
+            "agents": ["chen", "qing"],
             "speeches": [
-                {"agent": "xi", "display": "夕", "text": "我先进来了"},
-                {"agent": "nian", "display": "年", "text": "你慢点，等等我"},
+                {"agent": "chen", "display": "辰", "text": "我先进来了"},
+                {"agent": "qing", "display": "晴", "text": "你慢点，等等我"},
             ],
         }
-        # 同场续接：夕+年 再来
-        note = plugin._build_prev_round_note("sess-3p", ["xi", "nian"])
+        # 同场续接：辰+晴 再来
+        note = plugin._build_prev_round_note("sess-group", ["chen", "qing"])
         self.assertIn("上一场脉络", note)
-        self.assertIn("【夕】", note)
-        self.assertIn("【年】", note)
-        # 全新场次：点名阿米娅+斯卡蒂（与上轮无交集）→ 不注入
-        note2 = plugin._build_prev_round_note("sess-3p", ["amiya", "skadi"])
+        self.assertIn("【辰】", note)
+        self.assertIn("【晴】", note)
+        # 全新场次：点名小星+小汐（与上轮无交集）→ 不注入
+        note2 = plugin._build_prev_round_note("sess-group", ["nova", "tide"])
         self.assertEqual(note2, "")
         # 无缓存的 session → 空
-        self.assertEqual(plugin._build_prev_round_note("sess-other", ["xi"]), "")
+        self.assertEqual(plugin._build_prev_round_note("sess-other", ["chen"]), "")
 
     def test_build_prev_round_note_expired(self):
         """跨轮脉络超过 5 分钟视为旧场，不注入（防止旧场次串味）。"""
@@ -2305,12 +2358,12 @@ class TestChainMemoryPersist(unittest.TestCase):
         plugin._chain_round_ctx = {}
         plugin._chain_round_ctx["sess-old"] = {
             "ts": time.time() - 600,
-            "agents": ["xi", "nian"],
+            "agents": ["chen", "qing"],
             "speeches": [
-                {"agent": "xi", "display": "夕", "text": "老早以前说的"},
+                {"agent": "chen", "display": "辰", "text": "老早以前说的"},
             ],
         }
-        note = plugin._build_prev_round_note("sess-old", ["xi", "nian"])
+        note = plugin._build_prev_round_note("sess-old", ["chen", "qing"])
         self.assertEqual(note, "")
 
 
@@ -2333,8 +2386,8 @@ class TestRandomState(unittest.TestCase):
 
     def test_roll_daily_state_deterministic_same_day(self):
         """同一 agent 同日 roll 结果稳定（确定性种子去抖动）"""
-        a = roll_daily_state("kaltsit")
-        b = roll_daily_state("kaltsit")
+        a = roll_daily_state("heron")
+        b = roll_daily_state("heron")
         assert a.mood == b.mood and a.domain == b.domain and a.hand == b.hand
         assert a.seed == b.seed
         assert a.day == _today()
@@ -2342,16 +2395,16 @@ class TestRandomState(unittest.TestCase):
     def test_roll_daily_state_different_agents_differ(self):
         """不同 agent 同日结果大概率不同（不被算死）"""
         x = set()
-        for name in ("amiya", "closure", "theresia", "kaltsit", "skadi"):
+        for name in ("nova", "bell", "luna", "heron", "tide"):
             x.add((roll_daily_state(name).mood, roll_daily_state(name).domain))
         assert len(x) >= 2  # 至少两个不同组合
 
     def test_deterministic_seed_stable_per_agent_day(self):
         """deterministic_seed 按 agent+day 稳定、跨 agent 不同"""
         day = "2026-09-03"
-        s1 = _deterministic_seed("amiya", day)
-        s2 = _deterministic_seed("amiya", day)
-        s3 = _deterministic_seed("closure", day)
+        s1 = _deterministic_seed("nova", day)
+        s2 = _deterministic_seed("nova", day)
+        s3 = _deterministic_seed("bell", day)
         assert s1 == s2
         assert s1 != s3
 
@@ -2365,15 +2418,15 @@ class TestRandomState(unittest.TestCase):
     def test_manager_scene_isolation(self):
         """场景隔离：不同 unified_msg_origin 互不污染"""
         mgr = RandomStateManager()
-        st_a = mgr.get("scene1", "amiya")
-        # scene2 还没初始化 amiya -> 惰性
-        assert "amiya" not in mgr.all("scene2").keys()
-        mgr.get("scene2", "amiya")
-        assert mgr.all("scene1").keys() == {"amiya"}
-        assert mgr.all("scene2").keys() == {"amiya"}
+        st_a = mgr.get("scene1", "nova")
+        # scene2 还没初始化 nova -> 惰性
+        assert "nova" not in mgr.all("scene2").keys()
+        mgr.get("scene2", "nova")
+        assert mgr.all("scene1").keys() == {"nova"}
+        assert mgr.all("scene2").keys() == {"nova"}
         # 改 scene1 不影响 scene2
-        st_a2 = mgr.set_llm("scene1", "amiya", "亢奋", "工作")
-        assert mgr.get("scene2", "amiya").mood != st_a2.mood or True  # scene2 不受覆盖
+        st_a2 = mgr.set_llm("scene1", "nova", "亢奋", "工作")
+        assert mgr.get("scene2", "nova").mood != st_a2.mood or True  # scene2 不受覆盖
 
     def test_manager_lazy_init(self):
         """惰性初始化：未取过的场景不占内存"""
@@ -2385,11 +2438,11 @@ class TestRandomState(unittest.TestCase):
     def test_roll_daily_state_default_no_dedup_unchanged(self):
         """默认不传 avoid → 纯函数行为不变（确定性 seed 稳定）"""
         from random_state import _base_hand
-        a = roll_daily_state("closure", avoid_hands=[])
-        b = roll_daily_state("closure", avoid_hands=[])
+        a = roll_daily_state("bell", avoid_hands=[])
+        b = roll_daily_state("bell", avoid_hands=[])
         assert a.mood == b.mood and a.domain == b.domain
         # avoid=[] 与 None 同行为（不剔池）
-        assert a.hand == roll_daily_state("closure").hand
+        assert a.hand == roll_daily_state("bell").hand
 
     def test_base_hand_strips_suffix(self):
         """基础手头事剥离：去个性后缀后与池内原文对齐"""
@@ -2413,12 +2466,12 @@ class TestRandomState(unittest.TestCase):
             hand_a = flavors[0]
             # avoid 含 hand_a → 抽到的 base 不能是 hand_a（除非全池只剩它）
             for _ in range(20):
-                st = roll_daily_state("shu", avoid_hands=[hand_a])
+                st = roll_daily_state("he", avoid_hands=[hand_a])
                 if st.domain == domain:
                     self.assertNotIn(_base_hand(st.hand), [hand_a])
         # avoid=全池 → 回退全池，不抛异常且抽取合法
         for _ in range(5):
-            st = roll_daily_state("closure", avoid_hands=flavors)
+            st = roll_daily_state("bell", avoid_hands=flavors)
             self.assertTrue(st.hand)
 
     def test_manager_dedup_cross_day(self):
@@ -2431,18 +2484,18 @@ class TestRandomState(unittest.TestCase):
         from random_state import _record_seen, _seen_load, _recent_avoid_hands
         _day_a = "2026-08-20"
         _day_b = "2026-08-21"
-        _record_seen("shu", "生活", "在收拾房间，刚歇口气", _day_a, seen_file)
-        _record_seen("shu", "生活", "在收拾房间", _day_b, seen_file)
+        _record_seen("he", "生活", "在收拾房间，刚歇口气", _day_a, seen_file)
+        _record_seen("he", "生活", "在收拾房间", _day_b, seen_file)
         # 落盘验证（剥离后缀存 base）
         assert os.path.exists(seen_file)
         data = _seen_load(seen_file)
-        assert data[_day_a]["shu"]["hand"] == "在收拾房间"
-        assert data[_day_b]["shu"]["hand"] == "在收拾房间"
+        assert data[_day_a]["he"]["hand"] == "在收拾房间"
+        assert data[_day_b]["he"]["hand"] == "在收拾房间"
         # 9-04 之前 7 天内的 avoid 命中（.20/.21 在 7 天窗口）
-        avoid = _recent_avoid_hands("shu", "生活", "2026-08-25", seen_file)
+        avoid = _recent_avoid_hands("he", "生活", "2026-08-25", seen_file)
         assert "在收拾房间" in avoid
         # 窗口外（30 天前）不命中
-        avoid_old = _recent_avoid_hands("shu", "生活", "2026-09-20", seen_file)
+        avoid_old = _recent_avoid_hands("he", "生活", "2026-09-20", seen_file)
         assert "在收拾房间" not in avoid_old
 
     def test_manager_dedup_first_use_no_crash(self):
@@ -2453,7 +2506,7 @@ class TestRandomState(unittest.TestCase):
         self.addCleanup(shutil.rmtree, tmp)
         seen_file = os.path.join(tmp, "seen.json")
         mgr = RandomStateManager(seen_path=seen_file)
-        st = mgr.get("scene", "amiya")
+        st = mgr.get("scene", "nova")
         # 生成并写入 seen（get 内部 _roll_with_avoid + _record_seen）
         assert st.hand
         assert os.path.exists(seen_file)
@@ -2461,10 +2514,10 @@ class TestRandomState(unittest.TestCase):
         data = _seen_load(seen_file)
         # _record_seen 的去重契约是存 base hand（跨天去重比对），
         # 断言带后缀 st.hand 剥后缀后与存储一致（原断言误用带后缀值比对而恒挂）
-        assert data.get(st.day, {}).get("amiya", {}).get("hand") == _base_hand(st.hand)
+        assert data.get(st.day, {}).get("nova", {}).get("hand") == _base_hand(st.hand)
 
     def test_private_domain_in_pools(self):
-        """私房域入池（2026-09-04 博士拍板 A）：LIFE_DOMAINS/DOMAIN_KEYWORDS/HAND_FLAVOR 三处齐备"""
+        """私房域入池（2026-09-04 老师拍板 A）：LIFE_DOMAINS/DOMAIN_KEYWORDS/HAND_FLAVOR 三处齐备"""
         from random_state import LIFE_DOMAINS, DOMAIN_KEYWORDS, HAND_FLAVOR
         assert "私房" in LIFE_DOMAINS
         assert "私房" in DOMAIN_KEYWORDS and DOMAIN_KEYWORDS["私房"]
@@ -2475,26 +2528,26 @@ class TestRandomState(unittest.TestCase):
             assert _base_hand(f) == f, f"私房手头事带后缀: {f}"
 
     def test_private_domain_weight_tiers(self):
-        """私房域权重分级：放得开的≥2、害羞的≤0.5、凯尔希最低（博士拍板）"""
+        """私房域权重分级：放得开的≥2、害羞的≤0.5、小鹭最低（老师拍板）"""
         from random_state import PERSONA_DOMAIN_WEIGHTS
         w = PERSONA_DOMAIN_WEIGHTS
-        for name in ("closure", "nian", "shu", "liino"):
+        for name in ("bell", "qing", "he", "song"):
             assert w[name].get("私房", 0) >= 2, f"{name} 私房权重应放得开"
-        for name in ("amiya", "xi", "kaltsit"):
+        for name in ("nova", "chen", "heron"):
             assert w[name].get("私房", 0) <= 0.5, f"{name} 私房权重应极低"
 
     def test_roll_private_domain_hand_from_pool(self):
         """掷中私房域时，hand 必须来自私房池（不串其他域）"""
-        from random_state import HAND_FLAVOR, roll_daily_state
+        from random_state import HAND_FLAVOR, LIFE_DOMAINS, roll_daily_state
         for _ in range(50):
-            st = roll_daily_state("closure", avoid_hands=[])
+            st = roll_daily_state("bell", avoid_hands=[])
             if st.domain == "私房":
                 assert any(
                     st.hand == f or st.hand.startswith(f) for f in HAND_FLAVOR["私房"]
                 ), f"私房域 hand 越界: {st.hand}"
                 return
-        # 50 次未中（确定性 seed 可能偏），验证掷取合法即可
-        assert st.domain in ("工作", "吐槽", "深夜随笔", "兴趣", "生活", "私房")
+        # 50 次未中（确定性 seed 可能偏），验证掷取合法即可（域列表随部署数据）
+        assert st.domain in LIFE_DOMAINS, f"域越界: {st.domain}"
 
     def test_wild_private_branch_forces_private(self):
         """B：跳脱命中且 wild_private 命中 → 强制私房域（今天格外想他）"""
@@ -2521,7 +2574,7 @@ class TestRandomState(unittest.TestCase):
                     return super().random()
 
             rs.random.Random = _FakeRandom
-            st = rs.roll_daily_state("closure")
+            st = rs.roll_daily_state("bell")
             assert st.domain == "私房", f"wild_private 未强制私房: {st.domain}"
             assert st.hand, "私房域必须有手头事"
         finally:
@@ -2541,17 +2594,17 @@ class TestDailyLifeInjector(unittest.TestCase):
 
     def test_build_inject_prompt(self):
         """组装 prompt：含代理清单、今日话题域、对话记录"""
-        p = build_inject_prompt(["amiya", "closure"], "对话...", ["工作", "生活"])
-        assert "amiya、closure" in p["user"]
+        p = build_inject_prompt(["nova", "bell"], "对话...", ["工作", "生活"])
+        assert "nova、bell" in p["user"]
         assert "工作、生活" in p["user"]
         assert "对话..." in p["user"]
         assert p["system"]
 
     def test_parse_json_with_fence(self):
         """解析带 ```json 围栏的 LLM 输出"""
-        raw = '```json\n[{"agent":"amiya","mood":"专注","hand":"在拆报错","domain":"工作"}]\n```'
+        raw = '```json\n[{"agent":"nova","mood":"专注","hand":"在拆报错","domain":"工作"}]\n```'
         out = DailyLifeInjector._parse_json(raw)
-        assert out and out[0]["agent"] == "amiya"
+        assert out and out[0]["agent"] == "nova"
 
     def test_parse_json_garbage_returns_empty(self):
         """非 JSON 输出安全返回空，不抛异常"""
@@ -2566,9 +2619,9 @@ class TestDailyLifeInjector(unittest.TestCase):
         """provider 缺失时降级为纯规则随机，且为每 agent 补位"""
         rng = RandomStateManager()
         inj = DailyLifeInjector(rng, object(), provider_id="")
-        summary = asyncio.run(inj.inject("s", ["amiya", "closure"], "log"))
-        assert "amiya" in summary and "closure" in summary
-        assert summary["amiya"]  # 至少 mood/domain 非空
+        summary = asyncio.run(inj.inject("s", ["nova", "bell"], "log"))
+        assert "nova" in summary and "bell" in summary
+        assert summary["nova"]  # 至少 mood/domain 非空
 
     def test_inject_degrade_on_llm_exception(self):
         """LLM 抛异常时降级为纯规则随机，绝不致命"""
@@ -2577,8 +2630,8 @@ class TestDailyLifeInjector(unittest.TestCase):
         async def boom(**kw):
             raise RuntimeError("glm down")
 
-        summary = asyncio.run(self._degrades(boom, rng, "s", ["skadi"]))
-        assert "skadi" in summary
+        summary = asyncio.run(self._degrades(boom, rng, "s", ["tide"]))
+        assert "tide" in summary
 
     def test_inject_success_updates_state(self):
         """LLM 成功返回 JSON 时覆盖对应 agent 的 random_state"""
@@ -2587,21 +2640,21 @@ class TestDailyLifeInjector(unittest.TestCase):
         async def ok(**kw):
             resp = MagicMock()
             resp.completion_text = (
-                '[{"agent":"theresia","mood":"专注","hand":"在梳理战略","domain":"工作"},'
-                '{"agent":"amiya","mood":"亢奋","domain":"生活"}]'
+                '[{"agent":"luna","mood":"专注","hand":"在梳理战略","domain":"工作"},'
+                '{"agent":"nova","mood":"亢奋","domain":"生活"}]'
             )
             return resp
 
         inj = DailyLifeInjector(rng, ok, provider_id="glm-flash")
-        summary = asyncio.run(inj.inject("s1", ["theresia", "amiya"], "log"))
-        # theresia 被 LLM 覆盖
-        st = rng.get("s1", "theresia")
+        summary = asyncio.run(inj.inject("s1", ["luna", "nova"], "log"))
+        # luna 被 LLM 覆盖
+        st = rng.get("s1", "luna")
         assert st.llm_updated is True
         assert st.mood == "专注"
         assert st.domain == "工作"
-# ── 三期·M3 今日状态契合度（_daily_affinity / best_affinity，2026-09-03） ──────
+# ── 三期·小玖 今日状态契合度（_daily_affinity / best_affinity，2026-09-03） ──────
 class TestDailyAffinity(unittest.TestCase):
-    """M3 · 接话权重叠加的数据支撑：今日话题域契合度"""
+    """小玖 · 接话权重叠加的数据支撑：今日话题域契合度"""
 
     def _state_domain(self, mgr, scene, agent, domain):
         """强制把 agent 今日话题域设为指定值，便于确定性断言"""
@@ -2610,32 +2663,32 @@ class TestDailyAffinity(unittest.TestCase):
     def test_affinity_hit_domain_keyword(self):
         """命中今日话题域关键词 -> 正分"""
         mgr = RandomStateManager()
-        self._state_domain(mgr, "s", "kaltsit", "工作")
+        self._state_domain(mgr, "s", "heron", "工作")
         # "在开会吗" 含工作域关键词"开会" -> fav
-        assert mgr.daily_affinity("s", "kaltsit", "在开会吗？") >= 1
+        assert mgr.daily_affinity("s", "heron", "在开会吗？") >= 1
 
     def test_affinity_miss_other_domain(self):
         """话题与今日话题域不符 -> 0 分（今天不契合，可由别人接）"""
         mgr = RandomStateManager()
-        self._state_domain(mgr, "s", "kaltsit", "深夜随笔")
+        self._state_domain(mgr, "s", "heron", "深夜随笔")
         # 工作话题 vs 深夜随笔域 -> 0
-        assert mgr.daily_affinity("s", "kaltsit", "代码跑出 bug 了") == 0
+        assert mgr.daily_affinity("s", "heron", "代码跑出 bug 了") == 0
 
     def test_best_affinity_picks_most_fitting(self):
         """今天最契合消息话题的 agent 被挑中（不被算死）"""
         mgr = RandomStateManager()
-        self._state_domain(mgr, "s", "amiya", "生活")      # 今天聊生活的
-        self._state_domain(mgr, "s", "closure", "工作")    # 今天聊工作的
-        # 消息是工作向 -> closure(工作) 契合 > amiya(生活) 契合
-        best = mgr.best_affinity("s", ["amiya", "closure"], "这个项目怎么跑通")
-        assert best == "closure"
+        self._state_domain(mgr, "s", "nova", "生活")      # 今天聊生活的
+        self._state_domain(mgr, "s", "bell", "工作")    # 今天聊工作的
+        # 消息是工作向 -> bell(工作) 契合 > nova(生活) 契合
+        best = mgr.best_affinity("s", ["nova", "bell"], "这个项目怎么跑通")
+        assert best == "bell"
 
     def test_best_affinity_none_when_all_zero(self):
         """今天谁都不契合 -> 返回 None（交主代理自然接）"""
         mgr = RandomStateManager()
-        self._state_domain(mgr, "s", "amiya", "深夜随笔")
-        self._state_domain(mgr, "s", "skadi", "兴趣")
-        assert mgr.best_affinity("s", ["amiya", "skadi"], "预算不够了") is None
+        self._state_domain(mgr, "s", "nova", "深夜随笔")
+        self._state_domain(mgr, "s", "tide", "兴趣")
+        assert mgr.best_affinity("s", ["nova", "tide"], "预算不够了") is None
 
     def test_affinity_missing_state_returns_zero(self):
         """状态缺失/未初始化 -> 0 分，绝不炸"""
@@ -2653,8 +2706,8 @@ class TestDailyAffinity(unittest.TestCase):
         ev.unified_msg_origin = "sx"
         # 空 mixin 实例 + 空 state -> 归零
         m = ArbitrationMixin.__new__(ArbitrationMixin)
-        assert m._daily_affinity_for(ev, "amiya", "随便说点") == 0
-# ── 四期A · 今日状态接入 dispatch 注入链（2026-09-03 普瑞赛斯） ──────────
+        assert m._daily_affinity_for(ev, "nova", "随便说点") == 0
+# ── 四期A · 今日状态接入 dispatch 注入链（2026-09-03 领航） ──────────
 class TestDailyLifeInjectToDispatch(unittest.TestCase):
     """把 M1/M2 每日状态真实喂给子代理对话：开关门控 + 注入文本 + 引擎懒建"""
 
@@ -2675,11 +2728,11 @@ class TestDailyLifeInjectToDispatch(unittest.TestCase):
     def test_daily_state_text_natural_phrase(self):
         """_daily_state_text 拼出可读的『今日日常』叙述（非紧凑 summary）"""
         from dispatch import DispatchMixin
-        st = DailyState(agent="amiya", day=_today(), mood="小雀跃",
+        st = DailyState(agent="nova", day=_today(), mood="小雀跃",
                         domain="绘画", hand="琢磨《暮色》那组新画（一个人）", seed=1)
         mixin = DispatchMixin.__new__(DispatchMixin)
         # 直接调辅助纯函数
-        txt = DispatchMixin._daily_state_text(mixin, "amiya", st)
+        txt = DispatchMixin._daily_state_text(mixin, "nova", st)
         assert "今日日常" in txt
         assert "小雀跃" in txt
         assert "暮色" in txt
@@ -2714,18 +2767,18 @@ class TestDailyLifeInjectToDispatch(unittest.TestCase):
         """开关开启：parallel_handoff 调用子代理时 extra_user_content 含『今日日常』"""
         mock_context = MagicMock()
         class _FakeAgent:
-            name = "amiya"
+            name = "nova"
             instructions = ""
             tools = None
             begin_dialogs = None
         class _FakeHandoff:
             agent = _FakeAgent()
             provider_id = None
-            name = "transfer_to_amiya"
+            name = "transfer_to_nova"
         mock_context.subagent_orchestrator.handoffs = [_FakeHandoff()]
         mock_context.get_all_stars.return_value = []
         class _FakeLLMResp:
-            completion_text = "阿米娅的回复"
+            completion_text = "小星的回复"
         captured = {}
         async def _fake_generate(**kwargs):
             # 2026-09-11：子代理改走 tool_loop_agent，旁轨注入文本并入 prompt
@@ -2748,7 +2801,7 @@ class TestDailyLifeInjectToDispatch(unittest.TestCase):
         ev.message_obj.message_id = "msg-today-inject"
         raw = asyncio.run(plugin.parallel_handoff(
             ev,
-            calls=[{"agent_name": "amiya", "input": "今天过得怎么样"}],
+            calls=[{"agent_name": "nova", "input": "今天过得怎么样"}],
         ))
         data = json.loads(raw)
         assert data["results"][0]["success"] is True
@@ -2756,7 +2809,7 @@ class TestDailyLifeInjectToDispatch(unittest.TestCase):
         assert "今日日常" in joined
 
 
-# ── M5 · 家庭旁轨（family_pulse，2026-09-04 博士拍板 6 人常驻） ──────────────
+# ── M5 · 家庭旁轨（family_pulse，2026-09-04 老师拍板 6 人常驻） ──────────────
 class TestFamilyPulse(unittest.TestCase):
     """家庭旁轨：心跳闲聊 / 每日摘要 / cron 幂等 / 默认关零行为"""
 
@@ -2786,7 +2839,7 @@ class TestFamilyPulse(unittest.TestCase):
             "family_pulse_host_max": 0,
             "family_pulse_draft_enable": False,
             # 显式声明常驻池（代码侧不再内置默认名单，测试自备样本池）
-            "family_pulse_members": '["amiya","shu","closure","xi","theresia","skadi","ling","nian","liino","m3","kaltsit"]',
+            "family_pulse_members": '["nova","he","bell","chen","luna","tide","lan","qing","song","nine","heron"]',
         }
         if config:
             base.update(config)
@@ -2809,12 +2862,12 @@ class TestFamilyPulse(unittest.TestCase):
         """常驻池非法 JSON / 不足 2 人 → 返回空列表（代码侧不内置名单）"""
         p = self._make({"family_pulse_members": "{bad json"})
         self.assertEqual(p._pulse_members(), [])
-        p2 = self._make({"family_pulse_members": '["amiya"]'})
+        p2 = self._make({"family_pulse_members": '["nova"]'})
         self.assertEqual(len(p2._pulse_members()), 0)
 
     def test_members_custom(self):
-        p = self._make({"family_pulse_members": '["amiya","shu","closure"]'})
-        self.assertEqual(p._pulse_members(), ["amiya", "shu", "closure"])
+        p = self._make({"family_pulse_members": '["nova","he","bell"]'})
+        self.assertEqual(p._pulse_members(), ["nova", "he", "bell"])
 
     def test_schema_has_pulse_keys(self):
         """schema 必须包含家庭旁轨 16 个配置项且开关默认 False"""
@@ -2853,7 +2906,7 @@ class TestFamilyPulse(unittest.TestCase):
     def test_pick_two(self):
         """返回 2 人且互不相同"""
         p = self._make({})
-        a, b = p._pulse_pick_two(["amiya", "shu", "closure", "xi"])
+        a, b = p._pulse_pick_two(["nova", "he", "bell", "chen"])
         self.assertTrue(a and b and a != b)
 
     def _write_affinity(self, p, pairs):
@@ -2865,29 +2918,29 @@ class TestFamilyPulse(unittest.TestCase):
             json.dump(rel, f, ensure_ascii=False)
 
     def test_affinity_parses_and_skips_unmapped(self):
-        """关系网解析成英文 id 矩阵，博士/普瑞赛斯等无 id 对跳过"""
+        """关系网解析成英文 id 矩阵，老师/领航等无 id 对跳过"""
         p = self._make({})
         self._write_affinity(p, {
-            "阿米娅<->特蕾西娅": {"亲密度": 95, "基调": "敬+依恋"},
-            "凯尔希<->博士": {"亲密度": 100, "基调": "君臣"},
+            "小星<->小夜": {"亲密度": 95, "基调": "敬+依恋"},
+            "小鹭<->老师": {"亲密度": 100, "基调": "君臣"},
         })
         aff = p._pulse_affinity()
-        self.assertIn(frozenset(("amiya", "theresia")), aff)
-        self.assertEqual(aff[frozenset(("amiya", "theresia"))][0], 95)
-        # 博士无英文 id → 该对整条被跳过
-        self.assertNotIn(frozenset(("kaltsit", "博士")), aff)
+        self.assertIn(frozenset(("nova", "luna")), aff)
+        self.assertEqual(aff[frozenset(("nova", "luna"))][0], 95)
+        # 老师无英文 id → 该对整条被跳过
+        self.assertNotIn(frozenset(("heron", "老师")), aff)
 
     def test_pick_two_bias_affinity(self):
         """亲密度加权：关系好的 pair 明显比默默无闻的更常被抽中"""
         p = self._make({})
-        # 四人间只给 (shu, xi) 极高的亲密度，其余都无记录（基线一致）
+        # 四人间只给 (he, chen) 极高的亲密度，其余都无记录（基线一致）
         self._write_affinity(p, {
-            "黍<->夕": {"亲密度": 99999, "基调": "别扭依赖"},
+            "禾<->辰": {"亲密度": 99999, "基调": "别扭依赖"},
         })
         hits = {"shu_xi": 0, "other": 0}
         for _ in range(400):
-            a, b = p._pulse_pick_two(["amiya", "shu", "xi", "closure"])
-            if {a, b} == {"shu", "xi"}:
+            a, b = p._pulse_pick_two(["nova", "he", "chen", "bell"])
+            if {a, b} == {"he", "chen"}:
                 hits["shu_xi"] += 1
             else:
                 hits["other"] += 1
@@ -2899,7 +2952,7 @@ class TestFamilyPulse(unittest.TestCase):
         p = self._make({})  # 不写任何关系网文件
         seen = set()
         for _ in range(300):
-            a, b = p._pulse_pick_two(["amiya", "shu", "closure", "xi"])
+            a, b = p._pulse_pick_two(["nova", "he", "bell", "chen"])
             seen.add(frozenset((a, b)))
         self.assertGreaterEqual(len(seen), 4)  # 至少出现过半组合＝未锁死
 
@@ -2907,29 +2960,29 @@ class TestFamilyPulse(unittest.TestCase):
         """_pulse_tone 取到关系基调；无收录对返回空串（不注入）"""
         p = self._make({})
         self._write_affinity(p, {
-            "黍<->夕": {"亲密度": 92, "基调": "别扭依赖"},
+            "禾<->辰": {"亲密度": 92, "基调": "别扭依赖"},
         })
-        self.assertEqual(p._pulse_tone("shu", "xi"), "别扭依赖")
-        self.assertEqual(p._pulse_tone("amiya", "closure"), "")
+        self.assertEqual(p._pulse_tone("he", "chen"), "别扭依赖")
+        self.assertEqual(p._pulse_tone("nova", "bell"), "")
 
     def test_rel_matrix_multi_and_undefined(self):
         """[2026-09-13] 全桌关系矩阵：有记录→亲近度+基调；无记录→不太熟；自己排除"""
         p = self._make({})
         self._write_affinity(p, {
-            "黍<->夕": {"亲密度": 92, "基调": "别扭依赖"},
-            "黍<->可露希尔": {"亲密度": 70},
+            "禾<->辰": {"亲密度": 92, "基调": "别扭依赖"},
+            "禾<->小铃": {"亲密度": 70},
         })
-        out = p._pulse_rel_matrix("shu", ["shu", "xi", "closure", "amiya"])
-        self.assertIn("夕：亲近度92", out)
+        out = p._pulse_rel_matrix("he", ["he", "chen", "bell", "nova"])
+        self.assertIn("辰：亲近度92", out)
         self.assertIn("别扭依赖", out)
-        self.assertIn("可露希尔：亲近度70", out)
-        self.assertIn("阿米娅：不太熟，别热络", out)
-        self.assertNotIn("- 黍：", out)  # 自己不在矩阵里
+        self.assertIn("小铃：亲近度70", out)
+        self.assertIn("小星：不太熟，别热络", out)
+        self.assertNotIn("- 禾：", out)  # 自己不在矩阵里
 
     def test_rel_matrix_empty_group(self):
         """无其他在场者 → 空串（不注入）"""
         p = self._make({})
-        self.assertEqual(p._pulse_rel_matrix("shu", ["shu"]), "")
+        self.assertEqual(p._pulse_rel_matrix("he", ["he"]), "")
 
     def test_llm_system_has_mood_and_anti_politeness(self):
         """[2026-09-13] 情绪行为行 + 反客套规则 + 关系矩阵都进 system prompt"""
@@ -2949,7 +3002,7 @@ class TestFamilyPulse(unittest.TestCase):
             mood="烦躁", summary="烦躁/工坊/修那块电源板"
         )
         out = asyncio.run(
-            p._pulse_llm("shu", "测试", rel_matrix="- 夕：亲近度92，基调「别扭依赖」")
+            p._pulse_llm("he", "测试", rel_matrix="- 辰：亲近度92，基调「别扭依赖」")
         )
         self.assertEqual(out, "（没接话）")
         sys_p = captured.get("system", "")
@@ -2974,22 +3027,22 @@ class TestFamilyPulse(unittest.TestCase):
 
         orig = dict(_fp.FAMILY_PERSONAS)
         try:
-            p = self._make({"family_pulse_members": '["amiya","shu"]'})
+            p = self._make({"family_pulse_members": '["nova","he"]'})
             p._pulse_data_dir = lambda: self._tmp
             p._pulse_ensure_skeleton()
             path = os.path.join(self._tmp, "personas.json")
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
-            self.assertIn("amiya", data)
-            self.assertIn("shu", data)
+            self.assertIn("nova", data)
+            self.assertIn("he", data)
             # 骨架是通用占位：不含本部署家庭成员名
-            self.assertNotIn("普瑞赛斯", json.dumps(data, ensure_ascii=False))
+            self.assertNotIn("领航", json.dumps(data, ensure_ascii=False))
             # 再跑一次：已有文件不被覆盖
             with open(path, "w", encoding="utf-8") as f:
-                json.dump({"amiya": "我的自定义"}, f, ensure_ascii=False)
+                json.dump({"nova": "我的自定义"}, f, ensure_ascii=False)
             p._pulse_ensure_skeleton()
             with open(path, encoding="utf-8") as f:
-                self.assertEqual(json.load(f), {"amiya": "我的自定义"})
+                self.assertEqual(json.load(f), {"nova": "我的自定义"})
         finally:
             _fp.FAMILY_PERSONAS = orig  # 恢复全局，防测试间污染
 
@@ -2998,12 +3051,12 @@ class TestFamilyPulse(unittest.TestCase):
         """[2026-09-13] 无线程时从素材池弹新物件（stage=0），落盘可读回同一件"""
         p = self._make({})
         with self._tmp_thread_guard(p):
-            t, stage = p._pulse_ensure_thread("shu", {})
+            t, stage = p._pulse_ensure_thread("he", {})
             self.assertTrue(t)
             self.assertEqual(stage, 0)
             store = p._pulse_load_threads()
-            self.assertEqual(store["shu"]["text"], t)
-            self.assertEqual(store["shu"]["stage"], 0)
+            self.assertEqual(store["he"]["text"], t)
+            self.assertEqual(store["he"]["stage"], 0)
             self.assertIn(t, set(store.get("_seed_used", [])))  # 轮换标记
 
     def test_ensure_thread_reuses_until_done(self):
@@ -3011,21 +3064,21 @@ class TestFamilyPulse(unittest.TestCase):
         p = self._make({})
         with self._tmp_thread_guard(p):
             store = p._pulse_load_threads()
-            t1 = p._pulse_ensure_thread("xi", store)
-            t2 = p._pulse_ensure_thread("xi", store)
+            t1 = p._pulse_ensure_thread("chen", store)
+            t2 = p._pulse_ensure_thread("chen", store)
             self.assertEqual(t1, t2)
 
     def test_advance_stages_and_archives(self):
         """[2026-09-13] 三态推进：0→1→2，到 2 再戳即归档（下次开新线）"""
         p = self._make({})
         with self._tmp_thread_guard(p):
-            p._pulse_ensure_thread("amiya", {})
-            p._pulse_advance_thread("amiya")
-            self.assertEqual(p._pulse_load_threads()["amiya"].get("stage"), 1)
-            p._pulse_advance_thread("amiya")
-            self.assertEqual(p._pulse_load_threads()["amiya"].get("stage"), 2)
-            p._pulse_advance_thread("amiya")
-            self.assertNotIn("amiya", p._pulse_load_threads())  # 收尾已播报 → 归档
+            p._pulse_ensure_thread("nova", {})
+            p._pulse_advance_thread("nova")
+            self.assertEqual(p._pulse_load_threads()["nova"].get("stage"), 1)
+            p._pulse_advance_thread("nova")
+            self.assertEqual(p._pulse_load_threads()["nova"].get("stage"), 2)
+            p._pulse_advance_thread("nova")
+            self.assertNotIn("nova", p._pulse_load_threads())  # 收尾已播报 → 归档
 
     def test_thread_stage_compat_old_decay(self):
         """[2026-09-13] 旧格式兼容：无 stage 有 decay → 2→0 / 1→1 / 0→2"""
@@ -3041,9 +3094,9 @@ class TestFamilyPulse(unittest.TestCase):
         with self._tmp_thread_guard(p):
             from family_pulse import THREAD_FLAVORS, LIFE_SEEDS
 
-            full = [row[0] for row in THREAD_FLAVORS.get("xi", [])] + list(LIFE_SEEDS)
+            full = [row[0] for row in THREAD_FLAVORS.get("chen", [])] + list(LIFE_SEEDS)
             store = {"_seed_used": list(full)}
-            t, stage = p._pulse_ensure_thread("xi", store)
+            t, stage = p._pulse_ensure_thread("chen", store)
             self.assertTrue(t)
             self.assertEqual(stage, 0)
 
@@ -3052,7 +3105,7 @@ class TestFamilyPulse(unittest.TestCase):
 
         覆盖：①骨架能生成 ②无私有素材时线程从通用池取 ③无关系文件时矩阵降级。
         """
-        p = self._make({"family_pulse_members": '["amiya","shu"]'})
+        p = self._make({"family_pulse_members": '["nova","he"]'})
         p._pulse_data_dir = lambda: self._tmp  # 干净的"新用户"数据目录
         # ① 骨架生成
         p._pulse_ensure_skeleton()
@@ -3064,22 +3117,22 @@ class TestFamilyPulse(unittest.TestCase):
         try:
             _fp.THREAD_FLAVORS = {}
             with self._tmp_thread_guard(p):
-                t, stage = p._pulse_ensure_thread("amiya", {})
+                t, stage = p._pulse_ensure_thread("nova", {})
                 self.assertIn(t, set(_fp.LIFE_SEEDS))
                 self.assertEqual(stage, 0)
         finally:
             _fp.THREAD_FLAVORS = orig
         # ③ 无关系文件（_make 默认空目录）→ 矩阵降级"不太熟"
-        out = p._pulse_rel_matrix("amiya", ["amiya", "shu"])
+        out = p._pulse_rel_matrix("nova", ["nova", "he"])
         self.assertIn("不太熟", out)
 
     def test_thread_persists_across_instances(self):
         """不同插件实例共享同一线程文件 → 跨天/重启连续性"""
         p1 = self._make({})
-        p1._pulse_ensure_thread("skadi", {})
+        p1._pulse_ensure_thread("tide", {})
         p2 = self._make({})
         store = p2._pulse_load_threads()
-        self.assertIn("skadi", store)
+        self.assertIn("tide", store)
 
     # ── B方案：动态种子取材（破固定文案循环） ──
     def _write_pulse_log(self, p, agent, text):
@@ -3099,16 +3152,16 @@ class TestFamilyPulse(unittest.TestCase):
         p = self._make({})
         with self._tmp_thread_guard(p):
             # 往日志写一条"对话残渣"——旧实现会把它当种子，新实现必须无视
-            self._write_pulse_log(p, "shu", "哎呀，那碗筷就先放那吧，我待会儿洗")
-            t, stage = p._pulse_ensure_thread("shu", {})
+            self._write_pulse_log(p, "he", "哎呀，那碗筷就先放那吧，我待会儿洗")
+            t, stage = p._pulse_ensure_thread("he", {})
             self.assertNotEqual(t, "哎呀，那碗筷就先放那吧，我待会儿洗")
             self.assertEqual(stage, 0)
             from family_pulse import THREAD_FLAVORS, LIFE_SEEDS
 
-            pool_texts = {row[0] for row in THREAD_FLAVORS.get("shu", [])} | set(LIFE_SEEDS)
+            pool_texts = {row[0] for row in THREAD_FLAVORS.get("he", [])} | set(LIFE_SEEDS)
             self.assertIn(t, pool_texts)
             # 未归档的线程要被复用（不重掷）
-            t2, _ = p._pulse_ensure_thread("shu", p._pulse_load_threads())
+            t2, _ = p._pulse_ensure_thread("he", p._pulse_load_threads())
             self.assertEqual(t2, t)
 
     def test_ensure_thread_cold_start_from_pool(self):
@@ -3117,10 +3170,10 @@ class TestFamilyPulse(unittest.TestCase):
         with self._tmp_thread_guard(p):
             from family_pulse import THREAD_FLAVORS, LIFE_SEEDS
 
-            t, stage = p._pulse_ensure_thread("amiya", {})
+            t, stage = p._pulse_ensure_thread("nova", {})
             self.assertTrue(t)
             self.assertEqual(stage, 0)
-            pool_texts = {row[0] for row in THREAD_FLAVORS.get("amiya", [])} | set(LIFE_SEEDS)
+            pool_texts = {row[0] for row in THREAD_FLAVORS.get("nova", [])} | set(LIFE_SEEDS)
             self.assertIn(t, pool_texts)
 
     def test_recent_seed_across_days(self):
@@ -3142,15 +3195,15 @@ class TestFamilyPulse(unittest.TestCase):
                     json.dumps(
                         {
                             "ts": "21:00",
-                            "agent": "xi",
-                            "display": "xi",
+                            "agent": "chen",
+                            "display": "chen",
                             "text": "昨天那幅龙还晾在架上没落款",
                         },
                         ensure_ascii=False,
                     )
                     + "\n"
                 )
-            seed = p._pulse_recent_seed("xi")
+            seed = p._pulse_recent_seed("chen")
             self.assertIsNotNone(seed)
             self.assertEqual(seed[0], "昨天那幅龙还晾在架上没落款")
 
@@ -3158,24 +3211,24 @@ class TestFamilyPulse(unittest.TestCase):
         """[2026-09-13] 归档后下一跳从素材池开新线（不再吃对话日志）"""
         p = self._make({})
         with self._tmp_thread_guard(p):
-            self._write_pulse_log(p, "closure", "那块电源板又窜出杂讯，拆开重焊")
-            rec = {"closure": {"text": "旧事", "stage": 2}}
+            self._write_pulse_log(p, "bell", "那块电源板又窜出杂讯，拆开重焊")
+            rec = {"bell": {"text": "旧事", "stage": 2}}
             p._pulse_save_threads(rec)
-            p._pulse_advance_thread("closure")
-            self.assertNotIn("closure", p._pulse_load_threads())
-            t, stage = p._pulse_ensure_thread("closure", {})
+            p._pulse_advance_thread("bell")
+            self.assertNotIn("bell", p._pulse_load_threads())
+            t, stage = p._pulse_ensure_thread("bell", {})
             self.assertNotEqual(t, "那块电源板又窜出杂讯，拆开重焊")
             self.assertEqual(stage, 0)
 
-    # ── 真演化主菜：动态取材升级（2026-09-04 博士拍板：9 成真演化按底色） ──
+    # ── 真演化主菜：动态取材升级（2026-09-04 老师拍板：9 成真演化按底色） ──
     def test_recent_seed_excludes_used(self):
-        """used 传已在线的线程 → 该条不再被取材（破重复循环，博士 16:45 撞车修复）"""
+        """used 传已在线的线程 → 该条不再被取材（破重复循环，老师 16:45 撞车修复）"""
         p = self._make({})
         with self._tmp_thread_guard(p):
-            self._write_pulse_log(p, "shu", "腌萝卜那缸该翻一遍，坛沿起沫")
-            self._write_pulse_log(p, "shu", "菜园子那几垄白菜该收了")
+            self._write_pulse_log(p, "he", "腌萝卜那缸该翻一遍，坛沿起沫")
+            self._write_pulse_log(p, "he", "菜园子那几垄白菜该收了")
             # used 含第一条 → 只能取第二条（唯一可用）
-            seed = p._pulse_recent_seed("shu", used={"腌萝卜那缸该翻一遍，坛沿起沫"})
+            seed = p._pulse_recent_seed("he", used={"腌萝卜那缸该翻一遍，坛沿起沫"})
             self.assertIsNotNone(seed)
             self.assertEqual(seed[0], "菜园子那几垄白菜该收了")
 
@@ -3183,8 +3236,8 @@ class TestFamilyPulse(unittest.TestCase):
         """候选全被 used → None（无新可取材，交由冷启动兜底）"""
         p = self._make({})
         with self._tmp_thread_guard(p):
-            self._write_pulse_log(p, "xi", "那幅画还晾在架上没落款")
-            seed = p._pulse_recent_seed("xi", used={"那幅画还晾在架上没落款"})
+            self._write_pulse_log(p, "chen", "那幅画还晾在架上没落款")
+            seed = p._pulse_recent_seed("chen", used={"那幅画还晾在架上没落款"})
             self.assertIsNone(seed)
 
     def test_recent_seed_domain_prefers_fit(self):
@@ -3192,11 +3245,11 @@ class TestFamilyPulse(unittest.TestCase):
         p = self._make({})
         with self._tmp_thread_guard(p):
             # 两条念叨：一条带「生活」域关键词（收拾），一条是纯针线随笔
-            self._write_pulse_log(p, "shu", "刚把灶台收拾干净了")
-            self._write_pulse_log(p, "shu", "翻出旧针线包发了好一阵呆")
+            self._write_pulse_log(p, "he", "刚把灶台收拾干净了")
+            self._write_pulse_log(p, "he", "翻出旧针线包发了好一阵呆")
             from random_state import DOMAIN_KEYWORDS
             self.assertIn("收拾", DOMAIN_KEYWORDS["生活"])
-            seed = p._pulse_recent_seed("shu", domain="生活")
+            seed = p._pulse_recent_seed("he", domain="生活")
             self.assertIsNotNone(seed)
             self.assertEqual(seed[0], "刚把灶台收拾干净了")
 
@@ -3212,10 +3265,10 @@ class TestFamilyPulse(unittest.TestCase):
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
                 f.write(json.dumps(
-                    {"ts": "12:00", "agent": "amiya", "display": "amiya", "text": "嗯嗯"},
+                    {"ts": "12:00", "agent": "nova", "display": "nova", "text": "嗯嗯"},
                     ensure_ascii=False,
                 ) + "\n")
-            seed = p._pulse_recent_seed("amiya")
+            seed = p._pulse_recent_seed("nova")
             self.assertIsNone(seed)  # 短旁白被过滤 → 无候选
 
     def _tmp_thread_guard(self, p):
@@ -3270,7 +3323,7 @@ class TestFamilyPulse(unittest.TestCase):
     def test_tick_success_writes_log(self):
         """心跳成功：两人各落一条日志（固定二人组，锁定断言）"""
         p = self._make({"enable_family_pulse": True})
-        p._pulse_pick_group = lambda members: ["amiya", "shu"]
+        p._pulse_pick_group = lambda members: ["nova", "he"]
         p._pulse_pick_lines = lambda group_size: 2
         p.context.llm_generate = AsyncMock(return_value=self._resp("刚把柳木画板搬去晾"))
         asyncio.run(p.family_pulse_tick())
@@ -3281,7 +3334,7 @@ class TestFamilyPulse(unittest.TestCase):
     def test_tick_success_writes_log_three(self):
         """三人组心跳：三人各落一条，且后者会接着前一个人的茬（chain 连贯）"""
         p = self._make({"enable_family_pulse": True})
-        p._pulse_pick_group = lambda members: ["amiya", "shu", "xi"]
+        p._pulse_pick_group = lambda members: ["nova", "he", "chen"]
         p._pulse_pick_lines = lambda group_size: 3
         prompts = []
 
@@ -3302,7 +3355,7 @@ class TestFamilyPulse(unittest.TestCase):
     def test_tick_success_writes_log_four(self):
         """四人组心跳：四人各落一条，围坐唠嗑也能串成一条链"""
         p = self._make({"enable_family_pulse": True})
-        p._pulse_pick_group = lambda members: ["amiya", "shu", "xi", "closure"]
+        p._pulse_pick_group = lambda members: ["nova", "he", "chen", "bell"]
         p._pulse_pick_lines = lambda group_size: 4
         p.context.llm_generate = AsyncMock(return_value=self._resp("刚把柳木画板搬去晾"))
         asyncio.run(p.family_pulse_tick())
@@ -3339,11 +3392,11 @@ class TestFamilyPulse(unittest.TestCase):
         self.assertTrue(callable(stub.get_sender_id))
         self.assertTrue(callable(stub.get_message_type))
         # 可被 _memory_recall 打 persona 标
-        stub._subagent_persona = "shu"
-        self.assertEqual(stub._subagent_persona, "shu")
+        stub._subagent_persona = "he"
+        self.assertEqual(stub._subagent_persona, "he")
 
     def test_merge_pulse_memory_recall_doctor_private(self):
-        """博士私聊直问子代理：并入最近 6 小时家常（2026-09-05 博士改版，不再堆几天记忆）"""
+        """老师私聊直问子代理：并入最近 6 小时家常（2026-09-05 老师改版，不再堆几天记忆）"""
         p = self._make({"enable_family_pulse": True})
         lm = MagicMock()
         lm.initializer.is_initialized = True
@@ -3356,12 +3409,12 @@ class TestFamilyPulse(unittest.TestCase):
         now = _dt.datetime.now(_ZI("Asia/Shanghai"))
         recent_ts = (now - _dt.timedelta(minutes=30)).strftime("%H:%M")
         p._pulse_read_day = lambda: [
-            {"ts": recent_ts, "agent": "shu", "display": "黍", "text": "RECENT_LINE"},
+            {"ts": recent_ts, "agent": "he", "display": "禾", "text": "RECENT_LINE"},
         ]
-        # 博士私聊事件（会话 ≠ 旁轨会话）
+        # 老师私聊事件（会话 ≠ 旁轨会话）
         event = MagicMock()
         event.unified_msg_origin = "qq_restapi:FriendMessage:TESTUSER00000000000000000000000000"
-        event.get_message_str.return_value = "阿米娅，你们今天聊了什么？"
+        event.get_message_str.return_value = "小星，你们今天聊了什么？"
 
         try:
             from astrbot.core.provider.entities import ProviderRequest as RealPR
@@ -3375,7 +3428,7 @@ class TestFamilyPulse(unittest.TestCase):
         with mock.patch("memory.ProviderRequest", RealPR):
             parts = asyncio.run(
                 p._merge_pulse_memory_recall(
-                    ["<主召回>"], event, "amiya", "阿米娅，你们今天聊了什么？", lm
+                    ["<主召回>"], event, "nova", "小星，你们今天聊了什么？", lm
                 )
             )
         self.assertEqual(parts[0], "<主召回>", "主召回内容应保留在首位")
@@ -3393,15 +3446,15 @@ class TestFamilyPulse(unittest.TestCase):
         lm.initializer.is_failed = False
         lm.handle_memory_recall = AsyncMock()
         event = p._pulse_event_stub("family_pulse:FriendMessage:subagents")
-        event._subagent_persona = "amiya"
+        event._subagent_persona = "nova"
         parts = asyncio.run(p._merge_pulse_memory_recall(
-            ["<主召回>"], event, "amiya", "今天想泡壶茶", lm
+            ["<主召回>"], event, "nova", "今天想泡壶茶", lm
         ))
         self.assertEqual(parts, ["<主召回>"], "旁轨会话本身不应重复注入")
         lm.handle_memory_recall.assert_not_awaited()
 
     def test_merge_pulse_memory_recall_pulse_off_no_inject(self):
-        """旁轨已关（enable_family_pulse=False）：不再注入旁轨家常（2026-09-12 博士指令）"""
+        """旁轨已关（enable_family_pulse=False）：不再注入旁轨家常（2026-09-12 老师指令）"""
         p = self._make({"enable_family_pulse": False})
         lm = MagicMock()
         lm.initializer.is_initialized = True
@@ -3420,7 +3473,7 @@ class TestFamilyPulse(unittest.TestCase):
         )
         parts = asyncio.run(
             p._merge_pulse_memory_recall(
-                ["<主召回>"], event, "amiya", "你们今天聊了什么", lm
+                ["<主召回>"], event, "nova", "你们今天聊了什么", lm
             )
         )
         self.assertEqual(parts, ["<主召回>"], "旁轨关闭时不得注入家常")
@@ -3436,7 +3489,7 @@ class TestFamilyPulse(unittest.TestCase):
             "qq_restapi:FriendMessage:TESTUSER00000000000000000000000000"
         )
         event.get_platform_name.return_value = "qq_restapi"
-        stub = p._subagent_event_stub(event, "closure")
+        stub = p._subagent_event_stub(event, "bell")
         self.assertEqual(
             stub.get_message_type(),
             MessageType.GROUP_MESSAGE,
@@ -3448,34 +3501,36 @@ class TestFamilyPulse(unittest.TestCase):
         p = self._make(
             {
                 "name_display_map": {
-                    "amiya": "阿米娅",
-                    "closure": "可露希尔",
-                    "theresia": "特蕾西娅",
-                    "skadi": "斯卡蒂",
-                    "xi": "夕",
-                    "ling": "令",
-                    "nian": "年",
-                    "shu": "黍",
-                    "liino": "梨诺",
-                    "m3": "M3",
-                    "kaltsit": "凯尔希",
-                }
+                    "nova": "小星",
+                    "bell": "小铃",
+                    "luna": "小夜",
+                    "tide": "小汐",
+                    "chen": "辰",
+                    "lan": "岚",
+                    "qing": "晴",
+                    "he": "禾",
+                    "song": "小歌",
+                    "nine": "小玖",
+                    "heron": "小鹭",
+                },
+                # 部署声明：该子代理的人格在库中按「名字-子代理」后缀登记
+                "persona_suffix_agents": "luna",
             }
         )
         # name_display_map 配置里的映射
-        self.assertEqual(p._persona_name("shu"), "黍")
-        self.assertEqual(p._persona_name("skadi"), "斯卡蒂")
-        self.assertEqual(p._persona_name("amiya"), "阿米娅")
-        self.assertEqual(p._persona_name("m3"), "M3")
-        # 特蕾西娅：display 是「特蕾西娅」，人格真名是「特蕾西娅-子代理」
-        self.assertEqual(p._persona_name("theresia"), "特蕾西娅-子代理")
+        self.assertEqual(p._persona_name("he"), "禾")
+        self.assertEqual(p._persona_name("tide"), "小汐")
+        self.assertEqual(p._persona_name("nova"), "小星")
+        self.assertEqual(p._persona_name("nine"), "小玖")
+        # 小夜：display 是「小夜」，人格真名是「小夜-子代理」
+        self.assertEqual(p._persona_name("luna"), "小夜-子代理")
         # 未知 id：原样返回（不崩）
         self.assertEqual(p._persona_name("unknown_agent"), "unknown_agent")
         # _get_name_display_map 异常时兜底返回原 id
         with mock.patch.object(
             p, "_get_name_display_map", side_effect=RuntimeError("boom")
         ):
-            self.assertEqual(p._persona_name("shu"), "shu")
+            self.assertEqual(p._persona_name("he"), "he")
 
     def test_pulse_next_fire_daytime(self):
         """作息心跳：窗内 14:42 → 本区间 [14:17,16:17) 内随机点"""
@@ -3585,12 +3640,12 @@ class TestFamilyPulse(unittest.TestCase):
         event = MagicMock()
         event.unified_msg_origin = "qq_restapi:FriendMessage:TESTUSER00000000000000000000000000"
         parts = asyncio.run(p._merge_pulse_memory_recall(
-            ["<主召回>"], event, "amiya", "你们今天聊了什么", lm
+            ["<主召回>"], event, "nova", "你们今天聊了什么", lm
         ))
         self.assertEqual(parts, ["<主召回>"], "失败应返回原 parts")
 
     def test_pulse_log_fallback_six_hour_window(self):
-        """旁轨家常滑动窗口：只注入最近 6 小时内的记录（2026-09-05 博士改版）"""
+        """旁轨家常滑动窗口：只注入最近 6 小时内的记录（2026-09-05 老师改版）"""
         p = self._make({"enable_family_pulse": True})
         import datetime as _dt
         from zoneinfo import ZoneInfo as _ZI
@@ -3599,10 +3654,10 @@ class TestFamilyPulse(unittest.TestCase):
         recent_ts = (now - _dt.timedelta(minutes=30)).strftime("%H:%M")
         old_ts = (now - _dt.timedelta(hours=7)).strftime("%H:%M")
         p._pulse_read_day = lambda: [
-            {"ts": old_ts, "agent": "amiya", "display": "阿米娅", "text": "OLD_LINE"},
-            {"ts": recent_ts, "agent": "shu", "display": "黍", "text": "RECENT_LINE"},
+            {"ts": old_ts, "agent": "nova", "display": "小星", "text": "OLD_LINE"},
+            {"ts": recent_ts, "agent": "he", "display": "禾", "text": "RECENT_LINE"},
         ]
-        parts = p._pulse_log_fallback("amiya")
+        parts = p._pulse_log_fallback("nova")
         self.assertEqual(len(parts), 1)
         text = getattr(parts[0], "text", "")
         self.assertIn("RECENT_LINE", text)
@@ -3624,10 +3679,10 @@ class TestFamilyPulse(unittest.TestCase):
         # 2 小时前：1 小时窗口下应被滤掉
         mid_ts = (now - _dt.timedelta(hours=2)).strftime("%H:%M")
         p._pulse_read_day = lambda: [
-            {"ts": mid_ts, "agent": "amiya", "display": "阿米娅", "text": "MID_LINE"},
-            {"ts": recent_ts, "agent": "shu", "display": "黍", "text": "RECENT_LINE"},
+            {"ts": mid_ts, "agent": "nova", "display": "小星", "text": "MID_LINE"},
+            {"ts": recent_ts, "agent": "he", "display": "禾", "text": "RECENT_LINE"},
         ]
-        parts = p._pulse_log_fallback("amiya")
+        parts = p._pulse_log_fallback("nova")
         text = getattr(parts[0], "text", "")
         self.assertIn("RECENT_LINE", text)
         self.assertIn("家里最近 1 小时", text)
@@ -3639,14 +3694,14 @@ class TestFamilyPulse(unittest.TestCase):
         logs = [
             {
                 "ts": (now - _dt.timedelta(minutes=20 - i)).strftime("%H:%M"),
-                "agent": "amiya",
-                "display": "阿米娅",
+                "agent": "nova",
+                "display": "小星",
                 "text": f"L{i}",
             }
             for i in range(20)
         ]
         p._pulse_read_day = lambda: logs
-        parts = p._pulse_log_fallback("amiya")
+        parts = p._pulse_log_fallback("nova")
         text = getattr(parts[0], "text", "")
         self.assertIn("L19", text, "最新一条应保留")
         self.assertNotIn("L4\n", text, "15 条截尾：第 5 条（L4）应被截掉")
@@ -3670,7 +3725,7 @@ class TestFamilyPulse(unittest.TestCase):
         p._find_livingmemory_plugin = lambda: object()  # 找到插件
         p._memory_recall = fake_recall
         p._memory_store = fake_store
-        p._pulse_pick_group = lambda members: ["amiya", "shu"]
+        p._pulse_pick_group = lambda members: ["nova", "he"]
         p._pulse_pick_lines = lambda group_size: 2
         p.context.llm_generate = AsyncMock(return_value=self._resp("刚把柳木画板搬去晾"))
         asyncio.run(p.family_pulse_tick())
@@ -3689,7 +3744,7 @@ class TestFamilyPulse(unittest.TestCase):
             )
         )
         # 记忆召回与存储都发生了，且 agent 是挑中的两人的其一（全家 11 人池）
-        _FAMILY_POOL = {"amiya", "shu", "closure", "xi", "theresia", "skadi", "ling", "nian", "liino", "m3", "kaltsit"}
+        _FAMILY_POOL = {"nova", "he", "bell", "chen", "luna", "tide", "lan", "qing", "song", "nine", "heron"}
         self.assertIn(seen.get("agent"), _FAMILY_POOL)
         self.assertEqual(seen["event_persona"], seen["agent"])
         self.assertEqual(seen["stored_agent"], seen["agent"])
@@ -3704,7 +3759,7 @@ class TestFamilyPulse(unittest.TestCase):
 
         p._find_livingmemory_plugin = lambda: object()
         p._memory_recall = boom
-        p._pulse_pick_group = lambda members: ["amiya", "shu"]
+        p._pulse_pick_group = lambda members: ["nova", "he"]
         p._pulse_pick_lines = lambda group_size: 2
         p.context.llm_generate = AsyncMock(return_value=self._resp("刚把柳木画板搬去晾"))
         asyncio.run(p.family_pulse_tick())
@@ -3719,27 +3774,27 @@ class TestFamilyPulse(unittest.TestCase):
     def _pulse_extra_parts(self, kwargs):
         return kwargs.get("extra_user_content_parts") or []
 
-    # ── 自由插话（路线B, 2026-09-04 博士拍板）──
+    # ── 自由插话（路线B, 2026-09-04 老师拍板）──
     def test_interlope_candidates_excludes_group(self):
         """旁观者池 = 全家池减去入座者：设监在场的人才有资格插话"""
         p = self._make({})
-        cands = p._pulse_interlope_candidates(["amiya", "shu"])
-        self.assertNotIn("amiya", cands)
-        self.assertNotIn("shu", cands)
+        cands = p._pulse_interlope_candidates(["nova", "he"])
+        self.assertNotIn("nova", cands)
+        self.assertNotIn("he", cands)
         self.assertGreaterEqual(len(cands), 1)
 
     def test_pick_interloper_returns_candidate(self):
         """抢话仲裁：多人候选必返回其一，且从候选池里出"""
         p = self._make({})
-        cands = ["closure", "xi", "ling"]
-        picked = p._pulse_pick_interloper(cands, "阿米娅")
+        cands = ["bell", "chen", "lan"]
+        picked = p._pulse_pick_interloper(cands, "小星")
         self.assertIn(picked, cands)
-        self.assertIsNone(p._pulse_pick_interloper([], "阿米娅"))
+        self.assertIsNone(p._pulse_pick_interloper([], "小星"))
 
     def test_tick_interlope_injects_extra_speaker(self):
         """自由插话：未入座的人概率性冒话，多出一句、落日志、推进其线程"""
         p = self._make({"enable_family_pulse": True, "family_pulse_interlope_chance": 1.0, "family_pulse_interlope_max": 2})
-        p._pulse_pick_group = lambda members: ["amiya", "shu"]
+        p._pulse_pick_group = lambda members: ["nova", "he"]
         p._pulse_pick_lines = lambda group_size: 2
         p.context.llm_generate = AsyncMock(return_value=self._resp("刚把柳木画板搬去晾"))
         asyncio.run(p.family_pulse_tick())
@@ -3747,20 +3802,20 @@ class TestFamilyPulse(unittest.TestCase):
         # 原两人各一句 + 至少一次旁观插话
         self.assertGreaterEqual(len(logs), 3)
         agents = {r["agent"] for r in logs}
-        self.assertTrue(agents - {"amiya", "shu"}, "插话者应来自未入座的人")
+        self.assertTrue(agents - {"nova", "he"}, "插话者应来自未入座的人")
 
     def test_tick_interlope_disabled_by_default(self):
         """默认/显式关闭时：不插话，话量与入座者一致（回归保护）"""
         p = self._make({"enable_family_pulse": True})
-        p._pulse_pick_group = lambda members: ["amiya", "shu"]
+        p._pulse_pick_group = lambda members: ["nova", "he"]
         p._pulse_pick_lines = lambda group_size: 2
         p.context.llm_generate = AsyncMock(return_value=self._resp("刚把柳木画板搬去晾"))
         asyncio.run(p.family_pulse_tick())
         logs = p._pulse_read_day()
         self.assertEqual(len(logs), 2)
-        self.assertEqual({r["agent"] for r in logs}, {"amiya", "shu"})
+        self.assertEqual({r["agent"] for r in logs}, {"nova", "he"})
 
-    # ── 主代理参与（博士 2026-09-04 拍板：让普瑞赛斯坐到桌边）──
+    # ── 主代理参与（老师 2026-09-04 拍板：让领航坐到桌边）──
     def test_host_chance_defaults(self):
         """主代理插话概率/次数走配置：显式值生效，_make 默认关（回归保护）"""
         p = self._make({"family_pulse_host_chance": 0.3, "family_pulse_host_max": 2})
@@ -3775,14 +3830,16 @@ class TestFamilyPulse(unittest.TestCase):
         self.assertEqual(p3._pulse_host_max(), 2)
 
     def test_host_llm_returns_text(self):
-        """主代理插话走主代理 provider + 普瑞赛斯人格，返回一句闲话"""
+        """主代理插话走主代理 provider + 部署主代理人格，返回一句闲话"""
         p = self._make({})
         p.context.get_current_chat_provider_id = AsyncMock(return_value="test-provider")
         p.context.llm_generate = AsyncMock(return_value=self._resp("都聊到这儿了，加我一个"))
-        text = asyncio.run(p._pulse_host_llm("阿米娅", "今天的活儿干完了", "晚上", "屋里很安静"))
+        text = asyncio.run(p._pulse_host_llm("小星", "今天的活儿干完了", "晚上", "屋里很安静"))
         self.assertEqual(text, "都聊到这儿了，加我一个")
         sys_p = p.context.llm_generate.call_args.kwargs["system_prompt"]
-        self.assertIn("普瑞赛斯", sys_p)
+        # 人格取自部署侧 prompts.json（host_system）；此处校验「扮演引导」形态，
+        # 具体名字随各部署数据（样本环境为“领航”）。
+        self.assertRegex(sys_p, r"你在扮演：\S+")
 
     def test_tick_host_injects_log(self):
         """主代理插话落日志、更新 prev，子代理下一句接她的茬"""
@@ -3791,7 +3848,7 @@ class TestFamilyPulse(unittest.TestCase):
             "family_pulse_host_chance": 1.0,
             "family_pulse_host_max": 2,
         })
-        p._pulse_pick_group = lambda members: ["amiya", "shu"]
+        p._pulse_pick_group = lambda members: ["nova", "he"]
         p._pulse_pick_lines = lambda group_size: 3
         p.context.get_current_chat_provider_id = AsyncMock(return_value="test-provider")
 
@@ -3803,7 +3860,7 @@ class TestFamilyPulse(unittest.TestCase):
         logs = p._pulse_read_day()
         self.assertTrue(any(r["agent"] == "host" for r in logs), "主代理应出现在日志里")
 
-    # ── 拉博士（2026-09-04 博士拍板：围坐聊到兴头把博士拉进来） ──
+    # ── 拉老师（2026-09-04 老师拍板：围坐聊到兴头把老师拉进来） ──
     def test_draft_chance_workday_vs_holiday(self):
         """工作日概率低、节假日（含双休）概率高，总开关关闭返回 0"""
         p = self._make({"family_pulse_draft_enable": False})
@@ -3843,11 +3900,11 @@ class TestFamilyPulse(unittest.TestCase):
         p = self._make({})
         members = p._pulse_members()
         for _ in range(50):
-            d = p._pulse_pick_drafter(["amiya", "shu"], "阿米娅")
+            d = p._pulse_pick_drafter(["nova", "he"], "小星")
             self.assertIn(d, set(members) | {"host"})
 
     def test_draft_send_pushes_and_sets_state(self):
-        """召唤推送：落日志 + send_message 到博士私聊 + 状态置为等待回复"""
+        """召唤推送：落日志 + send_message 到老师私聊 + 状态置为等待回复"""
         p = self._make({
             "enable_family_pulse": True,
             "family_pulse_draft_enable": True,
@@ -3855,31 +3912,31 @@ class TestFamilyPulse(unittest.TestCase):
         })
         p.context.send_message = AsyncMock()
         p.context.get_current_chat_provider_id = AsyncMock(return_value="test-provider")
-        p.context.llm_generate = AsyncMock(return_value=self._resp("博士！你快来评评理"))
-        ok = asyncio.run(p._pulse_send_draft("amiya", "黍", "今天的汤是不是咸了", "晚上", "屋里很热闹"))
+        p.context.llm_generate = AsyncMock(return_value=self._resp("老师！你快来评评理"))
+        ok = asyncio.run(p._pulse_send_draft("nova", "禾", "今天的汤是不是咸了", "晚上", "屋里很热闹"))
         self.assertTrue(ok)
         logs = p._pulse_read_day()
-        self.assertTrue(any(r["agent"] == "amiya" for r in logs), "召唤语应落旁轨日志")
+        self.assertTrue(any(r["agent"] == "nova" for r in logs), "召唤语应落旁轨日志")
         p.context.send_message.assert_awaited()
         st = p._pulse_draft_load()
-        self.assertTrue(st.get("awaiting"), "应置为等待博士回复")
+        self.assertTrue(st.get("awaiting"), "应置为等待老师回复")
         self.assertGreater(st.get("count", 0), 0)
 
     def test_draft_reply_check_injects_doctor(self):
-        """博士私聊回复：注入旁轨日志(agent=doctor) + 触发接茬 + 清除等待"""
+        """老师私聊回复：注入旁轨日志(agent=doctor) + 触发接茬 + 清除等待"""
         p = self._make({
             "enable_family_pulse": True,
             "family_pulse_draft_enable": True,
         })
         p._pulse_draft_save({
             "date": "2099-01-01", "count": 1, "awaiting": True,
-            "await_until": "2099-01-02T00:00:00+08:00", "draft_by": "amiya",
+            "await_until": "2099-01-02T00:00:00+08:00", "draft_by": "nova",
         })
         event = MagicMock()
         event.get_message_str.return_value = "我来啦，汤咸了？我尝尝"
         event.get_message_type.return_value = "FriendMessage"
         event.get_sender_id.return_value = "TESTUSER00000000000000000000000000"
-        p.context.llm_generate = AsyncMock(return_value=self._resp("博士你终于来了"))
+        p.context.llm_generate = AsyncMock(return_value=self._resp("老师你终于来了"))
 
         async def _run():
             return p._pulse_draft_reply_check(event)
@@ -3887,15 +3944,15 @@ class TestFamilyPulse(unittest.TestCase):
         ok = asyncio.run(_run())
         self.assertTrue(ok)
         logs = p._pulse_read_day()
-        self.assertTrue(any(r["agent"] == "doctor" for r in logs), "博士的话应注入旁轨")
+        self.assertTrue(any(r["agent"] == "doctor" for r in logs), "老师的话应注入旁轨")
         self.assertFalse(p._pulse_draft_load().get("awaiting"), "接回后应清除等待")
 
     def test_draft_reply_check_ignores_others(self):
-        """非博士私聊消息：不注入、不触发（等回复状态保留）"""
+        """非老师私聊消息：不注入、不触发（等回复状态保留）"""
         p = self._make({"enable_family_pulse": True, "family_pulse_draft_enable": True})
         p._pulse_draft_save({
             "date": "2099-01-01", "count": 1, "awaiting": True,
-            "await_until": "2099-01-02T00:00:00+08:00", "draft_by": "amiya",
+            "await_until": "2099-01-02T00:00:00+08:00", "draft_by": "nova",
         })
         event = MagicMock()
         event.get_message_str.return_value = "有人吗"
@@ -3903,10 +3960,10 @@ class TestFamilyPulse(unittest.TestCase):
         event.get_sender_id.return_value = "other_user"
         ok = p._pulse_draft_reply_check(event)
         self.assertFalse(ok)
-        self.assertTrue(p._pulse_draft_load().get("awaiting"), "非博士消息不应消费等待状态")
+        self.assertTrue(p._pulse_draft_load().get("awaiting"), "非老师消息不应消费等待状态")
 
     def test_draft_reply_present_window_multiple(self):
-        """在场窗口：博士被拉后连续回话，每句都注入 + 触发接茬，不一次性消费"""
+        """在场窗口：老师被拉后连续回话，每句都注入 + 触发接茬，不一次性消费"""
         p = self._make({
             "enable_family_pulse": True,
             "family_pulse_draft_enable": True,
@@ -3919,9 +3976,9 @@ class TestFamilyPulse(unittest.TestCase):
             "date": now.strftime("%Y-%m-%d"), "count": 1, "awaiting": True,
             "await_until": (now + datetime.timedelta(minutes=30)).isoformat(),
             "present_until": (now + datetime.timedelta(minutes=30)).isoformat(),
-            "draft_by": "amiya",
+            "draft_by": "nova",
         })
-        p.context.llm_generate = AsyncMock(return_value=self._resp("博士你来啦"))
+        p.context.llm_generate = AsyncMock(return_value=self._resp("老师你来啦"))
 
         def _ev(msg):
             e = MagicMock()
@@ -3947,18 +4004,18 @@ class TestFamilyPulse(unittest.TestCase):
     def test_draft_followup_prefers_drafter(self):
         """接茬优先拉他的人：drafter 先接，补位者在后"""
         p = self._make({"enable_family_pulse": True, "family_pulse_draft_enable": True})
-        p.context.llm_generate = AsyncMock(return_value=self._resp("博士你终于来了"))
+        p.context.llm_generate = AsyncMock(return_value=self._resp("老师你终于来了"))
 
         async def _run():
-            await p._pulse_draft_followup("我来了", "test:FriendMessage:TESTUSER00000000000000000000000000", "amiya")
+            await p._pulse_draft_followup("我来了", "test:FriendMessage:TESTUSER00000000000000000000000000", "nova")
 
         asyncio.run(_run())
         logs = p._pulse_read_day()
         agents = [r["agent"] for r in logs if r["agent"] != "doctor"]
-        self.assertIn("amiya", agents, "拉博士的人应先接茬")
+        self.assertIn("nova", agents, "拉老师的人应先接茬")
         self.assertGreaterEqual(len(agents), 1)
 
-    # ── 唤即看：博士私聊回看旁轨日志 ──
+    # ── 唤即看：老师私聊回看旁轨日志 ──
     def test_pulse_recent_logs_window(self):
         """6h 窗口过滤：15:31 回看只留 ≥09:31 的日志，全天 177 条不再整刷"""
         import datetime as _dt
@@ -3992,12 +4049,12 @@ class TestFamilyPulse(unittest.TestCase):
         self.assertEqual(len(got), 2)
 
     def test_peek_doctor_private_sends(self):
-        """博士私聊「看看家里」→ 推送旁轨日志原文到博士 UMO + stop_event"""
+        """老师私聊「看看家里」→ 推送旁轨日志原文到老师 UMO + stop_event"""
         p = self._make({
             "enable_family_pulse": True,
             "family_pulse_digest_umo": "test:FriendMessage:TESTUSER00000000000000000000000000",
         })
-        p._pulse_append("amiya", "阿米娅", "今天想泡壶茶晒晒太阳")
+        p._pulse_append("nova", "小星", "今天想泡壶茶晒晒太阳")
         p.context.send_message = AsyncMock()
         event = MagicMock()
         event.get_message_str.return_value = "看看家里"
@@ -4012,11 +4069,11 @@ class TestFamilyPulse(unittest.TestCase):
         self.assertIn("TESTUSER", umo)
         # 文本组装走纯函数断言（send 侧是 mock，取不到真实 MessageChain 内容）
         text = p._build_digest_text(p._pulse_read_day(), "09-04")
-        self.assertIn("阿米娅", text)
+        self.assertIn("小星", text)
         self.assertIn("泡壶茶", text)
 
     def test_peek_non_doctor_noop(self):
-        """非博士私聊「看看家里」→ 放行不推送、不 stop"""
+        """非老师私聊「看看家里」→ 放行不推送、不 stop"""
         p = self._make({"enable_family_pulse": True})
         p.context.send_message = AsyncMock()
         event = MagicMock()
@@ -4037,7 +4094,7 @@ class TestFamilyPulse(unittest.TestCase):
         yesterday = (
             datetime.datetime.now(ZoneInfo("Asia/Shanghai")) - datetime.timedelta(days=1)
         ).strftime("%Y-%m-%d")
-        p._pulse_append("shu", "黍", "昨天腌的萝卜该翻缸了")
+        p._pulse_append("he", "禾", "昨天腌的萝卜该翻缸了")
         # 把刚写的记录挪到昨天的日志文件
         import os
         src = p._pulse_log_path()
@@ -4045,7 +4102,7 @@ class TestFamilyPulse(unittest.TestCase):
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         os.replace(src, dst)
         logs = p._pulse_read_day(yesterday)
-        self.assertTrue(any(r["agent"] == "shu" for r in logs), "应能读到昨天日志")
+        self.assertTrue(any(r["agent"] == "he" for r in logs), "应能读到昨天日志")
         self.assertEqual(p._pulse_peek_day("看看家里 昨天"), yesterday)
 
     def test_peek_disabled_noop(self):
@@ -4074,11 +4131,11 @@ class TestFamilyPulse(unittest.TestCase):
             "enable_family_pulse": True,
             "family_pulse_digest_umo": "test:FriendMessage:TESTUSER00000000000000000000000000",
         })
-        p._pulse_append("amiya", "阿米娅", "今天想泡壶茶晒晒太阳")
+        p._pulse_append("nova", "小星", "今天想泡壶茶晒晒太阳")
         # 文本组装（纯函数）断言
         text = p._build_digest_text(p._pulse_read_day(), "09-04")
         self.assertIn("家里动静", text)
-        self.assertIn("阿米娅", text)
+        self.assertIn("小星", text)
         self.assertIn("泡壶茶", text)
         # 发送侧：UMO 正确、调用一次
         p.context.send_message = AsyncMock()
@@ -4090,7 +4147,7 @@ class TestFamilyPulse(unittest.TestCase):
     def test_digest_disabled_no_send(self):
         """开关关：有日志也不发送"""
         p = self._make({"enable_family_pulse": False})
-        p._pulse_append("amiya", "阿米娅", "日志在但开关关着")
+        p._pulse_append("nova", "小星", "日志在但开关关着")
         p.context.send_message = AsyncMock()
         asyncio.run(p.family_pulse_digest())
         p.context.send_message.assert_not_awaited()
@@ -4155,7 +4212,7 @@ class TestFamilyPulse(unittest.TestCase):
         # 心跳循环 task 已创建（asyncio.run 退出时会 cancel 残留 task，只验存在）
         self.assertIsNotNone(getattr(p, "_pulse_loop_task", None))
 
-    # ── 氛围三档（2026-09-04 博士拍板：家里聊荤的可以下流）──
+    # ── 氛围三档（2026-09-04 老师拍板：家里聊荤的可以下流）──
     def test_pulse_mood_group_branches(self):
         """多人场只出 banter/daily；两人近关系可 private；两人一般以 daily 为主"""
         import family_pulse as fp_mod
@@ -4167,20 +4224,20 @@ class TestFamilyPulse(unittest.TestCase):
             self.assertEqual(mc.call_args.args[0], ["banter", "daily"])
         # 两人 + 亲密度高（写关系网 80）→ 候选含 private
         p2 = self._make({})
-        self._write_affinity(p2, {"阿米娅<->黍": {"亲密度": 80, "基调": "互相惦记"}})
+        self._write_affinity(p2, {"小星<->禾": {"亲密度": 80, "基调": "互相惦记"}})
         with mock.patch.object(fp_mod.random, "choices", return_value=["private"]) as mc:
-            self.assertEqual(p2._pulse_mood(["amiya", "shu"]), "private")
+            self.assertEqual(p2._pulse_mood(["nova", "he"]), "private")
             self.assertEqual(mc.call_args.args[0], ["private", "banter", "daily"])
         # 两人 + 无关系网 → 候选以 daily 为主
         p3 = self._make({})
         with mock.patch.object(fp_mod.random, "choices", return_value=["daily"]) as mc:
-            self.assertEqual(p3._pulse_mood(["xi", "nian"]), "daily")
+            self.assertEqual(p3._pulse_mood(["chen", "qing"]), "daily")
             self.assertEqual(mc.call_args.args[0], ["daily", "banter"])
 
     def test_tick_mood_banter_injects_spicy_rules(self):
-        """banter 场：system prompt 带『可以下流』『拿博士打趣』，且不禁止喊博士"""
+        """banter 场：system prompt 带『可以下流』『拿老师打趣』，且不禁止喊老师"""
         p = self._make({"enable_family_pulse": True})
-        p._pulse_pick_group = lambda members: ["amiya", "shu", "closure"]
+        p._pulse_pick_group = lambda members: ["nova", "he", "bell"]
         p._pulse_pick_lines = lambda group_size: 3
         p._pulse_mood = lambda group: "banter"
         p.context.llm_generate = AsyncMock(return_value=self._resp("刚把柳木画板搬去晾"))
@@ -4188,13 +4245,15 @@ class TestFamilyPulse(unittest.TestCase):
         calls = p.context.llm_generate.call_args_list
         sys0 = calls[0].kwargs.get("system_prompt", "")
         self.assertIn("可以下流", sys0)
-        self.assertIn("拿博士打趣", sys0)
-        self.assertNotIn("不要喊『博士』", sys0)
+        # 称呼随部署数据（prompts.json）；此处校验「拿…打趣」规则形态
+        self.assertRegex(sys0, r"拿\S{1,6}打趣")
+        # banter 场不放「不要喊」类禁令
+        self.assertNotIn("不要喊", sys0)
 
     def test_tick_mood_private_injects_private_rules(self):
-        """private 场：system prompt 带『体己话』『可以下流』，允许聊博士"""
+        """private 场：system prompt 带『体己话』『可以下流』，允许聊老师"""
         p = self._make({"enable_family_pulse": True})
-        p._pulse_pick_group = lambda members: ["amiya", "shu"]
+        p._pulse_pick_group = lambda members: ["nova", "he"]
         p._pulse_pick_lines = lambda group_size: 2
         p._pulse_mood = lambda group: "private"
         p.context.llm_generate = AsyncMock(return_value=self._resp("刚把柳木画板搬去晾"))
@@ -4204,23 +4263,24 @@ class TestFamilyPulse(unittest.TestCase):
         self.assertIn("可以下流", sys0)
 
     def test_tick_mood_daily_keeps_no_doctor_rule(self):
-        """daily 场：维持原规矩——不喊博士"""
+        """daily 场：维持原规矩——不喊老师"""
         p = self._make({"enable_family_pulse": True})
-        p._pulse_pick_group = lambda members: ["amiya", "shu"]
+        p._pulse_pick_group = lambda members: ["nova", "he"]
         p._pulse_pick_lines = lambda group_size: 2
         p._pulse_mood = lambda group: "daily"
         p.context.llm_generate = AsyncMock(return_value=self._resp("刚把柳木画板搬去晾"))
         asyncio.run(p.family_pulse_tick())
         sys0 = p.context.llm_generate.call_args_list[0].kwargs.get("system_prompt", "")
-        self.assertIn("不要喊『博士』", sys0)
+        # 称呼随部署数据（prompts.json）；此处校验「不要喊『…』」规则形态
+        self.assertRegex(sys0, r"不要喊『\S{1,6}』")
         self.assertNotIn("可以下流", sys0)
 
 
 class TestStickyMultiGroup(unittest.TestCase):
-    """[方案① 2026-09-07] 多P场次粘滞：多点名结束后的无点名消息按整组续接，不掉队。
+    """[方案① 2026-09-07] 多人场次粘滞：多点名结束后的无点名消息按整组续接，不掉队。
 
-    复现博士 23:30 现场 bug：第一轮阿米娅+斯卡蒂 2/2 成功，但旧 _route_last 只留
-    最后一个 agent，后续无点名消息只粘滞 skadi，阿米娅掉队。
+    复现老师 23:30 现场 bug：第一轮小星+小汐 2/2 成功，但旧 _route_last 只留
+    最后一个 agent，后续无点名消息只粘滞 tide，小星掉队。
     现在 _route_last 升级为「在场者组」，_t1_sticky_route 对多人组返回 list[str]。
     """
 
@@ -4232,16 +4292,16 @@ class TestStickyMultiGroup(unittest.TestCase):
                 "router_continue_window_sec": 300,
             },
         )
-        # mock 子代理池（含阿米娅+斯卡蒂）
+        # mock 子代理池（含小星+小汐）
         p._router_agent_pool = lambda: {
-            "amiya": "阿米娅",
-            "skadi": "斯卡蒂",
-            "theresia": "特蕾西娅",
+            "nova": "小星",
+            "tide": "小汐",
+            "luna": "小夜",
         }
         p._get_name_display_map = lambda: {
-            "amiya": "阿米娅",
-            "skadi": "斯卡蒂",
-            "theresia": "特蕾西娅",
+            "nova": "小星",
+            "tide": "小汐",
+            "luna": "小夜",
         }
         return p
 
@@ -4251,74 +4311,74 @@ class TestStickyMultiGroup(unittest.TestCase):
         return ev
 
     def test_multi_hits_after_multiname_record_group(self):
-        """多点名第一轮后写整组：_record_route_hits 把阿米娅+斯卡蒂都写入在场者组"""
+        """多点名第一轮后写整组：_record_route_hits 把小星+小汐都写入在场者组"""
         p = self._fresh_router()
         ev = self._ev()
-        p._record_route_hits(ev, ["amiya", "skadi"])
+        p._record_route_hits(ev, ["nova", "tide"])
         last, _ = p._route_mem()
         group = last[ev.unified_msg_origin]
-        self.assertEqual(set(group.keys()), {"amiya", "skadi"})
+        self.assertEqual(set(group.keys()), {"nova", "tide"})
 
     def test_sticky_returns_multi_group_list(self):
-        """无点名后续消息：_t1_sticky_route 命中多人组 → 返回整组 list（阿米娅不掉队）"""
+        """无点名后续消息：_t1_sticky_route 命中多人组 → 返回整组 list（小星不掉队）"""
         p = self._fresh_router()
         ev = self._ev()
-        p._record_route_hits(ev, ["amiya", "skadi"])
+        p._record_route_hits(ev, ["nova", "tide"])
         # 无点名消息（如"嗯，继续"）
         sticky = p._t1_sticky_route(ev, "嗯，继续")
         self.assertIsInstance(sticky, list)
-        self.assertEqual(set(sticky), {"amiya", "skadi"})
+        self.assertEqual(set(sticky), {"nova", "tide"})
 
     def test_single_group_still_returns_str(self):
         """单人粘滞仍返回 str（单 agent 直发路径零回归）"""
         p = self._fresh_router()
         ev = self._ev("sess-single")
-        p._record_route_hit(ev, "theresia")
+        p._record_route_hit(ev, "luna")
         sticky = p._t1_sticky_route(ev, "继续聊")
-        self.assertEqual(sticky, "theresia")
+        self.assertEqual(sticky, "luna")
 
     def test_new_mention_releases_sticky(self):
         """[2026-09-11 新口径] 显式点名（句首点名 / 呼叫词）→ 释放粘滞交给 T1 换人。"""
         p = self._fresh_router()
         ev = self._ev("sess-mention")
-        p._record_route_hits(ev, ["amiya", "skadi"])
+        p._record_route_hits(ev, ["nova", "tide"])
         # 句首点名且后接分隔标点 → 显式转移，粘滞释放
-        sticky = p._t1_sticky_route(ev, "特蕾西娅，你来接")
+        sticky = p._t1_sticky_route(ev, "小夜，你来接")
         self.assertIsNone(sticky)
         # 呼叫词点名 → 同样是显式转移
-        p._record_route_hits(ev, ["amiya", "skadi"])
-        sticky2 = p._t1_sticky_route(ev, "叫特蕾西娅过来")
+        p._record_route_hits(ev, ["nova", "tide"])
+        sticky2 = p._t1_sticky_route(ev, "叫小夜过来")
         self.assertIsNone(sticky2)
 
     def test_narrative_mention_keeps_sticky(self):
-        """[2026-09-11 博士口径] 长句叙述里顺带提及他名 → 不夺锁，仍按原组续接。"""
+        """[2026-09-11 老师口径] 长句叙述里顺带提及他名 → 不夺锁，仍按原组续接。"""
         p = self._fresh_router()
         ev = self._ev("sess-narrate")
-        p._record_route_hits(ev, ["amiya", "skadi"])
-        sticky = p._t1_sticky_route(ev, "特蕾西娅那个方案我觉得还得改改，你们先继续")
+        p._record_route_hits(ev, ["nova", "tide"])
+        sticky = p._t1_sticky_route(ev, "小夜那个方案我觉得还得改改，你们先继续")
         self.assertIsInstance(sticky, list)
-        self.assertEqual(set(sticky), {"amiya", "skadi"})
+        self.assertEqual(set(sticky), {"nova", "tide"})
 
     def test_is_explicit_transfer_matrix(self):
         """显式转移判定矩阵（2026-09-11 口径：命令/呼叫词/短名/句首点名算，叙述提及不算）。"""
         p = self._fresh_router()
-        self.assertTrue(p._is_explicit_transfer("/阿米娅"))
-        self.assertTrue(p._is_explicit_transfer("#特蕾西娅"))
-        self.assertTrue(p._is_explicit_transfer("！斯卡蒂"))
-        self.assertTrue(p._is_explicit_transfer("叫斯卡蒂过来"))
-        self.assertTrue(p._is_explicit_transfer("特蕾西娅"))
-        self.assertFalse(p._is_explicit_transfer("特蕾西娅那个方案还得改改再发我"))
+        self.assertTrue(p._is_explicit_transfer("/小星"))
+        self.assertTrue(p._is_explicit_transfer("#小夜"))
+        self.assertTrue(p._is_explicit_transfer("！小汐"))
+        self.assertTrue(p._is_explicit_transfer("叫小汐过来"))
+        self.assertTrue(p._is_explicit_transfer("小夜"))
+        self.assertFalse(p._is_explicit_transfer("小夜那个方案还得改改再发我"))
 
     def test_raw_command_text_restores_stripped_prefix(self):
         """唤醒层剥掉 '/' 后，从消息段拼回原文，T0 命令式照常识别。"""
         p = self._fresh_router()
         seg = MagicMock()
-        seg.text = "/阿米娅"
+        seg.text = "/小星"
         ev = MagicMock()
         ev.get_messages = lambda: [seg]
-        self.assertEqual(p._raw_command_text(ev), "/阿米娅")
-        agents, has_main = p._parse_agent_command("/阿米娅")
-        self.assertEqual(agents, ["amiya"])
+        self.assertEqual(p._raw_command_text(ev), "/小星")
+        agents, has_main = p._parse_agent_command("/小星")
+        self.assertEqual(agents, ["nova"])
         self.assertFalse(has_main)
 
     def test_sticky_group_of_reports_live_members(self):
@@ -4326,31 +4386,31 @@ class TestStickyMultiGroup(unittest.TestCase):
         p = self._fresh_router()
         ev = self._ev("sess-lock")
         self.assertEqual(p._sticky_group_of(ev), [])
-        p._record_route_hits(ev, ["amiya", "skadi"])
-        self.assertEqual(set(p._sticky_group_of(ev)), {"amiya", "skadi"})
+        p._record_route_hits(ev, ["nova", "tide"])
+        self.assertEqual(set(p._sticky_group_of(ev)), {"nova", "tide"})
 
-    def test_presis_token_higher_priority_clears_group(self):
-        """「普瑞赛斯」最高级令牌：清空在场者组（上层已清锁）"""
+    def test_pilot_token_higher_priority_clears_group(self):
+        """「领航」最高级令牌：清空在场者组（上层已清锁）"""
         p = self._fresh_router()
-        ev = self._ev("sess-presis")
-        p._record_route_hits(ev, ["amiya", "skadi"])
+        ev = self._ev("sess-pilot")
+        p._record_route_hits(ev, ["nova", "tide"])
         # 清理逻辑等同 _smart_router_check 的 last.pop
         last, _ = p._route_mem()
         last.pop(ev.unified_msg_origin, None)
-        sticky = p._t1_sticky_route(ev, "普瑞赛斯你来")
+        sticky = p._t1_sticky_route(ev, "领航你来")
         self.assertIsNone(sticky)
 
     def test_agent_removed_from_pool_dropped_from_group(self):
         """不在池的子代理从在场者组剔除（避免粘滞到已移除角色）"""
         p = self._fresh_router()
         ev = self._ev("sess-removed")
-        p._record_route_hits(ev, ["amiya", "skadi"])
-        # 移除 skadi（模拟下池）后，只留 amiya 单人
-        p._router_agent_pool = lambda: {"amiya": "阿米娅", "theresia": "特蕾西娅"}
+        p._record_route_hits(ev, ["nova", "tide"])
+        # 移除 tide（模拟下池）后，只留 nova 单人
+        p._router_agent_pool = lambda: {"nova": "小星", "luna": "小夜"}
         sticky = p._t1_sticky_route(ev, "继续")
-        self.assertEqual(sticky, "amiya")
+        self.assertEqual(sticky, "nova")
 class TestAdminCommand(unittest.TestCase):
-    """[软入口·A 方案 2026-09-12 博士指定] 柜台三件套：/谁在 /复位 /列表。
+    """[软入口·A 方案 2026-09-12 老师指定] 柜台三件套：/谁在 /复位 /列表。
     查锁、放锁、看名单；整句判定，带尾巴不拦截。纯逻辑测试（解析+文案+清锁）。"""
 
     def _fresh_router(self):
@@ -4362,14 +4422,14 @@ class TestAdminCommand(unittest.TestCase):
             },
         )
         p._router_agent_pool = lambda: {
-            "amiya": "阿米娅",
-            "closure": "可露希尔",
-            "xi": "夕",
+            "nova": "小星",
+            "bell": "小铃",
+            "chen": "辰",
         }
         p._get_name_display_map = lambda: {
-            "amiya": "阿米娅",
-            "closure": "可露希尔",
-            "xi": "夕",
+            "nova": "小星",
+            "bell": "小铃",
+            "chen": "辰",
         }
         return p
 
@@ -4401,16 +4461,16 @@ class TestAdminCommand(unittest.TestCase):
 
     def test_parse_rejects_agent_name(self):
         p = self._fresh_router()
-        self.assertEqual(p._parse_admin_command("/阿米娅"), "")
-        self.assertEqual(p._parse_admin_command("/可露希尔"), "")
+        self.assertEqual(p._parse_admin_command("/小星"), "")
+        self.assertEqual(p._parse_admin_command("/小铃"), "")
 
     # ── 回执文案与清锁 ─────────────────────────────────
     def test_status_reports_locked(self):
         p = self._fresh_router()
         ev = self._ev()
-        p._record_cmd_lock(ev, ["closure"])
+        p._record_cmd_lock(ev, ["bell"])
         text = p._admin_reply_text(ev, "status")
-        self.assertIn("可露希尔", text)
+        self.assertIn("小铃", text)
         self.assertIn("锁着", text)
 
     def test_status_reports_free(self):
@@ -4422,10 +4482,10 @@ class TestAdminCommand(unittest.TestCase):
     def test_reset_clears_all_locks(self):
         p = self._fresh_router()
         ev = self._ev()
-        p._record_cmd_lock(ev, ["closure", "xi"])
+        p._record_cmd_lock(ev, ["bell", "chen"])
         last, _ = p._route_mem()
-        last[ev.unified_msg_origin] = {"closure": 1.0}
-        p._record_direct_reply(ev.unified_msg_origin, "closure", "在呢")
+        last[ev.unified_msg_origin] = {"bell": 1.0}
+        p._record_direct_reply(ev.unified_msg_origin, "bell", "在呢")
         text = p._admin_reply_text(ev, "reset")
         self.assertIsNone(p._cmd_locked_group(ev))
         self.assertIsNone(last.get(ev.unified_msg_origin))
@@ -4436,14 +4496,14 @@ class TestAdminCommand(unittest.TestCase):
         p = self._fresh_router()
         ev = self._ev()
         text = p._admin_reply_text(ev, "list")
-        self.assertIn("阿米娅", text)
-        self.assertIn("可露希尔", text)
+        self.assertIn("小星", text)
+        self.assertIn("小铃", text)
 
 
 class TestAgentCommand(unittest.TestCase):
-    """[T0 命令式触发 2026-09-08 博士指定] 以 / 开头显式命令锁定子代理/主代理，
-    取代自然语言关键词猜测。/黍 · /黍+年 · /特蕾西娅+阿米娅+斯卡蒂 ·
-    /普瑞赛斯+阿米娅+特蕾西娅，不设上限，命令持续生效（写粘滞锁）。"""
+    """[T0 命令式触发 2026-09-08 老师指定] 以 / 开头显式命令锁定子代理/主代理，
+    取代自然语言关键词猜测。/禾 · /禾+晴 · /小夜+小星+小汐 ·
+    /领航+小星+小夜，不设上限，命令持续生效（写粘滞锁）。"""
 
     def setUp(self):
         # [测试卫生 2026-09-12] 主代理锁持久化会写真实 data/main_lock.json。
@@ -4484,26 +4544,26 @@ class TestAgentCommand(unittest.TestCase):
         )
         # mock 子代理池与显示名映射（含深度角色名）
         p._router_agent_pool = lambda: {
-            "amiya": "阿米娅",
-            "skadi": "斯卡蒂",
-            "theresia": "特蕾西娅",
-            "closure": "可露希尔",
-            "xi": "夕",
-            "nian": "年",
-            "ling": "令",
-            "shu": "黍",
-            "liino": "梨诺",
+            "nova": "小星",
+            "tide": "小汐",
+            "luna": "小夜",
+            "bell": "小铃",
+            "chen": "辰",
+            "qing": "晴",
+            "lan": "岚",
+            "he": "禾",
+            "song": "小歌",
         }
         p._get_name_display_map = lambda: {
-            "amiya": "阿米娅",
-            "skadi": "斯卡蒂",
-            "theresia": "特蕾西娅",
-            "closure": "可露希尔",
-            "xi": "夕",
-            "nian": "年",
-            "ling": "令",
-            "shu": "黍",
-            "liino": "梨诺",
+            "nova": "小星",
+            "tide": "小汐",
+            "luna": "小夜",
+            "bell": "小铃",
+            "chen": "辰",
+            "qing": "晴",
+            "lan": "岚",
+            "he": "禾",
+            "song": "小歌",
         }
         return p
 
@@ -4515,44 +4575,44 @@ class TestAgentCommand(unittest.TestCase):
     # ── 解析（_parse_agent_command）────────────────────
     def test_single_command(self):
         p = self._fresh_router()
-        agents, has_main = p._parse_agent_command("/黍")
-        self.assertEqual(agents, ["shu"])
+        agents, has_main = p._parse_agent_command("/禾")
+        self.assertEqual(agents, ["he"])
         self.assertFalse(has_main)
 
     def test_multi_command_plus(self):
         p = self._fresh_router()
-        agents, has_main = p._parse_agent_command("/黍+年")
-        self.assertEqual(set(agents), {"shu", "nian"})
+        agents, has_main = p._parse_agent_command("/禾+晴")
+        self.assertEqual(set(agents), {"he", "qing"})
         self.assertFalse(has_main)
 
     def test_multi_command_three_reordered(self):
         p = self._fresh_router()
-        agents, has_main = p._parse_agent_command("/特蕾西娅+阿米娅+斯卡蒂")
-        self.assertEqual(set(agents), {"theresia", "amiya", "skadi"})
+        agents, has_main = p._parse_agent_command("/小夜+小星+小汐")
+        self.assertEqual(set(agents), {"luna", "nova", "tide"})
         self.assertFalse(has_main)
 
-    def test_command_presis_single(self):
+    def test_command_pilot_single(self):
         p = self._fresh_router()
-        agents, has_main = p._parse_agent_command("/普瑞赛斯")
+        agents, has_main = p._parse_agent_command("/领航")
         self.assertIsNone(agents)
         self.assertTrue(has_main)
 
-    def test_command_presis_with_agents(self):
+    def test_command_pilot_with_agents(self):
         p = self._fresh_router()
-        agents, has_main = p._parse_agent_command("/普瑞赛斯+阿米娅+特蕾西娅")
-        self.assertEqual(set(agents), {"amiya", "theresia"})
+        agents, has_main = p._parse_agent_command("/领航+小星+小夜")
+        self.assertEqual(set(agents), {"nova", "luna"})
         self.assertTrue(has_main)
 
     def test_command_english_id(self):
         p = self._fresh_router()
-        agents, has_main = p._parse_agent_command("/amiya+skadi")
-        self.assertEqual(set(agents), {"amiya", "skadi"})
+        agents, has_main = p._parse_agent_command("/nova+tide")
+        self.assertEqual(set(agents), {"nova", "tide"})
         self.assertFalse(has_main)
 
     def test_command_alias(self):
         p = self._fresh_router()
-        agents, has_main = p._parse_agent_command("/兔兔+猫猫")
-        self.assertEqual(set(agents), {"amiya"})
+        agents, has_main = p._parse_agent_command("/星星+九九")
+        self.assertEqual(set(agents), {"nova"})
         self.assertFalse(has_main)
 
     def test_command_unknown_falls_back(self):
@@ -4563,50 +4623,50 @@ class TestAgentCommand(unittest.TestCase):
 
     def test_non_command_returns_none(self):
         p = self._fresh_router()
-        agents, has_main = p._parse_agent_command("黍，我们聊聊")
+        agents, has_main = p._parse_agent_command("禾，我们聊聊")
         self.assertIsNone(agents)
         self.assertFalse(has_main)
 
-    def test_command_presis_with_valid_and_unknown(self):
+    def test_command_pilot_with_valid_and_unknown(self):
         p = self._fresh_router()
-        agents, has_main = p._parse_agent_command("/普瑞赛斯+黍+foo")
-        self.assertEqual(set(agents), {"shu"})
+        agents, has_main = p._parse_agent_command("/领航+禾+foo")
+        self.assertEqual(set(agents), {"he"})
         self.assertTrue(has_main)
 
     # ── 粘滞锁定（命令命中后写入在场者组）────────────
     def test_command_locks_multi_group(self):
         p = self._fresh_router()
         ev = self._ev("sess-cmd-multi")
-        p._record_route_hits(ev, ["shu", "nian"])
+        p._record_route_hits(ev, ["he", "qing"])
         sticky = p._t1_sticky_route(ev, "继续吧")
         self.assertIsInstance(sticky, list)
-        self.assertEqual(set(sticky), {"shu", "nian"})
+        self.assertEqual(set(sticky), {"he", "qing"})
 
     def test_command_locks_single_then_sticky(self):
         p = self._fresh_router()
         ev = self._ev("sess-cmd-single")
-        p._record_route_hit(ev, "shu")
+        p._record_route_hit(ev, "he")
         sticky = p._t1_sticky_route(ev, "继续聊")
-        self.assertEqual(sticky, "shu")
+        self.assertEqual(sticky, "he")
 
-    # ── 多代理建议暂存（/普瑞赛斯+阿米娅 directive 用）──
+    # ── 多代理建议暂存（/领航+小星 directive 用）──
     def test_route_suggestions_multi_pop_all(self):
         p = self._fresh_router()
-        p._record_route_suggestions(["amiya", "theresia"])
+        p._record_route_suggestions(["nova", "luna"])
         got = p._pop_route_suggestions()
-        self.assertEqual(set(got), {"amiya", "theresia"})
+        self.assertEqual(set(got), {"nova", "luna"})
 
     def test_route_suggestion_single_legacy_compat(self):
         p = self._fresh_router()
-        p._record_route_suggestion("shu")
+        p._record_route_suggestion("he")
         got1 = p._pop_route_suggestion()
-        self.assertEqual(got1, "shu")
+        self.assertEqual(got1, "he")
         # 单次吐完，重取为空
         self.assertIsNone(p._pop_route_suggestion())
 class TestCmdLockHardGroup(unittest.TestCase):
-    """[命令式强制锁 2026-09-08 博士 bug 回归] 命令锁定后，会话永远只跟锁定组对话。
-    关键：锁定组内消息提及其他子代理名（如「你对阿米娅的看法」）绝不触发切换，
-    T1/T0.5/T2 全失效。这是博士抓到的核心 bug 的治本回归测试。"""
+    """[命令式强制锁 2026-09-08 老师 bug 回归] 命令锁定后，会话永远只跟锁定组对话。
+    关键：锁定组内消息提及其他子代理名（如「你对小星的看法」）绝不触发切换，
+    T1/T0.5/T2 全失效。这是老师抓到的核心 bug 的治本回归测试。"""
 
     def setUp(self):
         # [测试卫生 2026-09-12] 同 TestAgentCommand：备份→清空→恢复真实锁文件，
@@ -4642,36 +4702,36 @@ class TestCmdLockHardGroup(unittest.TestCase):
         p = self._fresh()
         ev = MagicMock()
         ev.unified_msg_origin = "sess-lock"
-        p._record_cmd_lock(ev, ["nian", "xi"])
+        p._record_cmd_lock(ev, ["qing", "chen"])
         got = p._cmd_locked_group(ev)
-        self.assertEqual(set(got), {"nian", "xi"})
+        self.assertEqual(set(got), {"qing", "chen"})
 
     def test_cmd_lock_survives_mention_other_agent(self):
-        """命令锁 /年+夕 后，消息「你们对阿米娅的看法」必须仍返回 年+夕，绝不切阿米娅。"""
+        """命令锁 /晴+辰 后，消息「你们对小星的看法」必须仍返回 晴+辰，绝不切小星。"""
         p = self._fresh()
         ev = MagicMock()
         ev.unified_msg_origin = "sess-bug"
-        p._record_cmd_lock(ev, ["nian", "xi"])
-        # 锁组判定只看会话锁，不看消息内容 → 提及阿米娅不污染
+        p._record_cmd_lock(ev, ["qing", "chen"])
+        # 锁组判定只看会话锁，不看消息内容 → 提及小星不污染
         got = p._cmd_locked_group(ev)
-        self.assertEqual(set(got), {"nian", "xi"})
-        self.assertNotIn("amiya", got)
+        self.assertEqual(set(got), {"qing", "chen"})
+        self.assertNotIn("nova", got)
 
     def test_cmd_lock_single_stays(self):
         p = self._fresh()
         ev = MagicMock()
         ev.unified_msg_origin = "sess-single"
-        p._record_cmd_lock(ev, ["shu"])
+        p._record_cmd_lock(ev, ["he"])
         got = p._cmd_locked_group(ev)
-        self.assertEqual(got, ["shu"])
+        self.assertEqual(got, ["he"])
 
-    def test_cmd_lock_cleared_by_presis(self):
+    def test_cmd_lock_cleared_by_pilot(self):
         p = self._fresh()
         ev = MagicMock()
         ev.unified_msg_origin = "sess-clear"
-        p._record_cmd_lock(ev, ["nian", "xi"])
+        p._record_cmd_lock(ev, ["qing", "chen"])
         self.assertTrue(p._cmd_lock.get("sess-clear"))
-        # 普瑞赛斯分支清锁
+        # 领航分支清锁
         p._cmd_lock.pop(ev.unified_msg_origin, None)
         self.assertIsNone(p._cmd_locked_group(ev))
 
@@ -4680,7 +4740,7 @@ class TestCmdLockHardGroup(unittest.TestCase):
         p = self._fresh()
         ev = MagicMock()
         ev.unified_msg_origin = "sess-mainlock"
-        p._record_cmd_lock(ev, ["nian"])
+        p._record_cmd_lock(ev, ["qing"])
         p._record_main_lock(ev)
         self.assertTrue(p._main_locked(ev))
         self.assertIsNone(p._cmd_locked_group(ev))
@@ -4702,9 +4762,9 @@ class TestCmdLockHardGroup(unittest.TestCase):
         p._record_main_lock(ev)
         p._clear_main_lock(ev)
         p._cmd_lock = {}
-        p._record_cmd_lock(ev, ["shu"])
+        p._record_cmd_lock(ev, ["he"])
         self.assertFalse(p._main_locked(ev))
-        self.assertEqual(p._cmd_locked_group(ev), ["shu"])
+        self.assertEqual(p._cmd_locked_group(ev), ["he"])
 
     def test_main_lock_no_leak_across_sessions(self):
         """[主代理锁] 锁是会话级的，不影响其他会话"""
@@ -4769,28 +4829,28 @@ class TestCmdLockHardGroup(unittest.TestCase):
         self.assertIn("主代理", text)
 
     def test_agent_lock_receipt_text(self):
-        """[命令锁回执 2026-09-13 博士实测 bug] lock_agents 回执含「已锁定」标识
+        """[命令锁回执 2026-09-13 老师实测 bug] lock_agents 回执含「已锁定」标识
         与中文显示名（对齐 lock_main 柜台文案）。"""
         p = self._fresh()
         ev = MagicMock()
         ev.unified_msg_origin = "sess-agent-receipt"
-        p._record_cmd_lock(ev, ["closure"])
+        p._record_cmd_lock(ev, ["bell"])
         text = p._admin_reply_text(ev, "lock_agents")
         self.assertIn("已锁定", text)
-        self.assertIn("可露希尔", text)
+        self.assertIn("小铃", text)
 
     def test_smart_agent_lock_receipt_and_no_call(self):
-        """[命令锁回执 2026-09-13 博士实测 bug] smart 端 /名字 强锁：
+        """[命令锁回执 2026-09-13 老师实测 bug] smart 端 /名字 强锁：
         回执 + 建锁 + 短路，不再把命令消息直接调用子代理（旧行为触发其直接回复）。"""
         import asyncio as _aio
         from unittest.mock import AsyncMock, patch as _patch
         p = self._fresh()
         ev = MagicMock()
         ev.unified_msg_origin = "sess-cmd-receipt"
-        ev.get_message_str.return_value = "/可露希尔"
+        ev.get_message_str.return_value = "/小铃"
         ev.is_at_or_wake_command = True
-        with _patch.object(type(p), "_resolve_command_text", return_value="/可露希尔"), \
-             _patch.object(type(p), "_parse_agent_command", return_value=(["closure"], False)), \
+        with _patch.object(type(p), "_resolve_command_text", return_value="/小铃"), \
+             _patch.object(type(p), "_parse_agent_command", return_value=(["bell"], False)), \
              _patch.object(type(p), "_router_enabled", return_value=True), \
              _patch.object(type(p), "_record_user_msg"), \
              _patch.object(type(p), "_dedup_shortcircuit", return_value=False), \
@@ -4802,10 +4862,10 @@ class TestCmdLockHardGroup(unittest.TestCase):
         m_reply.assert_called_once()           # 回执已发
         self.assertEqual(m_reply.call_args.args[1], "lock_agents")
         ev.stop_event.assert_called_once()
-        self.assertEqual(p._cmd_locked_group(ev), ["closure"])   # 锁已建立
+        self.assertEqual(p._cmd_locked_group(ev), ["bell"])   # 锁已建立
 
     def test_busy_agent_lock_receipt_and_no_call(self):
-        """[命令锁回执 2026-09-13 博士实测 bug] busy 端 /名字 强锁同款：
+        """[命令锁回执 2026-09-13 老师实测 bug] busy 端 /名字 强锁同款：
         回执 + 建锁 + 短路，不再把命令消息直接直发子代理。"""
         import asyncio as _aio
         import router as router_mod
@@ -4816,10 +4876,10 @@ class TestCmdLockHardGroup(unittest.TestCase):
         try:
             ev = MagicMock()
             ev.unified_msg_origin = "sess-busy-receipt"
-            ev.get_message_str.return_value = "/可露希尔"
+            ev.get_message_str.return_value = "/小铃"
             ev.is_at_or_wake_command = True
-            with _patch.object(type(p), "_resolve_command_text", return_value="/可露希尔"), \
-                 _patch.object(type(p), "_parse_agent_command", return_value=(["closure"], False)), \
+            with _patch.object(type(p), "_resolve_command_text", return_value="/小铃"), \
+                 _patch.object(type(p), "_parse_agent_command", return_value=(["bell"], False)), \
                  _patch.object(type(p), "_router_enabled", return_value=True), \
                  _patch.object(type(p), "parallel_handoff", new=AsyncMock()) as m_ph, \
                  _patch.object(type(p), "_send_admin_reply", new=AsyncMock()) as m_reply:
@@ -4829,18 +4889,18 @@ class TestCmdLockHardGroup(unittest.TestCase):
             m_reply.assert_called_once()
             self.assertEqual(m_reply.call_args.args[1], "lock_agents")
             ev.stop_event.assert_called_once()
-            self.assertEqual(p._cmd_locked_group(ev), ["closure"])
+            self.assertEqual(p._cmd_locked_group(ev), ["bell"])
         finally:
             router_mod._ACTIVE_AGENT_RUNNERS = old_runners
 
     def test_main_lock_wake_rewrite_not_treated_as_command(self):
-        """[2026-09-12 21:25 治本] 唤醒重写的斜杠普通消息（/你和可露希尔...）
+        """[2026-09-12 21:25 治本] 唤醒重写的斜杠普通消息（/你和小铃...）
         必须被识别为「非真命令」——否则主代理锁会把它当命令放行，
         消息被 T0/T1 扫出子代理名路由走（21:06 实测 bug）"""
         p = self._fresh()
         # 唤醒重写形态：带 / 但解析不出任何已知目标 → 非真命令
         self.assertFalse(
-            p._is_real_command("/你和可露希尔一起去看复调插件代码吧，审查还有没有bug")
+            p._is_real_command("/你和小铃一起去看复调插件代码吧，审查还有没有bug")
         )
         # 无前缀普通文本 → 非命令
         self.assertFalse(p._is_real_command("你和她一起去看代码"))
@@ -4856,15 +4916,15 @@ class TestCmdLockHardGroup(unittest.TestCase):
         p = self._fresh()
         ev = MagicMock()
         ev.unified_msg_origin = "sess-switch-repair"
-        ev.get_message_str.return_value = "/可露希尔"
+        ev.get_message_str.return_value = "/小铃"
         ev.is_at_or_wake_command = True
         p._record_main_lock(ev)
         # 另一会话先建命令锁，验证不被全局重置
         ev_other = MagicMock()
         ev_other.unified_msg_origin = "sess-other"
-        p._record_cmd_lock(ev_other, ["nian"])
-        with _patch.object(type(p), "_resolve_command_text", return_value="/可露希尔"), \
-             _patch.object(type(p), "_parse_agent_command", return_value=(["closure"], False)), \
+        p._record_cmd_lock(ev_other, ["qing"])
+        with _patch.object(type(p), "_resolve_command_text", return_value="/小铃"), \
+             _patch.object(type(p), "_parse_agent_command", return_value=(["bell"], False)), \
              _patch.object(type(p), "_router_enabled", return_value=True), \
              _patch.object(type(p), "_record_user_msg"), \
              _patch.object(type(p), "_dedup_shortcircuit", return_value=False), \
@@ -4879,8 +4939,8 @@ class TestCmdLockHardGroup(unittest.TestCase):
         p = self._fresh()
         ev = MagicMock()
         ev.unified_msg_origin = "sess-dedup"
-        msg = "你和可露希尔一起去看代码"
-        raw = "/你和可露希尔一起去看代码"  # 唤醒重写形态（非真命令）
+        msg = "你和小铃一起去看代码"
+        raw = "/你和小铃一起去看代码"  # 唤醒重写形态（非真命令）
         r1 = p._dedup_shortcircuit(ev, msg, raw)
         r2 = p._dedup_shortcircuit(ev, msg, raw)
         self.assertFalse(r1, "首次出现应放行")
@@ -4895,7 +4955,7 @@ class TestCmdLockHardGroup(unittest.TestCase):
         self.assertTrue(has_main)
         self.assertFalse(agents)
 
-    def test_presis_regex_includes_generic(self):
+    def test_pilot_regex_includes_generic(self):
         """[发布泛化] 主代理令牌正则包含通用词"""
         p = self._fresh()
         self.assertIsNotNone(p._PRESIS_TOKEN_RE)
@@ -4906,12 +4966,12 @@ class TestCmdLockHardGroup(unittest.TestCase):
         p = self._fresh()
         ev = MagicMock()
         ev.unified_msg_origin = "sess-replace"
-        p._record_cmd_lock(ev, ["nian", "xi"])
-        # 新命令 /黍 → 重置锁组
+        p._record_cmd_lock(ev, ["qing", "chen"])
+        # 新命令 /禾 → 重置锁组
         p._cmd_lock = {}
-        p._record_cmd_lock(ev, ["shu"])
+        p._record_cmd_lock(ev, ["he"])
         got = p._cmd_locked_group(ev)
-        self.assertEqual(got, ["shu"])
+        self.assertEqual(got, ["he"])
 
     def test_no_cmd_lock_returns_none(self):
         p = self._fresh()
@@ -4953,8 +5013,8 @@ class TestCmdLockHardGroup(unittest.TestCase):
         if with_orchestrator:
             orch = MagicMock()
             orch.handoffs = [
-                _Handoff("amiya", "Delegate tasks to amiya agent to handle the request."),
-                _Handoff("kaltsit", ""),
+                _Handoff("nova", "Delegate tasks to nova agent to handle the request."),
+                _Handoff("heron", ""),
             ]
             p.context.subagent_orchestrator = orch
         else:
@@ -4967,8 +5027,8 @@ class TestCmdLockHardGroup(unittest.TestCase):
         p = self._fresh_publish(with_orchestrator=True)
         with _patch.object(type(p), "T2_AGENT_BRIEF", {}):
             pool = p._router_agent_pool()
-        self.assertEqual(set(pool.keys()), {"amiya", "kaltsit"})
-        self.assertIn("amiya", pool["amiya"])
+        self.assertEqual(set(pool.keys()), {"nova", "heron"})
+        self.assertIn("nova", pool["nova"])
         self.assertNotIn("PRIVATE-PERSONA", str(pool), "不得读取人格机密 instructions")
 
     def test_publish_pool_empty_without_orchestrator(self):
@@ -4987,7 +5047,7 @@ class TestCmdLockHardGroup(unittest.TestCase):
         self.assertTrue(directive, "指令应兜底生成而非空")
         self.assertIn("parallel_handoff", directive)
         self.assertTrue(
-            "amiya" in directive or "阿米娅" in directive,
+            "nova" in directive or "小星" in directive,
             "指令应含目标子代理名（中英文均可）",
         )
 
@@ -5000,8 +5060,8 @@ class TestCmdLockHardGroup(unittest.TestCase):
         self.assertEqual(directive, "")
 
 class TestShortcircuitDedup(unittest.TestCase):
-    """[同消息去重屏障 2026-09-09 博士 bug 回归] OnWaitingLLMRequestEvent 对同一条
-    消息可能顺序触发两次 → 第二次必须被吞掉，子代理不得重复回话（夕回两遍 bug）。"""
+    """[同消息去重屏障 2026-09-09 老师 bug 回归] OnWaitingLLMRequestEvent 对同一条
+    消息可能顺序触发两次 → 第二次必须被吞掉，子代理不得重复回话（辰回两遍 bug）。"""
 
     def _fresh(self):
         p = TestAgentCommand()._fresh_router()
@@ -5018,43 +5078,43 @@ class TestShortcircuitDedup(unittest.TestCase):
     def test_second_identical_msg_deduped(self):
         p = self._fresh()
         sid = "sess-dedup"
-        ev1 = self._ev(sid, "继续做爱")
-        ev2 = self._ev(sid, "继续做爱")
-        self.assertFalse(p._dedup_shortcircuit(ev1, "继续做爱"))  # 第一条放行
-        self.assertTrue(p._dedup_shortcircuit(ev2, "继续做爱"))   # 同文本第二次吞掉
+        ev1 = self._ev(sid, "继续吧")
+        ev2 = self._ev(sid, "继续吧")
+        self.assertFalse(p._dedup_shortcircuit(ev1, "继续吧"))  # 第一条放行
+        self.assertTrue(p._dedup_shortcircuit(ev2, "继续吧"))   # 同文本第二次吞掉
         ev2.stop_event.assert_called_once()
 
     def test_different_msg_not_deduped(self):
         p = self._fresh()
         sid = "sess-diff"
-        ev1 = self._ev(sid, "继续做爱")
+        ev1 = self._ev(sid, "继续吧")
         ev2 = self._ev(sid, "换个姿势")
-        self.assertFalse(p._dedup_shortcircuit(ev1, "继续做爱"))
+        self.assertFalse(p._dedup_shortcircuit(ev1, "继续吧"))
         self.assertFalse(p._dedup_shortcircuit(ev2, "换个姿势"))  # 不同文本放行
         ev2.stop_event.assert_not_called()
 
     def test_window_expiry_allow_again(self):
         p = self._fresh()
         sid = "sess-expiry"
-        ev1 = self._ev(sid, "继续做爱")
-        self.assertFalse(p._dedup_shortcircuit(ev1, "继续做爱"))
+        ev1 = self._ev(sid, "继续吧")
+        self.assertFalse(p._dedup_shortcircuit(ev1, "继续吧"))
         # 模拟窗口过后（>12s）同文本应放行
         p._shortcircuit_last[sid] = (p._shortcircuit_last[sid][0], p._shortcircuit_last[sid][1] - 15)
-        ev2 = self._ev(sid, "继续做爱")
-        self.assertFalse(p._dedup_shortcircuit(ev2, "继续做爱"))
+        ev2 = self._ev(sid, "继续吧")
+        self.assertFalse(p._dedup_shortcircuit(ev2, "继续吧"))
 
     def test_distinct_session_independent(self):
         p = self._fresh()
-        a1 = self._ev("sess-A", "继续做爱")
-        b1 = self._ev("sess-B", "继续做爱")
-        self.assertFalse(p._dedup_shortcircuit(a1, "继续做爱"))
+        a1 = self._ev("sess-A", "继续吧")
+        b1 = self._ev("sess-B", "继续吧")
+        self.assertFalse(p._dedup_shortcircuit(a1, "继续吧"))
         # B 会话同文本首条，不受 A 影响
-        self.assertFalse(p._dedup_shortcircuit(b1, "继续做爱"))
+        self.assertFalse(p._dedup_shortcircuit(b1, "继续吧"))
 
 class TestSwitchLockOnNewMention(unittest.TestCase):
-    """[点名=换锁 2026-09-09 博士 bug 回归] 命令/粘滞锁锁定 nian+xi 后，再点名
-    新面孔 skadi（自然语言「斯卡蒂」）→ 必须换锁成 skadi，而不是被并入 3P。
-    同时：3P 中点点名在场者（nian）→ 不拆散 3P（保组，防记忆#4 Bug B regression）。"""
+    """[点名=换锁 2026-09-09 老师 bug 回归] 命令/粘滞锁锁定 qing+chen 后，再点名
+    新面孔 tide（自然语言「小汐」）→ 必须换锁成 tide，而不是被并入多人组。
+    同时：多人组中点点名在场者（qing）→ 不拆散组（保组，防记忆#4 Bug B regression）。"""
 
     def _fresh_router(self):
         from test_plugin import TestCmdLockHardGroup as _base
@@ -5069,56 +5129,56 @@ class TestSwitchLockOnNewMention(unittest.TestCase):
         return ev
 
     def _pool(self, p):
-        return {"nian": "年", "xi": "夕", "skadi": "斯卡蒂", "amiya": "阿米娅", "theresia": "特蕾西娅"}
+        return {"qing": "晴", "chen": "辰", "tide": "小汐", "nova": "小星", "luna": "小夜"}
 
     def test_new_face_switches_lock_group(self):
-        """核心 bug：锁 {nian,xi} 后单点名 skadi（新面孔）→ 换锁成 {skadi}"""
+        """核心 bug：锁 {qing,chen} 后单点名 tide（新面孔）→ 换锁成 {tide}"""
         p = self._fresh_router()
         p._router_agent_pool = lambda: self._pool(p)
-        ev = self._plain_event("年+夕，来做爱3p吧")
-        p._record_route_hits(ev, ["nian", "xi"])
+        ev = self._plain_event("晴+辰，一起过来吧")
+        p._record_route_hits(ev, ["qing", "chen"])
         last, _ = p._route_mem()
-        self.assertEqual(set(last[ev.unified_msg_origin].keys()), {"nian", "xi"})
-        # 博士再点名斯卡蒂（自然语言，非斜杠命令）
-        ev2 = self._plain_event("斯卡蒂", "sess-switch")
-        p._record_route_hit(ev2, "skadi")
+        self.assertEqual(set(last[ev.unified_msg_origin].keys()), {"qing", "chen"})
+        # 老师再点名小汐（自然语言，非斜杠命令）
+        ev2 = self._plain_event("小汐", "sess-switch")
+        p._record_route_hit(ev2, "tide")
         last2, _ = p._route_mem()
-        # 治本断言：不是并入成 {nian,xi,skadi}，而是换锁成 {skadi}
-        self.assertEqual(set(last2[ev.unified_msg_origin].keys()), {"skadi"})
+        # 治本断言：不是并入成 {qing,chen,tide}，而是换锁成 {tide}
+        self.assertEqual(set(last2[ev.unified_msg_origin].keys()), {"tide"})
 
-    def test_in_group_mention_keeps_3p(self):
-        """3P 中点点名在场者（nian）→ 保组 {nian,xi} 不拆散（记忆#4 Bug B regression）"""
+    def test_in_group_mention_keeps_group(self):
+        """多人组中点点名在场者（qing）→ 保组 {qing,chen} 不拆散（记忆#4 Bug B regression）"""
         p = self._fresh_router()
         p._router_agent_pool = lambda: self._pool(p)
-        ev = self._plain_event("年+夕，来做爱3p吧")
-        p._record_route_hits(ev, ["nian", "xi"])
-        # 3P 进行中夸年一句
-        ev2 = self._plain_event("年，你好会亲", "sess-switch")
-        p._record_route_hit(ev2, "nian")
+        ev = self._plain_event("晴+辰，一起过来吧")
+        p._record_route_hits(ev, ["qing", "chen"])
+        # 多人组进行中夸晴一句
+        ev2 = self._plain_event("晴，你好厉害", "sess-switch")
+        p._record_route_hit(ev2, "qing")
         last2, _ = p._route_mem()
-        self.assertEqual(set(last2[ev.unified_msg_origin].keys()), {"nian", "xi"})
+        self.assertEqual(set(last2[ev.unified_msg_origin].keys()), {"qing", "chen"})
 
     def test_multi_mention_redefines_group(self):
-        """多点名整组覆盖：{nian,xi} 后点 {amiya,skadi} → 换组为 {amiya,skadi}"""
+        """多点名整组覆盖：{qing,chen} 后点 {nova,tide} → 换组为 {nova,tide}"""
         p = self._fresh_router()
         p._router_agent_pool = lambda: self._pool(p)
-        ev = self._plain_event("年+夕，来做爱3p吧")
-        p._record_route_hits(ev, ["nian", "xi"])
-        ev2 = self._plain_event("阿米娅，斯卡蒂，一起来玩", "sess-switch")
-        p._record_route_hits(ev2, ["amiya", "skadi"])
+        ev = self._plain_event("晴+辰，一起过来吧")
+        p._record_route_hits(ev, ["qing", "chen"])
+        ev2 = self._plain_event("小星，小汐，一起来玩", "sess-switch")
+        p._record_route_hits(ev2, ["nova", "tide"])
         last2, _ = p._route_mem()
-        self.assertEqual(set(last2[ev.unified_msg_origin].keys()), {"amiya", "skadi"})
+        self.assertEqual(set(last2[ev.unified_msg_origin].keys()), {"nova", "tide"})
 
     def test_sticky_after_switch_returns_new_face(self):
-        """换锁 skadi 后，无点名承接消息 → 粘滞返回 skadi 单人（不再拉起 3P）"""
+        """换锁 tide 后，无点名承接消息 → 粘滞返回 tide 单人（不再拉起多人组）"""
         p = self._fresh_router()
         p._router_agent_pool = lambda: self._pool(p)
-        ev = self._plain_event("年+夕，来做爱3p吧")
-        p._record_route_hits(ev, ["nian", "xi"])
-        ev2 = self._plain_event("斯卡蒂", "sess-switch")
-        p._record_route_hit(ev2, "skadi")
+        ev = self._plain_event("晴+辰，一起过来吧")
+        p._record_route_hits(ev, ["qing", "chen"])
+        ev2 = self._plain_event("小汐", "sess-switch")
+        p._record_route_hit(ev2, "tide")
         sticky = p._t1_sticky_route(ev2, "继续聊")
-        self.assertEqual(sticky, "skadi")
+        self.assertEqual(sticky, "tide")
 
 
 class TestSubagentToolWhitelistConfig(unittest.TestCase):
@@ -5193,9 +5253,9 @@ class TestSubagentToolWhitelistConfig(unittest.TestCase):
 
 
 class TestSubagentRetrievalDiscipline(unittest.TestCase):
-    """2026-09-11：子代理检索纪律 + 步数默认值（博士点名修复「她的工具调用问题」）
+    """2026-09-11：子代理检索纪律 + 步数默认值（老师点名修复「她的工具调用问题」）
 
-    实证背景：closure 拿到 14 个只读工具、也真的调了 rg_search，但一次搜出 150 条
+    实证背景：bell 拿到 14 个只读工具、也真的调了 rg_search，但一次搜出 150 条
     命中，关键词太宽 + 用中文描述词搜代码，信号被噪音淹没，4 问只答上 2 问。
     工具没毛病，缺的是「怎么用」。这组测试锁住写进系统提示的检索纪律。
     """
@@ -5223,8 +5283,8 @@ class TestSubagentRetrievalDiscipline(unittest.TestCase):
     def test_system_prompt_appends_discipline(self):
         """系统提示 = 人格指令 + 检索纪律，人格在前不被覆盖"""
         p = self._plugin()
-        out = p._subagent_system_prompt(self._handoff("你是可露希尔"))
-        self.assertTrue(out.startswith("你是可露希尔"))
+        out = p._subagent_system_prompt(self._handoff("你是小铃"))
+        self.assertTrue(out.startswith("你是小铃"))
         self.assertIn("工具检索纪律", out)
         self.assertIn("不要用中文描述词", out)
         self.assertIn("绝对不要编造行号", out)
@@ -5252,7 +5312,7 @@ class TestSubagentRetrievalDiscipline(unittest.TestCase):
     def test_system_prompt_includes_taskcard_guide(self):
         """系统提示要带任务卡解读，与检索纪律并列"""
         p = self._plugin()
-        out = p._subagent_system_prompt(self._handoff("你是可露希尔"))
+        out = p._subagent_system_prompt(self._handoff("你是小铃"))
         self.assertIn("任务卡解读", out)
         self.assertIn("靶点", out)
         self.assertIn("不要从全库开始搜", out)
@@ -5303,17 +5363,17 @@ class TestSubagentRetrievalDiscipline(unittest.TestCase):
 
         p = self._plugin()
         # 唤醒层剥过前缀 → 补回来
-        self.assertEqual(p._resolve_command_text(_Ev(), "阿米娅"), "/阿米娅")
-        self.assertEqual(p._resolve_command_text(_Ev(), "阿米娅+夕"), "/阿米娅+夕")
+        self.assertEqual(p._resolve_command_text(_Ev(), "小星"), "/小星")
+        self.assertEqual(p._resolve_command_text(_Ev(), "小星+辰"), "/小星+辰")
         # 前缀还在就别重复补
-        self.assertEqual(p._resolve_command_text(_Ev(), "/阿米娅"), "/阿米娅")
+        self.assertEqual(p._resolve_command_text(_Ev(), "/小星"), "/小星")
 
         class _EvPlain(_Ev):
             """自然语言点名：没走唤醒前缀，不该被当命令"""
 
             is_at_or_wake_command = False
 
-        self.assertEqual(p._resolve_command_text(_EvPlain(), "阿米娅"), "阿米娅")
+        self.assertEqual(p._resolve_command_text(_EvPlain(), "小星"), "小星")
 
     def test_prompt_order_persona_first(self):
         """顺序：人格在最前，其后检索纪律，再任务卡——人格不被挤掉"""
@@ -5324,7 +5384,7 @@ class TestSubagentRetrievalDiscipline(unittest.TestCase):
 
 
 class TestSubagentResponsePreview(unittest.TestCase):
-    """2026-09-11 博士拍板：回传截断可配置化
+    """2026-09-11 老师拍板：回传截断可配置化
 
     原 preview 硬编码 120 字，segmented_forward 模式下主代理只拿得到 120 字摘要，
     无法做汇总复核（实测撞三次：子代理答卷、盲评表、G3 交付物）。
@@ -5383,7 +5443,7 @@ class TestCallOneFailurePaths(unittest.TestCase):
         mock_context = AsyncMock()
 
         class _FakeAgent:
-            name = "amiya"
+            name = "nova"
             instructions = ""
             tools = None
             begin_dialogs = None
@@ -5391,7 +5451,7 @@ class TestCallOneFailurePaths(unittest.TestCase):
         class _FakeHandoff:
             agent = _FakeAgent()
             provider_id = "prov-test"
-            name = "transfer_to_amiya"
+            name = "transfer_to_nova"
 
         mock_context.subagent_orchestrator.handoffs = [_FakeHandoff()]
         mock_context.get_all_stars.return_value = []
@@ -5438,7 +5498,7 @@ class TestCallOneFailurePaths(unittest.TestCase):
         plugin._ctx_engine.inject = AsyncMock(return_value="在吗")
         ev = MagicMock()
         raw = asyncio.run(
-            plugin.parallel_handoff(ev, calls=[{"agent_name": "amiya", "input": "在吗"}])
+            plugin.parallel_handoff(ev, calls=[{"agent_name": "nova", "input": "在吗"}])
         )
         r0 = json.loads(raw)["results"][0]
         self.assertFalse(r0["success"], "空回复必须判失败，不能报 success=True")
@@ -5461,7 +5521,7 @@ class TestCallOneFailurePaths(unittest.TestCase):
         plugin._ctx_engine = MagicMock()
         plugin._ctx_engine.inject = AsyncMock(return_value="在吗")
         raw = asyncio.run(
-            plugin.parallel_handoff(ev, calls=[{"agent_name": "amiya", "input": "在吗"}])
+            plugin.parallel_handoff(ev, calls=[{"agent_name": "nova", "input": "在吗"}])
         )
         r0 = json.loads(raw)["results"][0]
         self.assertFalse(r0["success"])
@@ -5482,7 +5542,7 @@ class TestCallOneFailurePaths(unittest.TestCase):
         try:
             asyncio.run(
                 plugin.parallel_handoff(
-                    ev, calls=[{"agent_name": "amiya", "input": "在吗"}]
+                    ev, calls=[{"agent_name": "nova", "input": "在吗"}]
                 )
             )
         except asyncio.CancelledError:
@@ -5518,20 +5578,20 @@ class TestSubagentVisibilityInject(unittest.TestCase):
         """有直发记录 → 请求尾部出现旁听窗且含她的话。"""
         import asyncio
         plugin = self._make_plugin({"subagent_visibility_inject": True})
-        plugin._record_direct_reply("test_sid", "closure", "还在看，普瑞赛斯你别急")
+        plugin._record_direct_reply("test_sid", "bell", "还在看，领航你别急")
         req = MagicMock()
         req.extra_user_content_parts = []
         asyncio.run(plugin._route_directive_inject(self._make_event(), req))
         parts = self._visibility_parts(req)
         self.assertEqual(len(parts), 1)
         self.assertIn("还在看", parts[0].text)
-        self.assertIn("closure", parts[0].text)
+        self.assertIn("bell", parts[0].text)
 
     def test_dedup_same_record(self):
         """同一记录只注入一次（二次请求不再追加）。"""
         import asyncio
         plugin = self._make_plugin({"subagent_visibility_inject": True})
-        plugin._record_direct_reply("test_sid", "closure", "还在看")
+        plugin._record_direct_reply("test_sid", "bell", "还在看")
         req1 = MagicMock()
         req1.extra_user_content_parts = []
         asyncio.run(plugin._route_directive_inject(self._make_event(), req1))
@@ -5545,7 +5605,7 @@ class TestSubagentVisibilityInject(unittest.TestCase):
         """开关关闭时不注入。"""
         import asyncio
         plugin = self._make_plugin({"subagent_visibility_inject": False})
-        plugin._record_direct_reply("test_sid", "closure", "还在看")
+        plugin._record_direct_reply("test_sid", "bell", "还在看")
         req = MagicMock()
         req.extra_user_content_parts = []
         asyncio.run(plugin._route_directive_inject(self._make_event(), req))
@@ -5555,7 +5615,7 @@ class TestSubagentVisibilityInject(unittest.TestCase):
         """超过 10 分钟窗口的旧记录不注入。"""
         import asyncio
         plugin = self._make_plugin({"subagent_visibility_inject": True})
-        plugin._record_direct_reply("test_sid", "closure", "很久以前")
+        plugin._record_direct_reply("test_sid", "bell", "很久以前")
         agent, ts, tail = plugin._route_reply["test_sid"]
         plugin._route_reply["test_sid"] = (agent, ts - 700, tail)
         req = MagicMock()
@@ -5573,7 +5633,7 @@ class TestSubagentVisibilityInject(unittest.TestCase):
         self.assertEqual(len(self._visibility_parts(req)), 0)
 
 
-# ── 审查盲区补强（2026-09-12 深夜，可露希尔口述 ⑤⑥⑦ 七条用例） ──────────
+# ── 审查盲区补强（2026-09-12 深夜，小铃口述 ⑤⑥⑦ 七条用例） ──────────
 class TestAuditBlindSpots(unittest.TestCase):
     """盲区三条：⑤关系网注入触达 / ⑥群身份超时+缓存 / ⑦重载任务生命周期。"""
 
@@ -5678,19 +5738,19 @@ class TestAuditBlindSpots(unittest.TestCase):
             json.dump(rel, f, ensure_ascii=False)
 
     def test_rel_inject_english_id_hits_chinese_keys(self):
-        """⑤e-1 真实口径：英文 id（amiya）必须命中中文 key，含对方名/亲密度/基调。"""
+        """⑤e-1 真实口径：英文 id（nova）必须命中中文 key，含对方名/亲密度/基调。"""
         p = self._make_plugin()
         p._relationship_root = self._tmp
         self._write_rel(
             {
                 "relationship_edges": {
-                    "阿米娅<->特蕾西娅": {
+                    "小星<->小夜": {
                         "type": "传承师徒/知心姐妹",
-                        "双向": "阿米娅: 敬她依赖她; 特蕾西娅: 温言护她长大",
+                        "双向": "小星: 敬她依赖她; 小夜: 温言护她长大",
                     }
                 },
                 "relationship_state": {
-                    "阿米娅<->特蕾西娅": {
+                    "小星<->小夜": {
                         "亲密度": 95,
                         "基调": "敬+依恋",
                         "最近互动": "刚重逢",
@@ -5699,9 +5759,9 @@ class TestAuditBlindSpots(unittest.TestCase):
                 "family_roles": {},
             }
         )
-        out = p._relationship_inject("amiya", "")
+        out = p._relationship_inject("nova", "")
         self.assertIn("【家庭关系】", out)
-        self.assertIn("特蕾西娅", out)
+        self.assertIn("小夜", out)
         self.assertIn("95", out)
         self.assertIn("敬+依恋", out)
         self.assertIn("敬她依赖她", out)
@@ -5713,18 +5773,18 @@ class TestAuditBlindSpots(unittest.TestCase):
         self._write_rel(
             {
                 "relationship_edges": {
-                    "阿米娅<->凯尔希": {"type": "师生", "双向": "阿米娅: 信赖; 凯尔希: 守护"}
+                    "小星<->小鹭": {"type": "师生", "双向": "小星: 信赖; 小鹭: 守护"}
                 },
                 "relationship_state": {
-                    "M3<->阿米娅": {"亲密度": 90, "基调": "守护"},
-                    "阿米娅<->特蕾西娅": {"亲密度": 95, "基调": "敬+依恋"},
+                    "小玖<->小星": {"亲密度": 90, "基调": "守护"},
+                    "小星<->小夜": {"亲密度": 95, "基调": "敬+依恋"},
                 },
                 "family_roles": {},
             }
         )
-        out = p._relationship_inject("amiya", "")
+        out = p._relationship_inject("nova", "")
         state_part = out.split("【家里的近况】")[-1]
-        self.assertLess(state_part.index("特蕾西娅"), state_part.index("M3"))
+        self.assertLess(state_part.index("小夜"), state_part.index("小玖"))
 
     def test_rel_inject_deterministic_for_cache(self):
         """⑤e-3 缓存铁律：同一文件下两次组装逐字节相同。"""
@@ -5733,14 +5793,14 @@ class TestAuditBlindSpots(unittest.TestCase):
         self._write_rel(
             {
                 "relationship_edges": {
-                    "阿米娅<->特蕾西娅": {"type": "姐妹", "双向": "阿米娅: 敬她; 特蕾西娅: 护她"}
+                    "小星<->小夜": {"type": "姐妹", "双向": "小星: 敬她; 小夜: 护她"}
                 },
-                "relationship_state": {"阿米娅<->特蕾西娅": {"亲密度": 95, "基调": "敬+依恋"}},
+                "relationship_state": {"小星<->小夜": {"亲密度": 95, "基调": "敬+依恋"}},
                 "family_roles": {},
             }
         )
-        a = p._relationship_inject("amiya", "")
-        b = p._relationship_inject("amiya", "")
+        a = p._relationship_inject("nova", "")
+        b = p._relationship_inject("nova", "")
         self.assertTrue(a)
         self.assertEqual(a, b)
 
@@ -5751,16 +5811,16 @@ class TestAuditBlindSpots(unittest.TestCase):
         self._write_rel(
             {
                 "relationship_edges": {
-                    "阿米娅<->特蕾西娅": {"type": "姐妹", "双向": "阿米娅: 敬她; 特蕾西娅: 护她"}
+                    "小星<->小夜": {"type": "姐妹", "双向": "小星: 敬她; 小夜: 护她"}
                 },
                 "relationship_state": {},
                 "family_roles": {},
             }
         )
-        out = p._subagent_system_prompt(self._handoff("你是阿米娅"), "amiya")
-        self.assertTrue(out.startswith("你是阿米娅"))
+        out = p._subagent_system_prompt(self._handoff("你是小星"), "nova")
+        self.assertTrue(out.startswith("你是小星"))
         self.assertIn("【家庭关系】", out)
-        self.assertIn("特蕾西娅", out)
+        self.assertIn("小夜", out)
         self.assertIn("工具检索纪律", out)
 
     def test_system_prompt_stable_across_calls(self):
@@ -5770,14 +5830,14 @@ class TestAuditBlindSpots(unittest.TestCase):
         self._write_rel(
             {
                 "relationship_edges": {
-                    "阿米娅<->特蕾西娅": {"type": "姐妹", "双向": "阿米娅: 敬她; 特蕾西娅: 护她"}
+                    "小星<->小夜": {"type": "姐妹", "双向": "小星: 敬她; 小夜: 护她"}
                 },
-                "relationship_state": {"阿米娅<->特蕾西娅": {"亲密度": 95, "基调": "敬+依恋"}},
-                "family_roles": {"阿米娅": {"定位": "王女", "角色": "女儿"}},
+                "relationship_state": {"小星<->小夜": {"亲密度": 95, "基调": "敬+依恋"}},
+                "family_roles": {"小星": {"定位": "王女", "角色": "女儿"}},
             }
         )
-        a = p._subagent_system_prompt(self._handoff("你是阿米娅"), "amiya")
-        b = p._subagent_system_prompt(self._handoff("你是阿米娅"), "amiya")
+        a = p._subagent_system_prompt(self._handoff("你是小星"), "nova")
+        b = p._subagent_system_prompt(self._handoff("你是小星"), "nova")
         self.assertEqual(a, b)
 
     def test_system_prompt_no_name_skips_relation(self):
@@ -5850,7 +5910,7 @@ class TestAuditBlindSpots(unittest.TestCase):
         star_manager.reload.assert_awaited_once()
 
 
-# ── markdown 降级（2026-09-12 深夜，博士反馈她的消息在 QQ 裸符号） ──────────
+# ── markdown 降级（2026-09-12 深夜，老师反馈她的消息在 QQ 裸符号） ──────────
 class TestMdPlainify(unittest.TestCase):
     """子代理消息 markdown → 纯文本降级（_plainify_md）。"""
 
@@ -5908,9 +5968,9 @@ _HAS_LOCAL_DATA = os.path.exists(
 
 _NEEDS_LOCAL_DATA = {
     "test_command_alias",
-    "test_command_presis_single",
-    "test_command_presis_with_agents",
-    "test_command_presis_with_valid_and_unknown",
+    "test_command_pilot_single",
+    "test_command_pilot_with_agents",
+    "test_command_pilot_with_valid_and_unknown",
     "test_rel_inject_deterministic_for_cache",
     "test_rel_inject_english_id_hits_chinese_keys",
     "test_rel_inject_state_sorted_by_intimacy",
