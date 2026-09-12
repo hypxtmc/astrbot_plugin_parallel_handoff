@@ -171,7 +171,7 @@
         "description": "子代理回复最大等待超时（秒）",
         "type": "int",
         "default": 120,
-        "hint": "单个子代理回复的最大允许等待秒数（工具参数 timeout 不传时的默认上限）。应对长文生成长耗时，建议 300~999。修复：原来这里被硬编码锁死 120，现在填多少生效多少。"
+        "hint": "单个子代理回复的最大允许等待秒数（工具参数 timeout 不传时的默认上限）。按需配置、无硬上限（常用 300~1800）。注意：后台任务路径另受 subagent_task_turn_timeout 看门狗管控，建议两边同步。"
     },
     "subagent_tool_call_timeout": {
         "description": "子代理单次工具调用超时（秒）",
@@ -255,7 +255,7 @@
         "description": "后台任务单任务超时（秒）",
         "type": "int",
         "default": 900,
-        "hint": "二期后台任务：看门狗。单个任务超过此时长会被强杀并标记为 interrupted，避免卡死的任务永远占着并发额度。"
+        "hint": "二期后台任务：看门狗。单个任务超过此时长会被强杀并标记为 interrupted，避免卡死的任务永远占着并发额度。建议与 subagent_reply_timeout 同步设置（后台路径的实际上限）。"
     },
     "recall_enabled": {
         "description": "子代理长期记忆开关",
