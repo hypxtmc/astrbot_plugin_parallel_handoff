@@ -255,10 +255,10 @@ class ArbitrationMixin:
         # [段五 2026-09-10 修复] 旧实现有两处致命伤，导致 R4 从未生效过：
         #   ① 它嵌在 R2 的 if 块内、且位于 R2 无条件 return True 之前 —— 两条 return
         #      结果相同，R4 的判定白算，是死代码；
-        #   ② 判据键名 "main" / "主代理" 与主代理真实记录键 MAIN_SPEAKER("__main__")
-        #      不一致，c1 恒为 0，条件永不成立。
+        #   ② 判据键名与主代理真实记录键 MAIN_SPEAKER("__main__") 不一致（旧版遗留键名），
+        #      c1 恒为 0，条件永不成立。
         # 修法：提到 R2 之前独立判定 + 键名对齐 MAIN_SPEAKER。
-        c_main = sum(1 for a in recent_agents if a == MAIN_SPEAKER or a == "main")
+        c_main = sum(1 for a in recent_agents if a == MAIN_SPEAKER)
         c_agent_e = sum(1 for a in recent_agents if a == "agent_e" or a == self._display_name("agent_e"))
         if c_main >= 2 and c_agent_e >= 2:
             return True

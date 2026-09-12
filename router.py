@@ -170,13 +170,43 @@ class RouterMixin:
             return 5.0
 
     def _router_agent_pool(self) -> dict:
-        """路由目标池：直发名单 ∩ 有负责人格的子代理（默认 9 人）"""
+        """路由目标池：直发名单 ∩ 有负责人格的子代理（默认 9 人）
+
+        [2026-09-13] 未配置 router_tables.json（t2_brief 为空）时，
+        自动从 subagent_orchestrator 发现子代理生成兜底池，保证新部署用户开箱可用；
+        用户自配词表后以自配为准，本部署行为不变。
+        """
         pool = dict(self.T2_AGENT_BRIEF)
+        if not pool:
+            pool = self._discover_agent_pool()
         raw = str(self._cfg("direct_delivery_agents", "")).strip()
         ids = {a.strip().lower() for a in raw.split(",") if a.strip()}
         if ids:
             pool = {k: v for k, v in pool.items() if k in ids}
         return pool
+
+    def _discover_agent_pool(self) -> dict:
+        """[2026-09-13] 词表缺失时从编排器发现子代理，生成兜底路由池。
+
+        新部署用户未配置 router_tables.json 时，以 AstrBot subagent_orchestrator 里
+        实际注册的子代理为准生成 {英文id: 公开描述} 池——让 T0/T1/T2 与路由指令开箱可用。
+        描述取自 handoff.description（官方给主 LLM 看的公开描述），不读 agent.instructions
+        （人格机密）；失败静默返回 {}（路由退回保守行为：全部放行主代理）。
+        """
+        try:
+            orchestrator = getattr(self.context, "subagent_orchestrator", None)
+            handoffs = getattr(orchestrator, "handoffs", None) or []
+            pool: dict = {}
+            for h in handoffs:
+                agent = getattr(h, "agent", None)
+                aid = str(getattr(agent, "name", "") or "").strip()
+                if not aid:
+                    continue
+                desc = str(getattr(h, "description", "") or "").strip()
+                pool[aid] = desc[:80] if desc else aid
+            return pool
+        except Exception:  # noqa: BLE001
+            return {}
 
     # ── T0 命令式触发层（2026-09-08 用户指定）────────────
     # 以 / 开头 + 名字（可 + 连接多名字）的显式命令，直接指定目标子代理/主代理，

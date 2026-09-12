@@ -273,7 +273,11 @@ class DirectiveMixin:
         raw_agents = str(self._cfg("direct_delivery_agents", "")).strip()
         agent_ids = [a.strip() for a in raw_agents.split(",") if a.strip()]
         if not agent_ids:
-            return ""
+            # [2026-09-13] 未配置直发名单时用路由池兜底（含编排器自动发现），
+            # 保证新部署用户开箱即得完整路由规范；池也为空才不注入（退回纯主代理托管）。
+            agent_ids = list(self._router_agent_pool().keys())
+            if not agent_ids:
+                return ""
         display_map = self._get_name_display_map()
         names = []
         for aid in agent_ids:
