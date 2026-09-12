@@ -13,6 +13,7 @@
 bot.call_action('get_group_member_info')，自给自足不依赖外部插件；
 查询失败静默降级（群身份是增强项，绝不影响主流程）；带 5 分钟进程内缓存。
 """
+import asyncio
 import logging
 import time
 from astrbot.api.event import AstrMessageEvent
@@ -59,11 +60,16 @@ class SceneMixin:
             call_action = getattr(bot, "call_action", None)
             text = ""
             if callable(call_action):
-                info = await call_action(
-                    "get_group_member_info",
-                    group_id=group_id,
-                    user_id=user_id,
-                    no_cache=False,
+                # [审查修复 2026-09-12] 原无超时：协议端卡住会把整条调度链挂死；
+                # 加 4s 超时，超时静默降级（返回空串，不写缓存）。
+                info = await asyncio.wait_for(
+                    call_action(
+                        "get_group_member_info",
+                        group_id=group_id,
+                        user_id=user_id,
+                        no_cache=False,
+                    ),
+                    timeout=4.0,
                 )
                 if isinstance(info, dict):
                     card = str(info.get("card") or "").strip()

@@ -12,6 +12,7 @@
 import asyncio
 import hashlib
 import json
+import os
 import time
 
 from astrbot.api import logger
@@ -135,8 +136,18 @@ class DispatchMixin:
         文件读失败或缺资料时返回空串，由调用方静默跳过（不影响主流程）。
         """
         try:
-            # 关系文件：插件在 data/plugins/astrbot_plugin_parallel_handoff/，向上两级到 data/
-            _rel_path = "/root/AstrBot/data/relationships/relationships.json"
+            # [审查修复 2026-09-12] 原为硬编码 /root/AstrBot 绝对路径（非本机部署必失效）；
+            # 改为相对解析：插件目录向上三级到 AstrBot 根，再进 data/relationships
+            # （与 family_pulse._pulse_affinity_path 同款，支持 _relationship_root 覆盖）。
+            _root = getattr(self, "_relationship_root", None)
+            _rel_path = os.path.join(
+                _root
+                or os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "..", "..", "..", "data", "relationships",
+                ),
+                "relationships.json",
+            )
             with open(_rel_path, encoding="utf-8") as _f:
                 rel = json.load(_f)
         except Exception as _e:

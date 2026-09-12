@@ -4574,6 +4574,45 @@ class TestCmdLockHardGroup(unittest.TestCase):
         # 裸斜杠其他内容 → 非命令
         self.assertFalse(p._is_real_command("/随便说点什么"))
 
+    def test_switch_command_clears_main_lock_and_keeps_other_sessions(self):
+        """[审查修复 2026-09-12] 换人命令 /子代理名 执行后：
+        ①主代理锁必须解除（否则用户换人换不出去——实测复现 P1-B）
+        ②其他会话的命令锁不受影响（原 self._cmd_lock={} 全局重置会互踩——P1-A）"""
+        import asyncio as _aio
+        from unittest.mock import AsyncMock, patch as _patch
+        p = self._fresh()
+        ev = MagicMock()
+        ev.unified_msg_origin = "sess-switch-repair"
+        ev.get_message_str.return_value = "/可露希尔"
+        ev.is_at_or_wake_command = True
+        p._record_main_lock(ev)
+        # 另一会话先建命令锁，验证不被全局重置
+        ev_other = MagicMock()
+        ev_other.unified_msg_origin = "sess-other"
+        p._record_cmd_lock(ev_other, ["nian"])
+        with _patch.object(type(p), "_resolve_command_text", return_value="/可露希尔"), \
+             _patch.object(type(p), "_parse_agent_command", return_value=(["closure"], False)), \
+             _patch.object(type(p), "_router_enabled", return_value=True), \
+             _patch.object(type(p), "_record_user_msg"), \
+             _patch.object(type(p), "_dedup_shortcircuit", return_value=False), \
+             _patch.object(type(p), "parallel_handoff", new=AsyncMock()):
+            _aio.run(p._smart_router_check(ev))
+        self.assertFalse(p._main_locked(ev), "换人命令后主代理锁应被解除")
+        self.assertIn("sess-other", p._cmd_lock, "其他会话的命令锁不应被抹掉")
+
+    def test_dedup_not_exempted_by_wake_rewrite(self):
+        """[审查修复 2026-09-12] 唤醒重写的普通消息不得逃逸去重窗口：
+        同消息第二次出现应被吞掉（否则私聊场景去重屏障失效、重复路由回归——P1-D）"""
+        p = self._fresh()
+        ev = MagicMock()
+        ev.unified_msg_origin = "sess-dedup"
+        msg = "你和可露希尔一起去看代码"
+        raw = "/你和可露希尔一起去看代码"  # 唤醒重写形态（非真命令）
+        r1 = p._dedup_shortcircuit(ev, msg, raw)
+        r2 = p._dedup_shortcircuit(ev, msg, raw)
+        self.assertFalse(r1, "首次出现应放行")
+        self.assertTrue(r2, "同消息二次触发应被去重吞掉")
+
     def test_main_token_generic_entry(self):
         """[发布泛化 2026-09-12] /主代理 通用词即可命中主代理令牌（无需知道部署者名字）"""
         from router import _MAIN_TOKEN_SET
