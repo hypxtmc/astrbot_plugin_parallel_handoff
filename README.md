@@ -159,7 +159,7 @@
 
 ## 功能详解
 
-> ⚠️ **实验性功能提示**：标注【实验性】的功能未经长期运行验证，行为可能随版本演进调整，请谨慎开启并留意日志。涉及：家庭旁轨（`enable_family_pulse`）、拉用户进旁轨（`family_pulse_draft_enable`）、读空气仲裁（`enable_read_air_arbitrate`）、3P/4P 接龙记忆沉淀（`enable_chain_memory_persist`）。
+> ⚠️ **实验性功能提示**：标注【实验性】的功能未经长期运行验证，行为可能随版本演进调整，请谨慎开启并留意日志。涉及：家庭旁轨（`enable_family_pulse`）、拉用户进旁轨（`family_pulse_draft_enable`）、读空气仲裁（`enable_read_air_arbitrate`）、多人接龙记忆沉淀（`enable_chain_memory_persist`）。
 
 ### 命令式点名（T0 强锁）
 
