@@ -773,7 +773,11 @@ class DispatchMixin:
                     delattr(event, _attr)
 
             # ── 上下文存储：追加到跨轮对话历史（ContextEngine） ──
-            self._ctx_engine.append(agent_name, event.unified_msg_origin, input_text, raw_response)
+            # 2026-09-15：落历史存 final_input 而不是 input_text —— 发送给 provider 的是
+            # final_input（含 scene_prefix / [用户身份]），重放时若存的是裸 input_text，
+            # 那条消息从第一个字符起就对不上，前缀缓存的断点被提前一个任务卡身位。
+            # 与 767 行记忆存储（同样用 final_input）口径一致。
+            self._ctx_engine.append(agent_name, event.unified_msg_origin, final_input, raw_response)
 
             # 自动转发已由 parallel_handoff 的分段转发负责,此处不再重复推送
             raw_response = self._maybe_prefix(agent_name, raw_response, enable_name_prefix)
