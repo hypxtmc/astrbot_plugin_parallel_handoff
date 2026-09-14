@@ -168,13 +168,21 @@ class MemoryMixin:
         import shutil
         import subprocess
 
+        # [2026-09-15 修] 原先写成 astrbot.api.message_components（该模块无 TextPart），
+        # ImportError 被下面的宽 except 静默吞掉 → 预取整整两小时没跑过一次却毫无日志。
+        # 正确路径与 dispatch.py 一致：astrbot.core.agent.message。导入失败也必须留痕。
         try:
-            from astrbot.api.message_components import TextPart
-        except Exception:  # 单测环境无该模块时静默退化
+            from astrbot.core.agent.message import TextPart
+        except Exception as _e:
+            logger.warning(f"[parallel_handoff] 预取线索跳过：TextPart 导入失败 {type(_e).__name__}: {_e}")
             return []
 
         cands = self._prefetch_candidates(text, limit=limit)
-        if not cands or not shutil.which("rg"):
+        if not cands:
+            logger.info("[parallel_handoff] 预取线索跳过：任务文本里没有可检索实体")
+            return []
+        if not shutil.which("rg"):
+            logger.warning("[parallel_handoff] 预取线索跳过：找不到 rg 可执行文件")
             return []
 
         # 搜索根：任务里的绝对路径 > 任务点名的插件目录 > 兜底 AstrBot 根
@@ -188,24 +196,43 @@ class MemoryMixin:
                 roots.append(d)
         roots = [r for r in dict.fromkeys(roots) if r and os.path.isdir(r)]
         if not roots:
-            roots = ["/root/AstrBot"]
+            # [2026-09-15 实测] 兜底不能给 AstrBot 全库：它下面压着 .venv / plugin_data 等
+            # 十几万文件，四个候选全部撞 5s 超时（总 20.4 秒、零命中）。实测 data/plugins
+            # 子树 4 个候选合计 849ms、36 命中——这才是兜底该有的量级。
+            for _d in ("/root/AstrBot/data/plugins", "/root/AstrBot/astrbot"):
+                if os.path.isdir(_d):
+                    roots.append(_d)
 
         skip_ext = ("README", "CHANGELOG", "LICENSE")
         doc_mark = ("├", "│", "└", "──")
 
         def _sync() -> str:
+            # [2026-09-15 修] 必须带 --no-ignore：AstrBot 根 .gitignore 第 23 行有 `data`，
+            # rg 默认遵守它 → 从 AstrBot 根搜时把 data/plugins 整个跳过，永远零命中。
+            # 实测直搜插件目录能命中 side_pulse.py:36，全库搜零命中，就是被忽略规则吃掉的。
+            import time
+
             lines = []
+            slow, bad = [], []
+            deadline = time.monotonic() + 4.0   # 总预算：预取快不过 4 秒，否则不如不预取
             for root in roots[:2]:
                 for c in cands:
-                    if len(lines) >= 8:
+                    if len(lines) >= 8 or time.monotonic() > deadline:
                         break
                     try:
                         r = subprocess.run(
-                            ["rg", "-n", "--no-heading", "--max-count", "3", "-F", c, root,
-                             "-g", "!*.pyc", "-g", "!__pycache__", "-g", "!.git", "-g", "!*.log"],
-                            capture_output=True, text=True, timeout=3,
+                            ["rg", "-n", "--no-ignore", "--no-heading", "--max-count", "3",
+                             "-F", c, root,
+                             "-g", "!*.pyc", "-g", "!__pycache__", "-g", "!.git", "-g", "!*.log",
+                             "-g", "!.venv*", "-g", "!node_modules", "-g", "!*.jsonl",
+                             "-g", "!plugin_data", "-g", "!*.bak*", "-g", "!*ytimeout*"],
+                            capture_output=True, text=True, timeout=2,
                         )
-                    except Exception:
+                    except subprocess.TimeoutExpired:
+                        slow.append(c)
+                        continue
+                    except Exception as _e:
+                        bad.append(f"{c}:{type(_e).__name__}")
                         continue
                     picked = []
                     for raw in r.stdout.strip().splitlines():
@@ -227,13 +254,19 @@ class MemoryMixin:
                         lines.append(f"- `{c}` → " + "、".join(picked))
                 if len(lines) >= 8:
                     break
+            if slow:
+                logger.info(f"[parallel_handoff] 预取：{len(slow)} 个候选检索超时 {slow[:3]}")
+            if bad:
+                logger.warning(f"[parallel_handoff] 预取：{len(bad)} 个候选检索异常 {bad[:3]}")
             return "\n".join(lines)
 
         try:
             body = await asyncio.to_thread(_sync)
-        except Exception:
+        except Exception as _e:
+            logger.warning(f"[parallel_handoff] 预取线索跳过：检索异常 {type(_e).__name__}: {_e}")
             return []
         if not body:
+            logger.info(f"[parallel_handoff] 预取线索跳过：{len(cands)} 个候选均无命中")
             return []
 
         head = "【预取线索（派单时替你跑好的定位锚点，未经验证）】\n"

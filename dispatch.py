@@ -19,6 +19,12 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 from astrbot.core.agent.message import TextPart
 
+# ── 模块加载 banner（2026-09-15）──
+# 用途：热重载对 Mixin 子模块是否真把新代码装进内存，看这行就够了。
+# 改完 dispatch.py、热重载后如果日志里没有更新的 banner 时间戳，
+# 说明 sys.modules 仍命中旧模块（回执会照样说「完全生效」）——那只能靠系统级重启。
+logger.info("[parallel_handoff] dispatch.py 已加载 · banner 2026-09-15T01:00")
+
 # 后台任务的终态集合（与 task_runner.TERMINAL 保持一致）。
 # 本地定义而非 import，避免与 task_runner 产生 import 耦合——
 # 两边真跑不到一起时，这里也不会在加载阶段就报错。
