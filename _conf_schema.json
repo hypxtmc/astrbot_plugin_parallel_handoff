@@ -185,6 +185,18 @@
         "default": 45,
         "hint": "单步工具执行的等待上限。官方默认 120，需低于总超时才有意义。"
     },
+    "metrics_enabled": {
+        "description": "子代理效率实验 · token 计量开关",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后每次 LLM 调用落一行 JSONL，用于测通信税。默认关；本地长期验收在配置里显式开。"
+    },
+    "metrics_path": {
+        "description": "token 计量落盘路径（留空 = 插件 data/metrics.jsonl）",
+        "type": "string",
+        "default": "",
+        "hint": "本地长期验收填 <插件数据目录>/experiments/subagent_efficiency/metrics.jsonl"
+    },
     "subagent_max_steps": {
         "description": "子代理工具循环最大步数",
         "type": "int",

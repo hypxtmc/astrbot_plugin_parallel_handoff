@@ -676,6 +676,7 @@ class DispatchMixin:
             except Exception as _pe:  # 打点绝不拖垮主链
                 logger.warning(f"[PROF-PROMPT] 打点失败: {_pe}")
                 _sys_p = self._subagent_system_prompt(handoff, agent_name)
+            _m_t0_sub = time.monotonic()
             llm_resp = await asyncio.wait_for(
                 self.context.tool_loop_agent(
                     event=event,
@@ -688,6 +689,13 @@ class DispatchMixin:
                     tool_call_timeout=self._cfg("subagent_tool_call_timeout", 45),
                 ),
                 timeout=llm_timeout,
+            )
+            # token 计量（2026-09-11 C 步 / 2026-09-14 复活）：usage 取循环末轮值
+            self._metrics_record(
+                "sub",
+                agent=agent_name,
+                usage=getattr(llm_resp, "usage", None),
+                latency_ms=int((time.monotonic() - _m_t0_sub) * 1000),
             )
             latency_ms = int((time.perf_counter() - t0) * 1000)
             raw_response = llm_resp.completion_text or ""
