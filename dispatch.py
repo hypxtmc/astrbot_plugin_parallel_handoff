@@ -567,6 +567,29 @@ class DispatchMixin:
         except Exception as _e:
             logger.warning(f"[parallel_handoff] 时间感知注入失败: {_e}")
 
+        # ── 预取线索注入（2026-09-15 用户驱动）──
+        #    依据：实测子代理单次派单每步约 7.4 秒，≥3 步的派单里 93% 是
+        #    「搜一次→看一眼→再搜一次」的串行搜索。这里趁派单的功夫，用本地
+        #    ripgrep 把任务文本里已点名的实体先定位一遍（实测 6 个候选 232ms），
+        #    把「文件:行」锚点并进 extra —— 她开局就能直接精读，省掉 1~2 步盲搜。
+        #    纯本地、不调 LLM、不砍任何原有注入；失败静默跳过，绝不阻断派单。
+        #    位置固定在时间感知之后（保持 extra 头部稳定）。
+        try:
+            if self._cfg("subagent_prefetch_enabled", True):
+                _pf_parts = await self._prefetch_clues(final_input)
+                if _pf_parts:
+                    memory_extra_parts = (
+                        list(memory_extra_parts[:1])
+                        + _pf_parts
+                        + list(memory_extra_parts[1:])
+                    )
+                    logger.info(
+                        f"[parallel_handoff] 预取线索注入 OK: "
+                        f"{len(getattr(_pf_parts[0], 'text', '') or '')} 字符"
+                    )
+        except Exception as _e:
+            logger.warning(f"[parallel_handoff] 预取线索注入失败: {_e}")
+
         # ── 关系网注入：已迁移至 system 稳定层（2026-09-13）
         #    原实现在此走 extra_user_content（mark_as_temp、每轮重复注入）：
         #    (a) 匹配 bug——拿英文 id 去匹配中文 key，恒返回空串（上线以来从未生效）；

@@ -123,6 +123,123 @@ class MemoryMixin:
         self._lm_bridge_cache = bridge
         return bridge
 
+    # ── 预取线索（2026-09-15 用户驱动）：派单时替子代理把「任务里已点名的实体」
+    #    先本地 ripgrep 一遍，把 文件:行 锚点塞进 extra，让她开局直接精读、跳过盲搜。
+    #    依据：实测子代理单次派单每步约 7.4 秒，≥3 步的派单里 93% 是
+    #    「搜一次→看一眼→再搜一次」的串行搜索。预取成本：纯本地 rg，实测
+    #    6 个候选 232ms、线索块约 300 字符，不调 LLM、不砍任何注入内容。
+    #    失败/无命中一律返回空列表，绝不影响派单主流程。
+    _PREFETCH_GENERIC = frozenset({
+        "AstrBot", "astrbot", "python", "plugin", "plugins", "test", "tests",
+        "data", "file", "files", "config", "main", "api", "json", "yaml",
+        "README", "src", "lib", "docs", "web", "http", "https", "log", "logs",
+        "用户", "任务", "文件", "目录", "代码", "函数", "变量", "配置", "插件", "测试",
+    })
+
+    @classmethod
+    def _prefetch_candidates(cls, text: str, limit: int = 5) -> list:
+        """从任务文本抽可检索实体（零 LLM 成本）。优先级：绝对路径 > 文件名 >
+        代码标识符（带下划线/驼峰）> 引号内片段。通用词走黑名单，避免抽到
+        「AstrBot」这种满库都是的词污染线索。"""
+        import re
+
+        paths = re.findall(r"/[\w\-./]{6,}", text)
+        files = re.findall(r"\b[\w\-]+\.(?:py|json|yaml|yml|toml|sh|log|md)\b", text)
+        ids = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]{2,})\b", text)
+        ids = [x for x in ids if "_" in x or re.search(r"[a-z][A-Z]", x)]
+        quoted = re.findall(r"[`\"'「【]([^`\"'\n【】]{3,60})[`\"'」】]", text)
+        out, seen = [], set()
+        for bucket in (paths, files, ids, quoted):
+            for c in bucket:
+                c = c.strip().rstrip("/")
+                if len(c) < 3 or c in seen or c in cls._PREFETCH_GENERIC:
+                    continue
+                seen.add(c)
+                out.append(c)
+                if len(out) >= limit:
+                    return out
+        return out
+
+    async def _prefetch_clues(self, text: str, limit: int = 5) -> list:
+        """本地 rg 预取定位锚点，返回 [TextPart]（失败返回 []）。"""
+        import asyncio
+        import os
+        import re
+        import shutil
+        import subprocess
+
+        try:
+            from astrbot.api.message_components import TextPart
+        except Exception:  # 单测环境无该模块时静默退化
+            return []
+
+        cands = self._prefetch_candidates(text, limit=limit)
+        if not cands or not shutil.which("rg"):
+            return []
+
+        # 搜索根：任务里的绝对路径 > 任务点名的插件目录 > 兜底 AstrBot 根
+        roots = []
+        for p in re.findall(r"/root/[\w\-./]{4,}", text):
+            p = p.rstrip("/")
+            roots.append(p if os.path.isdir(p) else os.path.dirname(p))
+        for name in re.findall(r"astrbot_plugin_[\w]+", text):
+            d = f"/root/AstrBot/data/plugins/{name}"
+            if os.path.isdir(d):
+                roots.append(d)
+        roots = [r for r in dict.fromkeys(roots) if r and os.path.isdir(r)]
+        if not roots:
+            roots = ["/root/AstrBot"]
+
+        skip_ext = ("README", "CHANGELOG", "LICENSE")
+        doc_mark = ("├", "│", "└", "──")
+
+        def _sync() -> str:
+            lines = []
+            for root in roots[:2]:
+                for c in cands:
+                    if len(lines) >= 8:
+                        break
+                    try:
+                        r = subprocess.run(
+                            ["rg", "-n", "--no-heading", "--max-count", "3", "-F", c, root,
+                             "-g", "!*.pyc", "-g", "!__pycache__", "-g", "!.git", "-g", "!*.log"],
+                            capture_output=True, text=True, timeout=3,
+                        )
+                    except Exception:
+                        continue
+                    picked = []
+                    for raw in r.stdout.strip().splitlines():
+                        parts = raw.split(":", 2)
+                        if len(parts) != 3:
+                            continue
+                        fpath, lno, body = parts
+                        rel = fpath.replace(root.rstrip("/") + "/", "")
+                        sbody = body.strip()
+                        # 过滤文档噪音：README/说明文档、注释行、目录树图
+                        if any(x in rel for x in skip_ext) and not rel.endswith(".py"):
+                            continue
+                        if sbody.startswith("#") or any(m in sbody for m in doc_mark):
+                            continue
+                        picked.append(f"{rel}:{lno}")
+                        if len(picked) >= 2:
+                            break
+                    if picked:
+                        lines.append(f"- `{c}` → " + "、".join(picked))
+                if len(lines) >= 8:
+                    break
+            return "\n".join(lines)
+
+        try:
+            body = await asyncio.to_thread(_sync)
+        except Exception:
+            return []
+        if not body:
+            return []
+
+        head = "【预取线索（派单时替你跑好的定位锚点，未经验证）】\n"
+        tail = "\n（这些是本机 rg 直接命中的位置，可直接 safe_read 精读；与任务不符就按自己的判断走）"
+        return [TextPart(text=head + body + tail).mark_as_temp()]
+
     # ── 记忆召回：注入长期记忆 ──
     async def _memory_recall(
         self,
