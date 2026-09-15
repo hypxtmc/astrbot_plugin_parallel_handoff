@@ -619,7 +619,7 @@ class DispatchMixin:
                         _daily_part = TextPart(text=_daily_txt).mark_as_temp()
                         memory_extra_parts = [_daily_part] + (memory_extra_parts or [])
                         logger.info(
-                            f"[parallel_handoff] 子代理今日状态注入 OK [{agent_name}]: "
+                            f"[parallel_handoff] 子代理今日状态注入 OK·r9 [{agent_name}]: "
                             f"{getattr(_daily_st, 'mood', '')}/{getattr(_daily_st, 'domain', '')}"
                         )
         except Exception as _e:
