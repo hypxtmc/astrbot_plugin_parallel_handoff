@@ -15,6 +15,11 @@ import json
 import os
 import time
 
+# 2026-09-16 00:26 假绿防护：运行时类方法换血指纹
+# 判定规则：内存中类属性 RUNTIME_BUILD_TAG 与磁盘 dispatch.py 中该常量比对
+# 不一致即内存跑的是旧血——这是热重载假绿的硬判据（不依赖行号/日志/探针）。
+RUNTIME_BUILD_TAG = "build-2026-09-16-0026-r10"
+
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 from astrbot.core.agent.message import TextPart
@@ -451,6 +456,7 @@ class DispatchMixin:
             return json.dumps(r, ensure_ascii=False)
         return json.dumps({"success": True, "response": str(r)}, ensure_ascii=False)
 
+    # 2026-09-16 00:06 现场制造一行「行号位移」验证 runtime 换血检测——产品实验
     async def _call_one(
         self,
         call: dict,
