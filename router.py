@@ -246,7 +246,24 @@ class RouterMixin:
         """
         if not raw:
             return ""
+        # 2026-09-18 修：raw 本身就是纯文本（部分适配器把 raw_message 直接给成
+        # 字符串，如 qq_restapi）。原实现对 str 走 getattr(raw, "raw_message") 必然
+        # 拿到 None → 返回 ""，调用方于是以为「平台侧就没有 /」。实测这是
+        # 「/子代理名 拿不到斜杠」的第五层原因：不是平台没给，是这里没认字符串形态。
+        if isinstance(raw, str):
+            return raw.strip()
         if isinstance(raw, dict):
+            # 2026-09-18 修：QQ 官方 payload 的消息文本在 d.content / d.message 里，
+            # 且**适配器自己就把开头的 / 剥了**（qq_restapi 的 message_parser.py L347：
+            # content = content[1:] if content.startswith("/")）——所以 message_str 与
+            # 消息段都拿不到斜杠，只有平台原始 payload 里还留着它。
+            # 这是「/子代理名 拿不到斜杠」的最后一层：前几层都在复调侧，这层在适配器。
+            _d = raw.get("d")
+            if isinstance(_d, dict):
+                for _k in ("content", "message"):
+                    _v = _d.get(_k)
+                    if isinstance(_v, str) and _v.strip():
+                        return _v.strip()
             for key in ("raw_message", "message"):
                 v = raw.get(key)
                 if isinstance(v, str) and v.strip():
@@ -270,6 +287,37 @@ class RouterMixin:
             if isinstance(v, str) and v.strip():
                 return v.strip()
         return ""
+
+    def _explicit_prefix_present(self, event: AstrMessageEvent) -> bool:
+        """未剥数据源里是否真的带命令前缀（2026-09-18 二次修）。
+
+        为什么需要它：is_at_or_wake_command 在私聊下**恒真**（唤醒层 L144-152
+        无条件置位），无法区分「用户显式打了 /」与「私聊自动唤醒」；而
+        message_str 已被唤醒层剥过（L123）。唯一还留着前缀的是唤醒层不碰的
+        两处：message_obj.raw_message（平台原始事件）与消息段文本。
+
+        第一版修复只看 is_private_chat 就 return raw，把用户真打的 /子代理名
+        一起杀了（实测：发 /助手F → 路由收到「助手F」→ T0 命令式不触发 → 命令锁
+        不建立、主代理锁也没被清，消息直通主代理）。这里改为逐源找前缀：
+        任一源带前缀就算用户确实打了。
+        """
+        _cands = []
+        try:
+            _mo = getattr(event, "message_obj", None)
+            _cands.append(self._extract_original_from_raw(getattr(_mo, "raw_message", None)))
+        except Exception:
+            pass
+        try:
+            for _comp in event.get_messages() or []:
+                _t = getattr(_comp, "text", None)
+                if isinstance(_t, str) and _t.strip():
+                    _cands.append(_t)
+        except Exception:
+            pass
+        for _c in _cands:
+            if isinstance(_c, str) and _c.lstrip().startswith(self._CMD_PREFIXES):
+                return True
+        return False
 
     def _raw_command_text(self, event: AstrMessageEvent) -> str:
         """还原含前缀的原始用户消息文本（2026-09-11 初版 / 2026-09-12 加固）。
@@ -326,11 +374,54 @@ class RouterMixin:
         raw = self._raw_command_text(event) or message
         if raw.startswith(self._CMD_PREFIXES):
             return raw
-        # 严格 `is True`：唤醒层赋的就是字面 True（waking_check/stage.py:114）。
-        # 不能用宽松判真——MagicMock 的任意属性访问都返回 truthy 的 Mock 对象，
-        # 宽松写会把测试与任何 mock 场景误补前缀，把自然语言点名错当命令锁。
-        if getattr(event, "is_at_or_wake_command", False) is True:
+        # ── 2026-09-18 修：私聊不能凭 is_at_or_wake_command 补前缀 ──
+        # core 唤醒层在私聊下**无条件**置 is_at_or_wake_command=True，并把
+        # wake_prefix 置成空串（astrbot/core/pipeline/waking_check/stage.py
+        # L144-152）——该标志的语义是「这条消息已经唤醒我了」，不是「用户显式
+        # 用了 /」。空串还意味着**什么都没剥**，raw 拿到的就是原文。
+        # 据它补 "/" 会把每条私聊消息都变成 /xxx（实测日志：'回到色情上来吧…'
+        # → '/回到色情上来吧…'），进而让 _is_real_command 误判成真命令、绕过
+        # 主代理锁的直通分支，去重屏障也吃到假命令文本。
+        # ── 2026-09-18 二次修：显式前缀判定必须逐源找，不能用私聊标志 ──
+        # 第一版只看 is_private_chat 就 return raw，把用户**真打的** /子代理名
+        # 一起杀掉了（实测：顾主发 /助手F → 路由收到「助手F」→ T0 命令式不触发
+        # → 命令锁不建立、主代理锁也没被清，消息直通主代理）。
+        # 根因：is_at_or_wake_command 在私聊恒真，区分不了「显式打了 /」与
+        # 「私聊自动唤醒」，而 message_str 已被唤醒层剥过。
+        if self._explicit_prefix_present(event):
             return "/" + raw
+        # 群聊：前缀被剥时靠唤醒标志兜底（群聊里它只在前缀/@ 时置真，可靠）。
+        # 严格 `is True`：唤醒层赋的就是字面 True（waking_check/stage.py:114），
+        # 宽松判真会把 MagicMock 的任意属性访问当唤醒，误补前缀。
+        try:
+            _is_private = bool(event.is_private_chat())
+        except Exception:
+            _is_private = False
+        if not _is_private and getattr(event, "is_at_or_wake_command", False) is True:
+            return "/" + raw
+        # ── 诊断（2026-09-18）：前缀判定未命中时把三层数据源形态打出来 ──
+        # 定位「/子代理名 的斜杠丢在哪一层」用的。已定位完毕（适配器 message_parser
+        # 的 content[1:] 先剥了一道），降为 debug 免得刷日志；再遇到前缀问题，
+        # 把日志级别开到 DEBUG 即可复现。
+        if raw and len(raw) <= 24 and not raw.startswith(self._CMD_PREFIXES):
+            try:
+                _mo = getattr(event, "message_obj", None)
+                _rm = getattr(_mo, "raw_message", None)
+                _segs = [getattr(_c, "text", None) for _c in (event.get_messages() or [])]
+                _dd = _rm.get("d") if isinstance(_rm, dict) and isinstance(_rm.get("d"), dict) else {}
+                logger.debug(
+                    "[parallel_handoff][前缀诊断] message=%r | mo.message_str=%r | segs=%r | "
+                    "raw_type=%s | raw_keys=%r | d.content=%r | d.message=%r",
+                    message,
+                    getattr(_mo, "message_str", None),
+                    _segs,
+                    type(_rm).__name__,
+                    list(_rm.keys())[:14] if isinstance(_rm, dict) else None,
+                    _dd.get("content"),
+                    _dd.get("message"),
+                )
+            except Exception as _e:
+                logger.debug("[parallel_handoff][前缀诊断] 打印失败: %r", _e)
         return raw
 
     # 呼叫词（锁仲裁用：锁在场时，只有「前缀命令」或「呼叫词 + 已知名字」才算换人）
@@ -1276,6 +1367,7 @@ class RouterMixin:
                     call_mode="chained" if len(calls) > 1 else "direct",
                     route_mode="direct",
                     mode="affection",
+                    speaker="顾主",
                 )
             except Exception as e:
                 logger.error(
@@ -1299,6 +1391,7 @@ class RouterMixin:
                     call_mode="chained",
                     route_mode="direct",
                     mode="affection",
+                    speaker="顾主",
                 )
             except Exception as e:
                 logger.error(
@@ -1324,6 +1417,7 @@ class RouterMixin:
                     call_mode="chained",
                     route_mode="direct",
                     mode="affection",
+                    speaker="顾主",
                 )
             except Exception as e:
                 logger.error(
@@ -1348,7 +1442,7 @@ class RouterMixin:
                 f"(runner active, skip follow-up capture)"
             )
             try:
-                await self.call_subagent(event, agent_name=route, input=message)
+                await self.call_subagent(event, agent_name=route, input=message, speaker="顾主")
             except Exception as e:
                 logger.error(
                     f"[parallel_handoff] BusyBypass T0.5 direct call failed: {e}; release to main"
@@ -1374,7 +1468,7 @@ class RouterMixin:
             f"(runner active, skip follow-up capture)"
         )
         try:
-            await self.call_subagent(event, agent_name=route, input=message)
+            await self.call_subagent(event, agent_name=route, input=message, speaker="顾主")
         except Exception as e:
             logger.error(
                 f"[parallel_handoff] BusyBypass direct call failed: {e}; release to main"
@@ -1528,6 +1622,7 @@ class RouterMixin:
                     call_mode="chained" if len(calls) > 1 else "direct",
                     route_mode="direct",
                     mode="affection",
+                    speaker="顾主",
                 )
             except Exception as e:
                 logger.error(
@@ -1554,6 +1649,7 @@ class RouterMixin:
                     call_mode="chained",
                     route_mode="direct",
                     mode="affection",
+                    speaker="顾主",
                 )
             except Exception as e:
                 logger.error(
@@ -1597,6 +1693,7 @@ class RouterMixin:
                         call_mode="chained",
                         route_mode="direct",
                         mode="affection",
+                        speaker="顾主",
                     )
                 except Exception as e:
                     logger.error(
@@ -1654,7 +1751,7 @@ class RouterMixin:
             f"cost={int((time.perf_counter() - t0) * 1000)}ms)"
         )
         try:
-            await self.call_subagent(event, agent_name=route, input=message)
+            await self.call_subagent(event, agent_name=route, input=message, speaker="顾主")
         except Exception as e:
             logger.error(f"[parallel_handoff] SmartRouter direct call failed: {e}; release to main")
             return False
