@@ -149,6 +149,13 @@ class RouterMixin:
         if _ROUTER_TABLES.get("main_token")
         else re.compile(r"(主代理|主agent)")
     )
+    # [2026-09-18 用户口径修正] 句首点名式令牌：子代理锁在场时，只有**以令牌开头**
+    # 才算点名主代理，句中出现不算。判定入口见 _main_token_hits。
+    _MAIN_HEAD_RE = (
+        re.compile(rf"^\s*(?:{_ROUTER_TABLES['main_token']}|主代理|主agent)")
+        if _ROUTER_TABLES.get("main_token")
+        else re.compile(r"^\s*(?:主代理|主agent)")
+    )
     # T2 判向时给模型看的子代理职责简介（简写，不涉及人格机密）
     T2_AGENT_BRIEF = _ROUTER_TABLES.get("t2_brief", {})
 
@@ -856,6 +863,29 @@ class RouterMixin:
         if len(live) < 2:
             return [next(iter(live.keys()))]
         return list(live.keys())
+
+    def _main_token_hits(self, event, message: str) -> bool:
+        """消息是否该触发主代理令牌放行（2026-09-18 口径修正）。
+
+        原判据是 `_MAIN_TOKEN_RE.search(message)` —— 句中出现即算，于是
+        跟子代理聊天时说「我去找主代理修bug」被当成点名主代理，本轮消息被截回
+        主代理、子代理收不到（2026-09-18 助手F连发两条没回应）。
+
+        新口径分两种情况：
+          · **无子代理锁** → 维持原样，句中出现即放行。此时没有锁要保护，
+            用户随口提到主代理，放行是更安全的一侧。
+          · **有子代理锁** → 只有「以令牌开头」的点名式才算（`主代理，过来`），
+            句中出现不算 —— 消息照常路由给锁定的子代理。
+
+        要切回主代理，发 `/主代理`（走 T0 命令路径显式解锁），或 /复位。
+        """
+        if not message or not self._MAIN_TOKEN_RE:
+            return False
+        if not self._MAIN_TOKEN_RE.search(message):
+            return False
+        if not self._cmd_locked_group(event):
+            return True
+        return bool(self._MAIN_HEAD_RE and self._MAIN_HEAD_RE.match(message.lstrip()))
 
     # ── 主代理锁（2026-09-12 用户指定）─────────────────
     def _record_main_lock(self, event):
@@ -1590,9 +1620,11 @@ class RouterMixin:
         # [最高优先级 2026-09-03 用户指定] 含连续「主代理」四字 → 无条件放行主代理（=主代理）。
         # 跳过 T1/T1.5/T2 全部判向，任何子代理都不得接管。返回 False 表示不短路、不 stop_event，
         # 消息自然落回主代理路径。登记路由历史防止 T1.5 后续承接接到子代理。
-        if self._MAIN_TOKEN_RE and self._MAIN_TOKEN_RE.search(message):
+        if self._main_token_hits(event, message):
             logger.info(
-                "[parallel_handoff] SmartRouter: 消息含「主代理令牌」→ 最高优先级放行主代理（不路由子代理）"
+                "[parallel_handoff] SmartRouter: 消息含「主代理令牌」→ 最高优先级放行主代理"
+                "（不路由子代理）| 子代理锁=%s",
+                "在场" if self._cmd_locked_group(event) else "无",
             )
             # 清掉该会话的续接记忆，避免后续承接句被 T1.5 续给错误子代理。
             # [2026-09-11 用户口径修正] 这里**不再**清命令锁：过去对话里只要提到
