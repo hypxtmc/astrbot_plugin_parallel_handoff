@@ -221,16 +221,23 @@ class RouterMixin:
     # 会把前缀从 event.message_str 里剥掉（waking_check/stage.py:123），所以 T0 判定
     # 不能只看 message_str——统一改用 _raw_command_text(event) 从消息段拼回原文。
     # 同时把可用前缀扩成一组（/ 全角／ # ！ ! 、），用户在 QQ 上发哪个都能锁。
-    _CMD_PREFIXES = ("/", "／", "#", "！", "!", "、")
+    # 2026-09-18 抽公共件：前缀字符集收成单一真源。此前 /／#！!、 这串在
+    # _CMD_PREFIXES / _CMD_RE / _ADMIN_RE 里各写一份，改一处漏两处。
+    # 注意两点：_CMD_RE 里的分隔符类 [/+、，,，] 是**另一个集合**（含 + 和 ,），
+    # 不是前缀类，保持字面量；反类要带 \s，也不能直接套正类。
+    _PREFIX_CHARS = "/／#！!、"
+    _CMD_PREFIXES = tuple(_PREFIX_CHARS)
+    _PREFIX_CLS = f"[{_PREFIX_CHARS}]"
+    _PREFIX_NEG = f"[^\\s{_PREFIX_CHARS}]"
     _CMD_RE = re.compile(
-        r"^[/／#！!、]([^\s/／#！!、]+(?:[/+、，,，][^\s/／#！!、]+)*)\s*$", re.M
+        rf"^{_PREFIX_CLS}({_PREFIX_NEG}+(?:[/+、，,，]{_PREFIX_NEG}+)*)\s*$", re.M
     )
     # ── T0 管理命令（软入口·A 方案 2026-09-12 用户指定）──────────────
     # /谁在 /复位 /列表 —— 会话柜台三件套：查锁、放锁、看名单。
     # 判定先于点名（管理词不是 agent 名，天然不冲突）；且必须整条消息只有命令本体，
     # 「/谁在 顺便说个事」这类带尾巴的不拦截，照常进消息流（防误吞正式内容）。
     _ADMIN_RE = re.compile(
-        r"^[/／#！!、](谁在|状态|复位|解除|放开|释放|列表|名单)\s*$", re.M
+        rf"^{_PREFIX_CLS}(谁在|状态|复位|解除|放开|释放|列表|名单)\s*$", re.M
     )
 
     def _extract_original_from_raw(self, raw) -> str:
@@ -401,29 +408,6 @@ class RouterMixin:
             _is_private = False
         if not _is_private and getattr(event, "is_at_or_wake_command", False) is True:
             return "/" + raw
-        # ── 诊断（2026-09-18）：前缀判定未命中时把三层数据源形态打出来 ──
-        # 定位「/子代理名 的斜杠丢在哪一层」用的。已定位完毕（适配器 message_parser
-        # 的 content[1:] 先剥了一道），降为 debug 免得刷日志；再遇到前缀问题，
-        # 把日志级别开到 DEBUG 即可复现。
-        if raw and len(raw) <= 24 and not raw.startswith(self._CMD_PREFIXES):
-            try:
-                _mo = getattr(event, "message_obj", None)
-                _rm = getattr(_mo, "raw_message", None)
-                _segs = [getattr(_c, "text", None) for _c in (event.get_messages() or [])]
-                _dd = _rm.get("d") if isinstance(_rm, dict) and isinstance(_rm.get("d"), dict) else {}
-                logger.debug(
-                    "[parallel_handoff][前缀诊断] message=%r | mo.message_str=%r | segs=%r | "
-                    "raw_type=%s | raw_keys=%r | d.content=%r | d.message=%r",
-                    message,
-                    getattr(_mo, "message_str", None),
-                    _segs,
-                    type(_rm).__name__,
-                    list(_rm.keys())[:14] if isinstance(_rm, dict) else None,
-                    _dd.get("content"),
-                    _dd.get("message"),
-                )
-            except Exception as _e:
-                logger.debug("[parallel_handoff][前缀诊断] 打印失败: %r", _e)
         return raw
 
     # 呼叫词（锁仲裁用：锁在场时，只有「前缀命令」或「呼叫词 + 已知名字」才算换人）
