@@ -125,13 +125,11 @@ class ParallelHandoffPlugin(
         _store = None
         if self._cfg("subagent_session_persist", True):
             try:
-                import os as _os
-
                 _data_dir = str(
                     StarTools.get_data_dir("astrbot_plugin_parallel_handoff")
                 )
                 _store = _session_store_mod.SessionStore(
-                    _os.path.join(_data_dir, "subagent_sessions"),
+                    os.path.join(_data_dir, "subagent_sessions"),
                     retention_days=self._cfg("subagent_session_retention_days", 30),
                 )
             except Exception as _store_e:  # noqa: BLE001
@@ -251,13 +249,9 @@ class ParallelHandoffPlugin(
                 success, err = await star_manager.reload("astrbot_plugin_parallel_handoff")
                 if success:
                     logger.info("[parallel_handoff] 插件热重载成功")
-                    from astrbot.core.message.components import Plain
-                    from astrbot.core.message.message_event_result import MessageChain
                     await event.send(MessageChain([Plain("✅ parallel_handoff 插件热重载成功")]))
                 else:
                     logger.error(f"[parallel_handoff] 热重载失败: {err}")
-                    from astrbot.core.message.components import Plain
-                    from astrbot.core.message.message_event_result import MessageChain
                     await event.send(MessageChain([Plain(f"❌ 热重载失败: {err}")]))
             except Exception as e:
                 logger.error(f"[parallel_handoff] 热重载异常: {e}")

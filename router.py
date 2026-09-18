@@ -25,6 +25,8 @@ from collections import deque
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
+from astrbot.core.message.components import Plain
+from astrbot.core.message.message_event_result import MessageChain
 
 try:
     from astrbot.core.star.filter.custom_filter import CustomFilter
@@ -588,8 +590,6 @@ class RouterMixin:
         """发送管理命令回执（发送失败不炸路由，仅记日志）。"""
         try:
             text = self._admin_reply_text(event, cmd)
-            from astrbot.core.message.components import Plain
-            from astrbot.core.message.message_event_result import MessageChain
             await event.send(MessageChain([Plain(text)]))
         except Exception as e:  # noqa: BLE001
             logger.error(f"[parallel_handoff] 管理命令回执发送失败: {e}")

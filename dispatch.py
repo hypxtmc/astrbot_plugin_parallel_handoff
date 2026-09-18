@@ -23,6 +23,8 @@ RUNTIME_BUILD_TAG = "build-2026-09-16-0026-r10"
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 from astrbot.core.agent.message import TextPart
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # ── 模块加载 banner（2026-09-15）──
 # 用途：热重载对 Mixin 子模块是否真把新代码装进内存，看这行就够了。
@@ -560,8 +562,6 @@ class DispatchMixin:
         #    mark_as_temp() 防止时间戳被持久化进历史上下文
         #    时段规则（用户 2026-09-02 01:11 定稿）：1-6凌晨 | 6-10早上 | 10-13中午 | 13-18下午 | 18-20傍晚 | 其他深夜
         try:
-            from datetime import datetime
-            from zoneinfo import ZoneInfo
             _now = datetime.now(ZoneInfo("Asia/Shanghai"))
             _week = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][_now.weekday()]
             _hour = _now.hour

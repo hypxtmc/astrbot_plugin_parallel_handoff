@@ -15,6 +15,10 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+from zoneinfo import ZoneInfo
+
+from astrbot.core.message.components import Plain
+from astrbot.core.message.message_event_result import MessageChain
 import json
 import os
 import random
@@ -103,8 +107,6 @@ LIFE_SEEDS = [
 
 def _pulse_period_desc(now: Optional[float] = None) -> str:
     """按时段给一句场景描述（与 dispatch 时间感知同时段规则，Asia/Shanghai）。"""
-    import datetime
-    from zoneinfo import ZoneInfo
 
     dt = (
         datetime.datetime.fromtimestamp(now, tz=ZoneInfo("Asia/Shanghai"))
@@ -156,8 +158,6 @@ class FamilyPulseMixin:
         return os.path.join(self._pulse_data_root(), "random_state_seen.json")
 
     def _pulse_log_path(self, day: Optional[str] = None) -> str:
-        import datetime
-        from zoneinfo import ZoneInfo
 
         d = day or datetime.datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
         return os.path.join(self._pulse_data_root(), f"{d}.jsonl")
@@ -486,8 +486,6 @@ class FamilyPulseMixin:
     def _pulse_append(self, agent: str, display: str, text: str) -> None:
         path = self._pulse_log_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        import datetime
-        from zoneinfo import ZoneInfo
 
         ts = datetime.datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%H:%M")
         rec = {"ts": ts, "agent": agent, "display": display, "text": text}
@@ -561,8 +559,6 @@ class FamilyPulseMixin:
         反复上线；传 domain 时优先挑与其话题域底色契合的句子（更贴角色），
         没有契合句才回退随机。没有任何历史 → None，交给冷启动兜底。
         """
-        import datetime
-        from zoneinfo import ZoneInfo
 
         days = []
         try:
@@ -932,8 +928,6 @@ class FamilyPulseMixin:
 
     def _pulse_is_holiday(self) -> bool:
         """工作日低频率 / 节假日（含双休）高频率。"""
-        import datetime
-        from zoneinfo import ZoneInfo
 
         wd = datetime.datetime.now(ZoneInfo("Asia/Shanghai")).weekday()
         return wd >= 5  # 周六=5 周日=6，双休算节假日
@@ -961,8 +955,6 @@ class FamilyPulseMixin:
         if not self._cfg("side_pulse_draft_enable", False):
             return False
         st = self._pulse_draft_load()
-        import datetime
-        from zoneinfo import ZoneInfo
 
         now = datetime.datetime.now(ZoneInfo("Asia/Shanghai"))
         today = now.strftime("%Y-%m-%d")
@@ -1059,13 +1051,9 @@ class FamilyPulseMixin:
             # 落日志：召唤语以发起者身份记入旁轨
             self._pulse_append(drafter, disp, call_text)
             # 推送到用户私聊：旁轨里有人喊他
-            from astrbot.core.message.components import Plain
-            from astrbot.core.message.message_event_result import MessageChain
 
             await self.context.send_message(umo, MessageChain([Plain(f"【{disp}】{call_text}")]))
             # 置等待回复状态（30 分钟窗口，超时自动失效）
-            import datetime
-            from zoneinfo import ZoneInfo
 
             st = self._pulse_draft_load()
             st["awaiting"] = True
@@ -1103,8 +1091,6 @@ class FamilyPulseMixin:
             # 只认用户私聊（FriendMessage + 用户本人），适配器前缀变化也稳
             if not self._pulse_is_doctor_private(event):
                 return False
-            import datetime
-            from zoneinfo import ZoneInfo
 
             now = datetime.datetime.now(ZoneInfo("Asia/Shanghai"))
             # awaiting 窗口（拉人后 30 分钟）过期 → 清 awaiting，但 present 窗口还在就继续接
@@ -1158,8 +1144,6 @@ class FamilyPulseMixin:
     async def _pulse_draft_followup(self, doctor_msg: str, umo: str, drafter: Optional[str] = None) -> None:
         """用户回话后的立即接茬 mini-tick：优先拉他的人先接，再补一人，推回用户私聊。"""
         try:
-            import datetime
-            from zoneinfo import ZoneInfo
 
             now = datetime.datetime.now(ZoneInfo("Asia/Shanghai"))
             day = now.strftime("%Y-%m-%d")
@@ -1193,8 +1177,6 @@ class FamilyPulseMixin:
                 if text:
                     self._pulse_append(ag, disp, text)
                     self._pulse_advance_thread(ag)
-                    from astrbot.core.message.components import Plain
-                    from astrbot.core.message.message_event_result import MessageChain
 
                     await self.context.send_message(umo, MessageChain([Plain(f"【{disp}】{text}")]))
         except Exception as e:  # noqa: BLE001
@@ -1388,8 +1370,6 @@ class FamilyPulseMixin:
             logs = self._pulse_read_day()
             if not logs:
                 return
-            import datetime
-            from zoneinfo import ZoneInfo
 
             day = datetime.datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%m-%d")
             msg = self._build_digest_text(logs, day)
@@ -1399,8 +1379,6 @@ class FamilyPulseMixin:
             )
             if not umo:
                 return
-            from astrbot.core.message.components import Plain
-            from astrbot.core.message.message_event_result import MessageChain
 
             await self.context.send_message(umo, MessageChain([Plain(msg)]))
             _logger.info("[side_pulse] digest 已推送(%d 条)", len(logs))
@@ -1418,7 +1396,6 @@ class FamilyPulseMixin:
         零点后全部；日志 ts 缺损的行直接剔除。now 可注入便于测试。
         """
         import datetime as _dt
-        from zoneinfo import ZoneInfo
 
         if not logs:
             return []
@@ -1441,8 +1418,6 @@ class FamilyPulseMixin:
 
         只认明确词，不给模糊日期匹配，避免误读正常聊天内容。
         """
-        import datetime
-        from zoneinfo import ZoneInfo
 
         now = datetime.datetime.now(ZoneInfo("Asia/Shanghai"))
         if "前天" in raw:
@@ -1457,8 +1432,6 @@ class FamilyPulseMixin:
         仅响应用户私聊（FriendMessage + 用户本人），其他会话直接放行不拦截；
         命中则 stop_event（主代理不再回话）+ 推送日志原文到用户私聊。
         """
-        import datetime
-        from zoneinfo import ZoneInfo
 
         try:
             if not self._cfg("enable_side_pulse", False):
@@ -1497,8 +1470,6 @@ class FamilyPulseMixin:
             umo = self._pulse_draft_umo()
             if not umo:
                 return False
-            from astrbot.core.message.components import Plain
-            from astrbot.core.message.message_event_result import MessageChain
 
             await self.context.send_message(umo, MessageChain([Plain(msg)]))
             _logger.info("[side_pulse] 唤即看: 用户回看 %s（%d 条）", day, len(logs))
@@ -1591,7 +1562,6 @@ class FamilyPulseMixin:
         返回 (start, end, interval_sec)。窗口起止与区间长均可配：
         side_pulse_window_start / side_pulse_window_end / side_pulse_interval_min。
         """
-        from zoneinfo import ZoneInfo
 
         tz = ZoneInfo("Asia/Shanghai")
         sh, sm = (
@@ -1647,7 +1617,6 @@ class FamilyPulseMixin:
         _logger.info("[side_pulse] 作息心跳循环已启动")
         while True:
             try:
-                from zoneinfo import ZoneInfo
 
                 now = datetime.datetime.now(ZoneInfo("Asia/Shanghai"))
                 fire = self._pulse_next_fire(now, rng)
