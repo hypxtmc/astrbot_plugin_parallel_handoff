@@ -297,6 +297,40 @@ class RouterMixin:
                 return v.strip()
         return ""
 
+    def _raw_sources(self, event: AstrMessageEvent):
+        """收集未剥数据源（2026-09-18 抽公共件）。
+
+        此前 _explicit_prefix_present 与 _raw_command_text 各扫一遍同样的两处
+        （message_obj.raw_message / get_messages()），逻辑近乎相同但**语义分叉**：
+        前者逐段看，后者把段拼成一串。合并时最容易踩的坑就是把返回值当 list 用
+        ——后者会从「拼接所有段」悄悄变成「取首个非空段」
+        （见 test_raw_sources_multi_segment_divergence）。
+
+        所以返回二元组，两条语义各取所需，**不在这里替调用方做决定**：
+          raw_text  —— raw_message 归一化后的原文，取不到则空串
+          seg_texts —— 各消息段文本（保留原样，不拼接、不 strip，过滤交给调用方）
+
+        两处 try 都是必须的：平台可能没实现 message_obj / get_messages，
+        也可能在取的时候抛（见 test_get_messages_raises_returns_empty）。
+        """
+        raw_text = ""
+        try:
+            _mo = getattr(event, "message_obj", None)
+            raw_text = self._extract_original_from_raw(getattr(_mo, "raw_message", None))
+        except Exception as e:
+            logger.debug(f"[parallel_handoff] raw_message 取原文失败: {e}")
+
+        seg_texts = []
+        try:
+            for _comp in event.get_messages() or []:
+                _t = getattr(_comp, "text", None)
+                if isinstance(_t, str) and _t:
+                    seg_texts.append(_t)
+        except Exception:
+            pass
+
+        return raw_text, seg_texts
+
     def _explicit_prefix_present(self, event: AstrMessageEvent) -> bool:
         """未剥数据源里是否真的带命令前缀（2026-09-18 二次修）。
 
@@ -310,21 +344,13 @@ class RouterMixin:
         不建立、主代理锁也没被清，消息直通主代理）。这里改为逐源找前缀：
         任一源带前缀就算用户确实打了。
         """
-        _cands = []
-        try:
-            _mo = getattr(event, "message_obj", None)
-            _cands.append(self._extract_original_from_raw(getattr(_mo, "raw_message", None)))
-        except Exception:
-            pass
-        try:
-            for _comp in event.get_messages() or []:
-                _t = getattr(_comp, "text", None)
-                if isinstance(_t, str) and _t.strip():
-                    _cands.append(_t)
-        except Exception:
-            pass
-        for _c in _cands:
-            if isinstance(_c, str) and _c.lstrip().startswith(self._CMD_PREFIXES):
+        raw_text, seg_texts = self._raw_sources(event)
+        # ① raw_message 归一化后带前缀
+        if isinstance(raw_text, str) and raw_text.lstrip().startswith(self._CMD_PREFIXES):
+            return True
+        # ② 逐段看：任一消息段带前缀（平台把 raw_message 给空时靠这条）
+        for _t in seg_texts:
+            if _t.strip() and _t.lstrip().startswith(self._CMD_PREFIXES):
                 return True
         return False
 
@@ -344,24 +370,12 @@ class RouterMixin:
           ③ 都拿不到 → 返回 ""，由调用方回落 message_str
         """
         # ① 平台原始事件（最可信）
-        try:
-            raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
-            txt = self._extract_original_from_raw(raw)
-            if txt:
-                return txt
-        except Exception as e:
-            logger.debug(f"[parallel_handoff] raw_message 取原文失败: {e}")
-        # ② 消息段拼回
-        try:
-            segs = event.get_messages()
-        except Exception:
-            return ""
-        buf = []
-        for seg in segs or []:
-            txt = getattr(seg, "text", None)
-            if isinstance(txt, str) and txt:
-                buf.append(txt)
-        return "".join(buf).strip()
+        # ② 消息段拼回 —— 两处取值已抽进 _raw_sources，语义在这里**保持不变**：
+        #    raw_message 优先，没有才把段**拼接**回来（不是取首个非空段）
+        raw_text, seg_texts = self._raw_sources(event)
+        if raw_text:
+            return raw_text
+        return "".join(seg_texts).strip()
 
     def _resolve_command_text(self, event: AstrMessageEvent, message: str) -> str:
         """解析出用于 T0 命令判定的文本（2026-09-12 四修）。
