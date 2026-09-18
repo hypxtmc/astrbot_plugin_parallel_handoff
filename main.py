@@ -148,6 +148,7 @@ class ParallelHandoffPlugin(
                 max_concurrent=self._cfg("subagent_task_max_concurrent", 20),
                 max_per_session=self._cfg("subagent_task_max_per_session", 5),
                 turn_timeout=self._cfg("subagent_task_turn_timeout", 900),
+                on_done=self._on_task_done,
             )
             # 进程刚起来，内存里本不该有残留任务；此调用为防御性清理，
             # 将来若任务也落盘，它就是必需的一步。
@@ -155,6 +156,51 @@ class ParallelHandoffPlugin(
         except Exception as _tr_e:  # noqa: BLE001
             logger.warning(f"[parallel_handoff] 后台任务运行器初始化失败: {_tr_e}")
             self._task_runner = None
+
+    async def _on_task_done(self, rec) -> None:
+        """后台任务终态 → 主动往会话推一条（P1 · 2026-09-18）。
+
+        设计里写的是「她做完再来找我」，但在此之前 _run 跑完只写 rec.result，
+        没有任何回调——主代理不主动取，这条链路就断在那儿，用户也看不到。
+        这个回调就是那缺失的一半：她跑完自己冒泡，主代理可以继续陪用户说话。
+
+        - 默认开启，`subagent_task_notify=false` 可关（多任务时怕刷屏）
+        - 结果截断 300 字，全文仍用 `task_result` 取
+        - 任何异常都吞掉：通知失败不能影响任务终态
+        """
+        try:
+            if not self._cfg("subagent_task_notify", True):
+                return
+            umo = getattr(rec, "session_key", "") or ""
+            if not umo or umo == "default":
+                return
+            from astrbot.core.message.components import Plain
+            from astrbot.core.message.message_event_result import MessageChain
+
+            status = getattr(rec, "status", "")
+            icon = {
+                "done": "✅",
+                "failed": "❌",
+                "interrupted": "⏱️",
+                "stopped": "🚫",
+            }.get(status, "•")
+            try:
+                name = self._display_name(rec.agent)
+            except Exception:
+                name = rec.agent
+            elapsed = round((rec.finished_at or 0) - rec.created_at, 1)
+
+            if status == "done":
+                body = (rec.result or "").strip()
+                if len(body) > 300:
+                    body = body[:300] + f"\n…（共 {len(rec.result)} 字，用 task_result 取全文）"
+                text = f"{icon} 【{name}】后台任务完成（{elapsed}s）\n{body}" if body else f"{icon} 【{name}】后台任务完成（{elapsed}s）"
+            else:
+                text = f"{icon} 【{name}】后台任务未完成（{elapsed}s）：{rec.error or status}"
+
+            await self.context.send_message(umo, MessageChain([Plain(text)]))
+        except Exception as _e:  # noqa: BLE001
+            logger.warning(f"[parallel_handoff] 后台任务完成通知失败（非致命）: {_e}")
 
     # ── 事件注册：主代理前缀自动注入（实现见 forward.py ForwardMixin） ──
     @filter.on_decorating_result()
@@ -347,10 +393,10 @@ Args:
         """查后台任务状态（二期）。不阻塞，立即返回。
 
 使用场景：派了后台任务之后，想知道它跑完没有。
-不传 task_id 则列出当前所有活跃任务。
+**丢了 task_id 也能查**——不传 task_id 时返回本会话的 active + recent（含已完成的，带结果预览）。
 
 Args:
-    task_id (string): 任务 ID，不传则列出全部活跃任务
+    task_id (string): 任务 ID，不传则列出本会话活跃任务 + 最近 10 条（含已结束）
 """
         return await super().task_status(event, task_id)
 

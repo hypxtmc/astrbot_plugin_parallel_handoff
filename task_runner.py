@@ -102,11 +102,14 @@ class TaskRunner:
         max_per_session: int = 5,
         turn_timeout: float = 900.0,
         result_ttl: float = 3600.0,
+        on_done: Callable[[TaskRecord], Awaitable[None]] | None = None,
     ):
         self.max_concurrent = int(max_concurrent)
         self.max_per_session = int(max_per_session)
         self.turn_timeout = float(turn_timeout)
         self.result_ttl = float(result_ttl)
+        # P1（2026-09-18）：任务终态时回调，让子代理「做完自己冒泡」
+        self.on_done = on_done
 
         self.tasks: dict[str, TaskRecord] = {}
         self._stop_flags: set[str] = set()
@@ -164,6 +167,23 @@ class TaskRunner:
         finally:
             rec.finished_at = time.time()
             self._stop_flags.discard(rec.task_id)
+            await self._notify(rec)
+
+    async def _notify(self, rec: TaskRecord) -> None:
+        """任务终态时回调（P1 · 2026-09-18）。
+
+        设计里写的是「她做完再来找我」，但在此之前 _run 跑完只写 rec.result，
+        没有任何回调——主代理不主动取，这条链路就断在那儿，用户也看不到。
+
+        **回调异常必须吞掉**：通知失败是小事，把任务终态带崩是大事。
+        stop 抢先置终态的路径不回调（用户自己取消的，当场就知道）。
+        """
+        if self.on_done is None:
+            return
+        try:
+            await self.on_done(rec)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[task_runner] on_done 回调失败 {rec.task_id}: {exc}")
 
     # ── 查询 ─────────────────────────────────────────────
     def get(self, task_id: str) -> TaskRecord | None:
@@ -196,6 +216,27 @@ class TaskRunner:
             if session_key and t.session_key != session_key:
                 continue
             out.append(t.to_dict(include_result=False))
+        return out
+
+    def list_recent(self, session_key: str | None = None, n: int = 10) -> list[dict]:
+        """列出最近的任务（**含已结束的**），按提交时间倒序。
+
+        P0（2026-09-18）：list_active 会主动过滤终态，于是 task_status 无参时
+        只看得见还在跑的。主代理一旦丢了 task_id，连「我刚派了什么、跑完没」
+        都查不到，结果永久取不回。本方法补上这一环。
+
+        列表里带 `result_preview`（截断 300 字）——多数情况下不用再调
+        task_result 就能知道成没成、结果长什么样。
+        """
+        rows = list(self.tasks.values())
+        if session_key:
+            rows = [t for t in rows if t.session_key == session_key]
+        rows.sort(key=lambda t: t.created_at, reverse=True)
+        out = []
+        for t in rows[: max(1, int(n))]:
+            d = t.to_dict(include_result=False)
+            d["result_preview"] = (t.result or "")[:300]
+            out.append(d)
         return out
 
     # ── 控制 ─────────────────────────────────────────────

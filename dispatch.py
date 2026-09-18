@@ -365,7 +365,12 @@ class DispatchMixin:
         return getattr(self, "_task_runner", None)
 
     async def task_status(self, event, task_id=None) -> str:
-        """查任务状态。不传 task_id 则列出本会话的活跃任务。"""
+        """查任务状态。不传 task_id 则列出本会话最近 10 条任务（**含已结束的**）。
+
+        P0（2026-09-18）：以前无参只列 `active`，而 list_active 主动过滤终态——
+        主代理一旦丢了 task_id，连「我刚派了什么、跑完没」都查不到，结果永久
+        取不回（当晚真实翻车）。现在多给一份 `recent`，含终态 + 结果预览。
+        """
         runner = self._runner_or_none()
         if runner is None:
             return json.dumps({"error": "后台任务未启用"}, ensure_ascii=False)
@@ -378,7 +383,11 @@ class DispatchMixin:
             return json.dumps(rec.to_dict(), ensure_ascii=False)
         session_key = getattr(event, "unified_msg_origin", "") or "default"
         return json.dumps(
-            {"active": runner.list_active(session_key), "stats": runner.stats()},
+            {
+                "active": runner.list_active(session_key),
+                "recent": runner.list_recent(session_key, n=10),
+                "stats": runner.stats(),
+            },
             ensure_ascii=False,
         )
 
