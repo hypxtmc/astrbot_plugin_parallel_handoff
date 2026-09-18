@@ -305,6 +305,7 @@ class ParallelHandoffPlugin(
         call_mode: str = None,
         mode: str = None,
         background: bool = False,
+        speaker: str = None,
     ) -> str:
         """并行调用多个子代理（如 agent_a、agent_b、agent_c 等）,
 同时获取它们的回复并汇总。
@@ -333,6 +334,7 @@ Args:
     route_mode(string): 路由模式覆盖，'direct'或'relay'；不传用模式/配置默认。技术干活任务传"relay"使子代理回复返回主代理汇总；日常贴贴不传走默认直发。
     call_mode(string): 调用模式覆盖，'parallel'或'chained'；不传用模式/配置默认。技术干活传"parallel"并行调度；流水线任务传"chained"接龙。
     background(boolean): 是否后台执行（二期，默认 false）。true 时立即返回 task_id 不阻塞——主代理可以继续和用户对话，子代理做完再用 task_result 取结果；适合耗时长或需要真并行的任务。false 时等子代理全部做完再返回，与原行为完全一致。
+    speaker(string): 可选。说话者身份标注，让子代理知道本条消息是谁在说。不传默认"主代理"（主代理调度，可能转述顾主原话）；转述顾主原话时可传"主代理转述顾主原话"。顾主点名的短路路由由插件自动标注"顾主"，无需关心。
 
 【派单纪律（L2 协议，2026-09-12 立）】
 1. **带判断**：任务卡必写【判断】+【依据】，不写纯指令——只给指令她会照做，
@@ -343,7 +345,7 @@ Args:
 4. **产出默认可疑**：她交回来的是**线索**不是**结论**，验收时先问
    "这东西和已有实现重不重复"——防"往代码库塞第二个轮子"。
 """
-        return await super().parallel_handoff(event, calls, timeout, message, route_mode, call_mode, mode, background)
+        return await super().parallel_handoff(event, calls, timeout, message, route_mode, call_mode, mode, background, speaker=speaker or "主代理")
 
     # ── LLM 工具注册：task_status / task_result / task_stop（二期后台任务） ──
     @llm_tool(name="task_status")
@@ -390,6 +392,7 @@ Args:
         event: AstrMessageEvent,
         agent_name: str,
         input: str,
+        speaker: str = None,
     ) -> str:
         """替代 transfer_to_* 工具的统一入口。调用单个子代理并将回复直接分段转发到用户。
 
@@ -402,4 +405,4 @@ Args:
     agent_name (string): 子代理名称。支持英文 id（如 agent_a、agent_b）和中文名（以 name_display_map 配置为准），大小写不敏感
     input (string): 传给子代理的完整问题或指令
 """
-        return await super().call_subagent(event, agent_name, input)
+        return await super().call_subagent(event, agent_name, input, speaker=speaker or "主代理")

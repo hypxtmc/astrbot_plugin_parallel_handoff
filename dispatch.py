@@ -467,6 +467,7 @@ class DispatchMixin:
         livingmemory_plugin,
         enable_name_prefix: bool,
         timeout: int,
+        speaker: str = None,
     ) -> dict:
         """调用单个子代理，带超时和错误隔离。
 
@@ -537,6 +538,12 @@ class DispatchMixin:
             final_input = f"{_id_note}\n{final_input}"
         except Exception as e:
             logger.warning(f"[parallel_handoff] 用户身份注入失败: {e}")
+
+        # ── 说话者身份注入（2026-09-18 双向身份识别） ──
+        # 区分「顾主亲口点名」（router 短路，speaker="顾主"）与「主代理调度/转述」
+        # （main.py 工具壳默认兕底 "主代理"）。None 不注入——旧路径零影响。
+        if speaker:
+            final_input = f"[说话者] 本条消息来自：{speaker}\n{final_input}"
 
         # ── 记忆召回：注入长期记忆（memory.py） ──
         # 接龙注入的前文是临时上下文：记忆链路（召回/存储）统一剥离，
@@ -939,6 +946,7 @@ class DispatchMixin:
         call_mode: str = None,
         mode: str = None,
         background: bool = False,
+        speaker: str = None,
     ) -> str:
         """并行调用多个子代理（如 agent_a、agent_b、agent_c 等）,
 同时获取它们的回复并汇总。
@@ -957,6 +965,7 @@ Args:
     route_mode(string): 路由模式覆盖，'direct'或'relay'；不传用模式/配置默认。技术干活任务传"relay"使子代理回复返回主代理汇总；日常贴贴不传走默认直发。
     call_mode(string): 调用模式覆盖，'parallel'或'chained'；不传用模式/配置默认。技术干活传"parallel"并行调度；流水线任务传"chained"接龙。
     background(boolean): 是否后台执行（二期，默认 false）。true 时立即返回 task_id 不阻塞——主代理可以继续和用户对话，子代理做完再来取结果（用 task_result），适合耗时长或需要并行的任务。false 时等子代理全部做完再返回，与原行为完全一致。
+    speaker(string): 内部参数。说话者身份，注入为 [说话者] 行；None 不注入。router 短路传"顾主"，工具壳默认"主代理"。
 """
         # ── LLM 同回合重复调用防重：同一消息对同一批子代理的重复路由短路 ──
         # 防重 key 含本次路由目标子代理名单，串行调不同子代理可各自放行
@@ -1139,6 +1148,7 @@ Args:
                     livingmemory_plugin=livingmemory_plugin,
                     enable_name_prefix=enable_name_prefix,
                     timeout=timeout,
+                    speaker=speaker,
                 )
                 results.append(r)
                 # ── 流式转发：本条立刻发出，不等整条链 ──
@@ -1234,6 +1244,7 @@ Args:
                         livingmemory_plugin=livingmemory_plugin,
                         enable_name_prefix=enable_name_prefix,
                         timeout=timeout,
+                        speaker=speaker,
                     )),
                 )
                 submitted.append(
@@ -1262,6 +1273,7 @@ Args:
                     livingmemory_plugin=livingmemory_plugin,
                     enable_name_prefix=enable_name_prefix,
                     timeout=timeout,
+                    speaker=speaker,
                 )
                 for c in calls
             ]
@@ -1608,6 +1620,7 @@ Args:
         event: AstrMessageEvent,
         agent_name: str,
         input: str,
+        speaker: str = None,
     ) -> str:
         """替代 transfer_to_* 工具的统一入口。调用单个子代理并将回复直接分段转发到用户。
 
@@ -1621,4 +1634,4 @@ Args:
     input (string): 传给子代理的完整问题或指令
 """
         calls = [{"agent_name": agent_name, "input": input}]
-        return await self.parallel_handoff(event, calls=calls)
+        return await self.parallel_handoff(event, calls=calls, speaker=speaker)
