@@ -1332,7 +1332,11 @@ Args:
                     self._last_agent[session_id] = r["agent_name"]
                     if self._is_direct_delivery(r.get("agent_name", ""), direct_agents, route_mode):
                         # 直发成功的回复尾部记入路由记忆（T2 剧情参照用）
-                        self._record_direct_reply(session_id, r["agent_name"], r.get("response", "") or "")
+                        self._record_direct_reply(
+                            session_id,
+                            r["agent_name"],
+                            r.get("_user_response") or r.get("response", "") or "",
+                        )
 
         success_count = sum(1 for r in results if r.get("success"))
         fail_count = len(results) - success_count
@@ -1372,6 +1376,7 @@ Args:
                         # 双段投递：用户端发【日常】，主代理收【技术】
                         _user_part, _tech_part = self._split_dual_output(r.get("response", ""))
                         r["_tech_response"] = _tech_part
+                        r["_user_response"] = _user_part
                         await self._forward_segmented(_user_part, event)
                         if agent_name not in [ra.get("agent_name") for ra in return_agent_results]:
                             return_agent_results.append(r)
@@ -1636,7 +1641,10 @@ Args:
     # both 双段输出的拆解：直发用户取【日常】，回传主代理取【技术】。
     # 兜底策略是「宁可重复，不可丢」——没写标记就两路都用全文，
     # 只写了一段就那一段兜两路。格式没写对不该导致内容消失。
-    _DUAL_USER_RE = re.compile(r"【日常】\s*(.*?)(?=【技术】|$)", re.S)
+    # 注意：user 组要连【日常】标记之前的内容一起收——子代理的名字前缀（【助手B】）
+    # 是 _maybe_prefix 加在整段回复最前面的，落在标记之外，只取标记之后会把前缀丢掉，
+    # 用户就不知道是谁在说话。
+    _DUAL_USER_RE = re.compile(r"^(.*?)【日常】\s*(.*?)(?=【技术】|$)", re.S)
     _DUAL_TECH_RE = re.compile(r"【技术】\s*(.*)$", re.S)
 
     def _split_dual_output(self, text: str) -> tuple:
@@ -1648,7 +1656,7 @@ Args:
         _mt = self._DUAL_TECH_RE.search(_t)
         if not (_mu or _mt):
             return _t, _t
-        _user = _mu.group(1).strip() if _mu else ""
+        _user = (_mu.group(1) + _mu.group(2)).strip() if _mu else ""
         _tech = _mt.group(1).strip() if _mt else ""
         return (_user or _t), (_tech or _t)
 
