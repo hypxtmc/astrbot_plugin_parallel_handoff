@@ -1172,7 +1172,6 @@ Args:
                     if r.get("success") and self._is_direct_delivery(r.get("agent_name", ""), direct_agents, route_mode):
                         # direct 代理：已流式转发，统一转发阶段跳过
                         r["_sent"] = True
-                        r["_directed"] = True  # 只标“真直发过”，与 _sent（还含失败通知）区分
                         await self._forward_segmented(r.get("response", ""), event)
                         # [2026-09-12 旁听窗] 流式路径补记录（原仅统一转发路径记录），
                         # 供主代理下一轮可见性注入
@@ -1352,15 +1351,16 @@ Args:
                 is_direct = self._is_direct_delivery(agent_name, direct_agents, route_mode)
 
                 # 接龙模式下该条已流式发送/通知，跳过避免重复
-                # both 模式例外：已成功直发的条目也要回传主代理（失败通知不在此列，故按 _directed 判）
+                # both 模式例外：已成功直发的条目也要回传主代理。
+                # 判据用 is_direct + success：_sent 的两个来源里只有“direct 且成功”那条满足，
+                # 失败通知只打 _sent，不会误收。（原先靠手动置位的 _directed 已删，它是冗余的）
                 if r.get("_sent"):
-                    if also_return and r.get("_directed") and r.get("success"):
+                    if also_return and is_direct and r.get("success"):
                         if agent_name not in [ra.get("agent_name") for ra in return_agent_results]:
                             return_agent_results.append(r)
                     continue
 
                 if r.get("success") and is_direct:
-                    r["_directed"] = True
                     await self._forward_segmented(r.get("response", ""), event)
                     # both：直发的同时完整回传，让主代理知道子代理说了什么
                     if also_return and agent_name not in [ra.get("agent_name") for ra in return_agent_results]:

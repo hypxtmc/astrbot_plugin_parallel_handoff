@@ -264,12 +264,18 @@ class DirectiveMixin:
             call_mode = str(mcfg.get("call_mode", "chained")).strip().lower()
             timeout = mcfg.get("timeout", 120)
             kind_label = "日常贴贴"
-            mode_label = (
-                f"route_mode={route_mode}（子代理回复直接分段转发用户端） + "
-                f"call_mode={call_mode}（串行接龙）"
-                if call_mode == "chained"
-                else f"route_mode={route_mode} + call_mode={call_mode}（timeout={timeout}s）"
-            )
+            if route_mode == "both":
+                mode_label = (
+                    f"route_mode=both（子代理回复直发用户端，同时完整回传主代理） + "
+                    f"call_mode={call_mode}（串行接龙）"
+                )
+            elif call_mode == "chained":
+                mode_label = (
+                    f"route_mode={route_mode}（子代理回复直接分段转发用户端） + "
+                    f"call_mode=chained（串行接龙）"
+                )
+            else:
+                mode_label = f"route_mode={route_mode} + call_mode={call_mode}（timeout={timeout}s）"
         else:
             route_mode = str(self._cfg("route_mode", "direct")).strip().lower()
             call_mode = str(self._cfg("call_mode", "parallel")).strip().lower()
@@ -349,10 +355,19 @@ class DirectiveMixin:
                 "必须在工具调用前留空、不输出任何主代理导语/转述/解释（如“我这就叫她”“她应你了”）"
                 "，直接发起工具调用，由子代理亲口对用户说话；切忌在子代理发言前让主代理插话。"
             )
-            lines.append(
-                "- 直发后禁言：parallel_handoff 完成子代理直发后，本轮主代理不得再输出任何"
-                "总结/转述/收尾文字（如“已传给她”“她在回你了”）——工具调用即本轮回复结束，"
-                f"无需画蛇添足；等{self._get_user_address()}需要时再开口。"
-            )
+            if route_mode == "both":
+                # both 下用户已看到子代理原文，不需要“禁言”，改成“只做增量”——
+                # 否则会与上面 both 支的“你照常可以说话”直接打架（两条互斥指令同框）。
+                lines.append(
+                    "- 直发后发言纪律：子代理原文用户已经看过，你照旧可以说话，但只做增量"
+                    "（决策、下一步、风险提示），不要复述子代理原话，"
+                    f"也不要说“已传给她”这类收尾话；等{self._get_user_address()}需要时再开口。"
+                )
+            else:
+                lines.append(
+                    "- 直发后禁言：parallel_handoff 完成子代理直发后，本轮主代理不得再输出任何"
+                    "总结/转述/收尾文字（如“已传给她”“她在回你了”）——工具调用即本轮回复结束，"
+                    f"无需画蛇添足；等{self._get_user_address()}需要时再开口。"
+                )
         lines.append("- 工具列表保持完整，禁止摘除或绕过任何工具")
         return "\n".join(lines)
