@@ -1511,6 +1511,35 @@ class RouterMixin:
         event.stop_event()
         return True
 
+    async def _shortcircuit_chain(
+        self, event, agents, message, *, label: str, record_hits: bool = False
+    ) -> bool:
+        """[2026-09-19 抽公共件] 多人接龙短路：调 parallel_handoff 后 stop_event。
+
+        原先 3 处内联写法同构（T0 命令锁在场组 / 多点名强呼叫 / T0.5 粘滞多人组），
+        差异只有：agent 列表、日志文案、是否写粘滞记忆。call_mode 原先一处随人数
+        切换、两处写死 chained，统一成按人数裁决（那两处已保证 len>=2，等价）。
+        """
+        calls = [{"agent_name": a, "input": message} for a in agents]
+        try:
+            await self.parallel_handoff(
+                event,
+                calls=calls,
+                call_mode="chained" if len(calls) > 1 else "direct",
+                route_mode="direct",
+                mode="affection",
+                speaker="顾主",
+            )
+        except Exception as e:
+            logger.error(
+                f"[parallel_handoff] SmartRouter: {label}调用失败 {e}; release to main"
+            )
+            return False
+        if record_hits:
+            self._record_route_hits(event, agents)
+        event.stop_event()
+        return True
+
     async def _smart_router_check(self, event: AstrMessageEvent) -> bool:
         """on_waiting_llm_request 钩子实现。命中返回 True 并已 stop_event。
 
@@ -1648,23 +1677,9 @@ class RouterMixin:
                 f"[parallel_handoff] SmartRouter: T0 命令强制锁在场组 {cmd_locked} → "
                 f"短路路由（对话提及他名不切换，治本）"
             )
-            calls = [{"agent_name": a, "input": message} for a in cmd_locked]
-            try:
-                await self.parallel_handoff(
-                    event,
-                    calls=calls,
-                    call_mode="chained" if len(calls) > 1 else "direct",
-                    route_mode="direct",
-                    mode="affection",
-                    speaker="顾主",
-                )
-            except Exception as e:
-                logger.error(
-                    f"[parallel_handoff] SmartRouter: T0 命令锁调用失败 {e}; release to main"
-                )
-                return False
-            event.stop_event()
-            return True
+            return await self._shortcircuit_chain(
+                event, cmd_locked, message, label="T0 命令锁"
+            )
         # [多点名强呼叫短路 2026-09-07 方案A] 一次明确点名多个子代理
         #（如「助手A，助手D，我们一起来玩」）→ 短路走 chained 接龙，
         # 主代理完全不下场（用户记忆#4：点几个名就几个延续、不插嘴）。
@@ -1675,25 +1690,10 @@ class RouterMixin:
                 f"[parallel_handoff] SmartRouter: 多点名强呼叫 {multi} → "
                 f"短路 chained 接龙（主代理不下场）"
             )
-            calls = [{"agent_name": a, "input": message} for a in multi]
-            try:
-                await self.parallel_handoff(
-                    event,
-                    calls=calls,
-                    call_mode="chained",
-                    route_mode="direct",
-                    mode="affection",
-                    speaker="顾主",
-                )
-            except Exception as e:
-                logger.error(
-                    f"[parallel_handoff] SmartRouter: 多点名接龙调用失败 {e}; release to main"
-                )
-                return False
             # [方案① 2026-09-07] 多人场次：把整组写入粘滞记忆，供后续无点名消息按组续接。
-            self._record_route_hits(event, multi)
-            event.stop_event()
-            return True
+            return await self._shortcircuit_chain(
+                event, multi, message, label="多点名接龙", record_hits=True
+            )
         # T1 点名 / 领域词
         route = self._t1_route(message)
         # [锁仲裁 2026-09-11 用户口径] 粘滞在册组存在时，T1 只有提名权、没有转移权：
@@ -1719,23 +1719,9 @@ class RouterMixin:
                     f"[parallel_handoff] SmartRouter: T0.5 粘滞多人组 {sticky} → "
                     f"短路 chained 接龙（多人场次续接，主代理不下场）"
                 )
-                calls = [{"agent_name": a, "input": message} for a in sticky]
-                try:
-                    await self.parallel_handoff(
-                        event,
-                        calls=calls,
-                        call_mode="chained",
-                        route_mode="direct",
-                        mode="affection",
-                        speaker="顾主",
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"[parallel_handoff] SmartRouter: 粘滞多人接龙调用失败 {e}; release to main"
-                    )
-                    return False
-                event.stop_event()
-                return True
+                return await self._shortcircuit_chain(
+                    event, sticky, message, label="粘滞多人接龙"
+                )
             route = sticky if isinstance(sticky, str) else None
             conf = 1.0 if route else 0.0
             source = "T0.5"
