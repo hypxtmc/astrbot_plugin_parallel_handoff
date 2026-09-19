@@ -558,8 +558,7 @@ class RouterMixin:
             return "📍 没锁着谁，消息自动分派\n（指定：/名字 · 名单：/列表）"
 
         if cmd == "reset":
-            if getattr(self, "_cmd_lock", None):
-                self._cmd_lock.pop(event.unified_msg_origin, None)
+            self._drop_cmd_lock(event)
             self._clear_main_lock(event)
             last, _ = self._route_mem()
             last.pop(event.unified_msg_origin, None)
@@ -825,6 +824,16 @@ class RouterMixin:
             self._route_reply = {}     # session -> (agent_id, ts, reply_tail)
         return self._route_last, self._route_msgs
 
+    def _drop_cmd_lock(self, event):
+        """[2026-09-19 抽公共件] 清掉该会话的命令锁，不动其他会话。
+
+        原先 6 处内联写法完全一致（getattr 守卫 + pop(unified_msg_origin)）：
+        smart 端 reset / 换人命令 / 含主代理命令，busy 端同款，以及 _clear_main_lock
+        里的互斥清理。抽成单点后守卫逻辑只有一份，防漏改。
+        """
+        if getattr(self, "_cmd_lock", None):
+            self._cmd_lock.pop(event.unified_msg_origin, None)
+
     def _record_cmd_lock(self, event, agents):
         """[T0 命令式强制锁定 2026-09-08 用户指定] 记录会话级命令锁定在场者组。
 
@@ -900,8 +909,7 @@ class RouterMixin:
         lock[event.unified_msg_origin] = time.time()
         _save_main_lock_file(lock)   # [持久化 2026-09-12] 建锁即时落盘，热重载/重启不丢
         # 与子代理锁互斥：清掉旧的子代理命令锁 / 粘滞锁
-        if getattr(self, "_cmd_lock", None):
-            self._cmd_lock.pop(event.unified_msg_origin, None)
+        self._drop_cmd_lock(event)
         last, _ = self._route_mem()
         last.pop(event.unified_msg_origin, None)
 
@@ -1346,8 +1354,7 @@ class RouterMixin:
             # [审查修复 2026-09-12] 仅覆盖当前会话旧命令锁（原为全局重置，
             # 多会话场景会抹掉其他会话的锁）；换人命令同时解除主代理锁
             # （对齐 docstring「新命令（/子代理名）能解除」——否则残锁换人换不出去）。
-            if getattr(self, "_cmd_lock", None):
-                self._cmd_lock.pop(event.unified_msg_origin, None)
+            self._drop_cmd_lock(event)
             self._record_cmd_lock(event, cmd_agents)
             self._clear_main_lock(event)
             await self._send_admin_reply(event, "lock_agents")
@@ -1355,8 +1362,7 @@ class RouterMixin:
             return True
         # 含主代理的命令（busy 时主代理在场优先；纯主代理建锁+回执短路，20:57 强化）
         if cmd_main:
-            if getattr(self, "_cmd_lock", None):
-                self._cmd_lock.pop(event.unified_msg_origin, None)
+            self._drop_cmd_lock(event)
             if cmd_agents:
                 # [审查修复 2026-09-12] 含子代理：不维持主代理锁（与 smart 端对称）
                 self._clear_main_lock(event)
@@ -1581,8 +1587,7 @@ class RouterMixin:
                 )
                 # 写命令强制锁（覆盖该会话旧命令锁，不动其他会话——审查修复 2026-09-12）
                 # → 此后 messages 按锁组强制路由
-                if getattr(self, "_cmd_lock", None):
-                    self._cmd_lock.pop(event.unified_msg_origin, None)
+                self._drop_cmd_lock(event)
                 self._record_cmd_lock(event, cmd_agents)
                 # [审查修复] 换人命令即解除主代理锁（对齐 docstring 语义）
                 self._clear_main_lock(event)
@@ -1592,8 +1597,7 @@ class RouterMixin:
             # 含主代理（/主代理 或 /主代理+助手A）：主代理在场。
             #   - agents 空 → 纯主代理：建立主代理锁（会话直通主代理）
             #   - agents 非空 → 主代理调度子代理，放行主代理 + 暂存判向目标
-            if getattr(self, "_cmd_lock", None):
-                self._cmd_lock.pop(event.unified_msg_origin, None)
+            self._drop_cmd_lock(event)
             if cmd_agents:
                 # 含子代理：不建主代理锁（子代理优先），主代理本轮可 relay 调度
                 self._clear_main_lock(event)
