@@ -99,11 +99,11 @@ class ParallelHandoffPlugin(
     _metrics_mod.MetricsMixin,
     Star,
 ):
-    """并行子代理调用插件"""
+    """让子代理同时开口、接龙干活、互相来往——主代理执棒，多声部并行。"""
 
     @filter.on_llm_response()
     async def metrics_on_llm_response(self, event, response):
-        """主代理侧 token 计量（子代理走 tool_loop_agent，不触发本事件）"""
+        """主代理侧的 token 计量。子代理走 tool_loop_agent，不触发这里。"""
         await self.on_llm_response_metrics(event, response)
 
     # agent_name -> 中文显示名 映射表
@@ -158,15 +158,11 @@ class ParallelHandoffPlugin(
             self._task_runner = None
 
     async def _on_task_done(self, rec) -> None:
-        """后台任务终态 → 主动往会话推一条（P1 · 2026-09-18）。
-
-        设计里写的是「她做完再来找我」，但在此之前 _run 跑完只写 rec.result，
-        没有任何回调——主代理不主动取，这条链路就断在那儿，用户也看不到。
-        这个回调就是那缺失的一半：她跑完自己冒泡，主代理可以继续陪用户说话。
+        """后台任务跑完，主动往会话推一条，不用主代理去取。
 
         - 默认开启，`subagent_task_notify=false` 可关（多任务时怕刷屏）
         - 结果截断 300 字，全文仍用 `task_result` 取
-        - 任何异常都吞掉：通知失败不能影响任务终态
+        - 异常一律吞掉：通知失败不该影响任务终态
         """
         try:
             if not self._cfg("subagent_task_notify", True):
@@ -205,26 +201,22 @@ class ParallelHandoffPlugin(
     # ── 事件注册：主代理前缀自动注入（实现见 forward.py ForwardMixin） ──
     @filter.on_decorating_result()
     async def _inject_mainagent_prefix(self, event: AstrMessageEvent):
-        """在主代理消息发出前自动加【名字】前缀
+        """主代理消息发出前自动加【名字】前缀。
 
-        通过 on_decorating_result 钩子拦截所有即将发送的消息，
-        当 enable_mainagent_name_prefix=true 且消息不以任何子代理前缀开头时，
-        自动在消息正文前加 "【主代理名】\n" 前缀。
-        子代理分段转发期间此钩子被抑制，避免误加。
+        仅当 enable_mainagent_name_prefix=true 且消息不以任何子代理前缀开头时加。
+        子代理分段转发期间抑制，避免误加。
         """
         return await super()._inject_mainagent_prefix(event)
 
     # ── 事件注册：路由强制指令注入（实现见 directive.py DirectiveMixin） ──
     @filter.on_llm_request()
     async def _route_directive_inject(self, event: AstrMessageEvent, req: ProviderRequest):
-        """按配置向主代理 LLM 请求注入路由强制指令（软注入，不拦截）。
+        """往主代理请求尾部注入路由强制指令（软注入，不拦截）。
 
-        触发点：仅主代理请求经过 OnLLMRequestEvent（子代理走 llm_generate 不触发）。
-        作用：把 route_mode / call_mode / direct_delivery_agents 算出的路由路径规范
-        追加到 req.extra_user_content_parts（请求尾部，livingmemory 同款），主代理必须照走；
-        不修改 req.func_tool（工具全保留）。系统提示与历史消息为请求前缀，完全不动，
-        故不破坏 DeepSeek 前缀缓存命中率；mark_as_temp 置 _no_save，不写入对话历史。
-        已含标记则跳过，避免 agent 循环多轮重复注入。
+        把 route_mode / call_mode / direct_delivery_agents 算出的路径规范追加到
+        extra_user_content_parts，主代理照走。系统提示与历史不动，不破坏前缀缓存；
+        不碰 func_tool，工具全保留；已含标记则跳过，避免循环重复注入。
+        子代理走 llm_generate，不触发本事件。
         """
         # [2026-09-04 用户拍板] 拉用户接回旁路：主代理链路零侵入检测用户私聊回复，
         # 命中则注入旁轨日志 + 异步触发接茬（不 stop_event、不拦截，主代理照常回复用户）。
@@ -237,33 +229,29 @@ class ParallelHandoffPlugin(
     # ── 事件注册：小模型路由层（T1规则/T2小模型/T3兜底，实现见 router.py RouterMixin） ──
     @filter.on_waiting_llm_request()
     async def _smart_router_check(self, event: AstrMessageEvent):
-        """小模型路由层：主代理 LLM 调用前最早停点判向。
+        """小模型路由层：主代理 LLM 调用前的最早停点。
 
-        命中（点名/领域词或小模型高置信）→ 子代理直发 + event.stop_event()，
-        主代理流程整体短路，省掉主模型推理与记忆召回；未命中原样放行主代理。
-        总开关 enable_smart_router 默认关，显式开启才生效。
+        命中（点名/领域词或小模型高置信）→ 子代理直发并短路主代理，省掉主模型
+        推理与记忆召回；未命中原样放行。总开关 enable_smart_router 默认关。
         """
         return await super()._smart_router_check(event)
 
     # ── 事件注册：忙碌旁路（主代理干活时 T1 点名直达，实现见 router.py RouterMixin） ──
     @filter.custom_filter(_router_mod.BusyRunnerFilter)
     async def _busy_direct_bypass(self, event: AstrMessageEvent):
-        """[Busy Bypass 2026-08-31] 消息入口旁路：主代理正在干活（活跃 runner）时，
-        点名子代理的消息直接直发子代理，绕过 follow-up 捕获。
+        """主代理干活时的消息旁路：点名子代理的消息直发，绕过 follow-up 捕获。
 
-        filter 仅在该 UMO 有活跃 agent runner 时通过（主代理工具链执行中），
-        通过后本 handler 在 star_request_sub_stage 执行（先于 agent_sub_stage 的
-        follow-up 捕获）→ T1 命中 → call_subagent 直发 + stop_event；
-        未命中放行（消息照常进 follow-up 给主代理）。
+        filter 只在该会话有活跃 runner 时通过，且在 follow-up 捕获之前执行；
+        命中则直发 + stop_event，未命中放行。
         """
         return await super()._busy_bypass_check(event)
 
 
     # ── 生命周期：旁路模块定时任务（实现见 side_pulse.py FamilyPulseMixin） ──
     async def initialize(self):
-        """插件加载/热重载时注册旁路模块 cron（幂等：先清同名遗留再注册）。
+        """加载/热重载时注册旁路模块 cron（幂等，先清同名遗留）。
 
-        开关 enable_side_pulse 默认 False——关闭时零注册、零行为变化。
+        enable_side_pulse 默认 False，关闭时零注册、零行为变化。
         """
         if self._cfg("enable_side_pulse", False):
             try:
@@ -272,7 +260,7 @@ class ParallelHandoffPlugin(
                 logger.error(f"[parallel_handoff] 旁路模块注册失败: {e}")
 
     async def terminate(self):
-        """卸载/重载时拆掉旁路模块定时任务，不留垃圾（biliread 同款）。"""
+        """卸载/重载时拆掉旁路模块定时任务，不留垃圾。"""
         try:
             await self.teardown_pulse_jobs()
         except Exception:  # noqa: BLE001
@@ -281,7 +269,7 @@ class ParallelHandoffPlugin(
     # ── 热重载（插件入口命令，完整实现保留本模块） ────────────
     @filter.regex(r"^(热重载一下并行子代理调用插件|热重载并行插件|重载插件|reload_parallel)$")
     async def reload_plugin(self, event: AstrMessageEvent):
-        """热重载本插件：在QQ发送"热重载并行插件"等短语即可重新加载,无需wake_prefix"""
+        """发「热重载并行插件」等短语即可重载本插件，无需 wake_prefix。"""
         star_manager = getattr(self.context, "_star_manager", None)
         if star_manager is None:
             yield event.plain_result("❌ 重载失败：无法获取插件管理器")
@@ -313,23 +301,15 @@ class ParallelHandoffPlugin(
     # ── 事件注册：动态前缀切换（实现见 config.py ConfigMixin） ──
     @filter.regex(r"(?:关掉|打开)（(.+?)）的前缀|（(.+?)）的前缀(?:关|开)了")
     async def toggle_prefix(self, event: AstrMessageEvent):
-        """动态切换子代理名前缀开关
-
-        匹配模式：
-        - "关掉（子代理名）的前缀" -> 设为 false
-        - "打开（子代理名）的前缀" -> 设为 true
-        - "（子代理名）的前缀关了" -> 设为 false
-        - "（子代理名）的前缀开了" -> 设为 true
-        """
+        """开关某个子代理的名字前缀。例：「关掉（助手A）的前缀」。"""
         return await super().toggle_prefix(event)
 
     # ── 事件注册：唤即看（用户私聊回看旁轨日志，实现见 side_pulse.py FamilyPulseMixin） ──
     @filter.regex(r"^(看看家里|看家里|家里今天|家里动静|看看她们聊了啥|看看大家)")
     async def pulse_peek(self, event: AstrMessageEvent):
-        """用户私聊发「看看家里」→ 回看旁轨日志原文（今天/昨天/前天）。
+        """私聊发「看看家里」→ 回看旁轨日志原文（今天/昨天/前天）。
 
-        仅用户私聊响应：命中 stop_event 并推送日志；其他会话/他人消息
-        内部判定后放行，不影响正常对话流程。
+        只认用户私聊；其他会话或他人消息内部放行，不影响正常对话。
         """
         return await super()._pulse_peek(event)
 
@@ -347,82 +327,61 @@ class ParallelHandoffPlugin(
         background: bool = False,
         speaker: str = None,
     ) -> str:
-        """并行调用多个子代理（如 agent_a、agent_b、agent_c 等）,
-同时获取它们的回复并汇总。
+        """派活给子代理，把它们的回复收回来汇总。
 
-使用场景：当需要多个子代理从不同角度回答同一个问题时使用此工具。
-例如同时询问 agent_a 和 agent_b 对某件事的看法。
+一次可以派多个——要几个角度看同一件事，或者任务能拆开并行，就一次派出去。
 
 Args:
-    calls(array[object]): 子代理调用列表。每个元素必须包含：
-        - agent_name(string): 子代理名称,可选值: 助手A, 助手B 等（需在 name_display_map 中配置）
-        - input(string): 传给该子代理的问题/指令。**推荐按任务卡块写**：
-              【任务】要解决什么
-              【靶点】已给的定位线索（文件路径/符号/行号）
-              【判断】你当前的判断——**待验证命题，不是事实**
-              【依据】判断凭什么（线索来源，可能本身就有漏洞）
-              【产出】【边界】【完成标准】
-            为什么【判断】必须写：只在任务卡里**明说你的假设**，子代理才有东西可反驳。
-            实测教训（2026-09-12）：写"我认为 X 没实现"→ 她查出其实早已实现（prune 就在
-            session_store.py L179-200），拦住了一次重复造轮子；写"实现 X"→ 她照做，
-            错的那部分直接落进交付物。子代理系统提示里已写死"判断校验"职责，
-            她会主动证伪——但前提是你给了靶子。
-        - order(integer, 可选): 输出时的排序序号,越小越靠前
-    timeout(number): 单个子代理的超时秒数,默认120秒（用户设定，永久生效）。超过此时间未返回则跳过该子代理。
-    message(string): 当开启消息消歧且不传calls时,传入原始消息文本,工具会自动路由到最近对话的子代理。
-    mode(string): 模式可选设置，'tech'或'affection'。传 'tech' 用技术干活模式配置（tech_mode_config，默认 relay+parallel 主代理统帅收卷）；传 'affection' 用日常贴贴模式配置（affection_mode_config，默认 direct+chained 直发）。不传则回落全局 route_mode/call_mode 配置。用户配置永远优先（2026-08-31 用户指定）：mode 命中时以模式配置为准，显式传参不覆盖。
-    route_mode(string): 路由模式覆盖，'direct'或'relay'；不传用模式/配置默认。技术干活任务传"relay"使子代理回复返回主代理汇总；日常贴贴不传走默认直发。
-    call_mode(string): 调用模式覆盖，'parallel'或'chained'；不传用模式/配置默认。技术干活传"parallel"并行调度；流水线任务传"chained"接龙。
-    background(boolean): 是否后台执行（二期，默认 false）。true 时立即返回 task_id 不阻塞——主代理可以继续和用户对话，子代理做完再用 task_result 取结果；适合耗时长或需要真并行的任务。false 时等子代理全部做完再返回，与原行为完全一致。
-    speaker(string): 可选。说话者身份标注，让子代理知道本条消息是谁在说。不传默认"主代理"（主代理调度，可能转述顾主原话）；转述顾主原话时可传"主代理转述顾主原话"。顾主点名的短路路由由插件自动标注"顾主"，无需关心。
+    calls(array[object]): 派单列表，每项含 agent_name（要在 name_display_map 里配过）、
+        input（交给它的任务）、order（可选，输出排序）。
+        任务按块写：【任务】要解决什么 / 【靶点】定位线索 / 【判断】你当前的判断
+        ——待验证的命题，不是事实 / 【依据】判断凭什么 / 【产出】【边界】【完成标准】。
+        【判断】一定要写，把假设明说出来她才有东西可反驳。
+    timeout(number): 单个子代理的超时秒数，默认 120，超了跳过。
+    message(string): 开了消息消歧又不想传 calls 时，直接给原始消息。
+    mode(string): 'tech' 技术干活 / 'affection' 日常贴贴，不传按全局配置。
+    route_mode(string): 'relay' 先回到我这儿汇总再发 / 'direct' 直发。
+    call_mode(string): 'parallel' 并行 / 'chained' 接龙。
+    background(boolean): true 时不阻塞，立刻返回 task_id，做完用 task_result 取。
+    speaker(string): 这话谁说的，不传默认"主代理"。
 
-【派单纪律（L2 协议，2026-09-12 立）】
-1. **带判断**：任务卡必写【判断】+【依据】，不写纯指令——只给指令她会照做，
-   判断错了没人拦得住。**你压缩掉的往往正是她能挑出错的地方。**
-2. **角色偏审查**：执行你自己也能做（你有全局视野，还更准）；
-   **独立视角只有她有**——优先派"校验/复核/找盲区/证伪"，其次才是"实现"。
-3. **同批交同一人**：EXP2 实测集中派单快 3.43 倍、省 61%（摊薄启动成本）。
-4. **产出默认可疑**：她交回来的是**线索**不是**结论**，验收时先问
-   "这东西和已有实现重不重复"——防"往代码库塞第二个轮子"。
-"""
+派单纪律：带判断，优先派校验而不是实现，同批交同一人，产出默认可疑。
+        """
         return await super().parallel_handoff(event, calls, timeout, message, route_mode, call_mode, mode, background, speaker=speaker or "主代理")
 
     # ── LLM 工具注册：task_status / task_result / task_stop（二期后台任务） ──
     @llm_tool(name="task_status")
     async def task_status(self, event: AstrMessageEvent, task_id: str = None) -> str:
-        """查后台任务状态（二期）。不阻塞，立即返回。
+        """查后台任务跑到哪了。不阻塞。
 
-使用场景：派了后台任务之后，想知道它跑完没有。
-**丢了 task_id 也能查**——不传 task_id 时返回本会话的 active + recent（含已完成的，带结果预览）。
+不传 task_id 就列本会话的活跃任务加最近 10 条（含已结束的）。
 
 Args:
-    task_id (string): 任务 ID，不传则列出本会话活跃任务 + 最近 10 条（含已结束）
-"""
+    task_id (string): 任务 ID，可不传
+        """
         return await super().task_status(event, task_id)
 
     @llm_tool(name="task_result")
     async def task_result(
         self, event: AstrMessageEvent, task_id: str, timeout: int = 60
     ) -> str:
-        """取后台任务的结果（二期）。
-
-使用场景：派了后台任务后，等它跑完拿结果。已经跑完的直接返回，不再等待。
+        """取后台任务的结果。跑完了直接返回，没跑完就等。
 
 Args:
-    task_id (string): 任务 ID（由 parallel_handoff 的 background=true 返回）
-    timeout (number): 最多等多少秒，默认 60。超时则返回当前进度，不报错
-"""
+    task_id (string): parallel_handoff 用 background=true 时返回的那个
+    timeout (number): 最多等多少秒，默认 60。超时返回当前进度，不报错
+        """
         return await super().task_result(event, task_id, timeout)
 
     @llm_tool(name="task_stop")
     async def task_stop(self, event: AstrMessageEvent, task_id: str) -> str:
-        """取消一个后台任务（二期）。
+        """叫停一个后台任务。
 
-使用场景：派出去的任务发现没必要了、或者要叫停某个跑偏的子代理。
+派出去发现没必要了，或者哪个子代理跑偏了。
 
 Args:
-    task_id (string): 要取消的任务 ID
-"""
+    task_id (string): 要停的任务 ID
+        """
         return await super().task_stop(event, task_id)
 
     # ── LLM 工具注册：call_subagent（实现见 dispatch.py DispatchMixin） ──
@@ -434,15 +393,12 @@ Args:
         input: str,
         speaker: str = None,
     ) -> str:
-        """替代 transfer_to_* 工具的统一入口。调用单个子代理并将回复直接分段转发到用户。
+        """调一个子代理，回复直接分段发到用户——不走我转述。
 
-使用场景：
-- 用户明确要求与某子代理对话（如「agent_b，设备改造的事交给你了」）
-- 用户提到子代理名字后说正事
-- 相比 transfer_to_* 工具，本工具确保回复直接发到用户而不用主代理转述
+用户点名要找谁、或者提到某个名字后说正事，用这个。
 
 Args:
-    agent_name (string): 子代理名称。支持英文 id（如 agent_a、agent_b）和中文名（以 name_display_map 配置为准），大小写不敏感
-    input (string): 传给子代理的完整问题或指令
-"""
+    agent_name (string): 子代理名，英文 id 或中文名都认（以 name_display_map 为准）
+    input (string): 传给它的完整问题或指令
+        """
         return await super().call_subagent(event, agent_name, input, speaker=speaker or "主代理")
