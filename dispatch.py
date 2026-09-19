@@ -1078,6 +1078,8 @@ Args:
         except Exception as _arb_tool_e:
             logger.warning(f"[read_air] arbitrate_tool observe skipped (non-fatal): {_arb_tool_e}")
         t_total = time.perf_counter()
+        # [2026-09-19] _sess 提到分支外：并行模式也要用（跨轮脉络注入/缓存）
+        _sess = event.unified_msg_origin
         if call_mode == "chained":
             # ── 接龙模式：串行调用，前一个子代理的回复注入下一个的输入 ──
             # 注：direct/relay 均为发送方式，与接龙的调用方式正交，互不冲突。
@@ -1089,7 +1091,6 @@ Args:
             # 本轮若与上轮在场者有交集（续接场景），把上轮脉络注入首发者 input，
             # 让她知道「上一轮谁说了什么、谁还在场」——否则首发者只凭自己记忆召回，
             # 会把不在场的人叫进来（实测：误拉其他角色进场、在场者被晾）。
-            _sess = event.unified_msg_origin
             _prev_note = self._build_prev_round_note(
                 _sess, [c.get("agent_name") for c in calls]
             )
@@ -1200,37 +1201,9 @@ Args:
             # ── 接龙结束：本场脉络写入会话级缓存（跨轮续接用）────────
             # 2026-09-08 用户实测：多代理同场续接第二轮时首发者失忆，
             # 误拉其他角色进场、在场者被晾——根因是 chained 全场脉络是单次调用局部变量。
-            # 这里把「在场者组+每人发言」按 session 存下来，下一轮 chained 续接时
-            # 注入给首发者（_build_prev_round_note），让她记得上一轮谁说过什么。
-            try:
-                _round_ctx = getattr(self, "_chain_round_ctx", None)
-                if _round_ctx is None:
-                    _round_ctx = self._chain_round_ctx = {}
-                _round_ctx[_sess] = {
-                    "ts": time.time(),
-                    "agents": [
-                        r.get("agent_name")
-                        for r in results
-                        if r.get("success") and r.get("agent_name")
-                    ],
-                    "speeches": [
-                        {
-                            "agent": r.get("agent_name"),
-                            "display": self._display_name(r.get("agent_name", "")),
-                            "text": (r.get("response", "") or "")[:600],
-                        }
-                        for r in results
-                        if r.get("success") and r.get("response")
-                    ],
-                }
-                logger.info(
-                    f"[parallel_handoff] 跨轮脉络缓存 OK session={_sess} "
-                    f"agents={_round_ctx[_sess]['agents']}"
-                )
-            except Exception as _ctx_e:
-                logger.warning(
-                    f"[parallel_handoff] 跨轮脉络缓存写入失败（非致命）: {_ctx_e}"
-                )
+            # 2026-09-19：逻辑抽到 _save_chain_round_ctx，并行模式共用同一份缓存，
+            # 使「并行→并行」「并行→接龙」两种续接也能看到上一场谁说了什么。
+            self._save_chain_round_ctx(_sess, results)
             # 接龙模式保持调用顺序发送，不按 order 重排（order 仅对并行模式生效）
         elif background and getattr(self, "_task_runner", None) is not None:
             # ── 二期：后台并行（不阻塞主代理）─────────────────
@@ -1273,6 +1246,43 @@ Args:
             )
         else:
             # ── 并行模式（默认）──
+            # ── 跨轮脉络注入（2026-09-19：并行模式也吃上）──────────
+            # 用户拍板（2026-09-19）：并行模式下子代理各跑各的、互不知情，
+            # 要像「同一间办公室」——上一轮谁说过什么、谁还在场，注入给本轮每个调用。
+            # 复用 chained 的 _build_prev_round_note（自带 5min 窗口 + 名单交集校验），
+            # 无上轮缓存/名单无交集时返回空串，零注入零开销。
+            try:
+                _prev_note = self._build_prev_round_note(
+                    _sess, [c.get("agent_name") for c in calls]
+                )
+                if _prev_note:
+                    for _c in calls:
+                        _c["input"] = _prev_note + (_c.get("input") or "")
+                    logger.info(
+                        f"[parallel_handoff] 并行跨轮脉络注入 "
+                        f"{len(calls)} 个调用 session={_sess}"
+                    )
+            except Exception as _pn_e:
+                logger.warning(
+                    f"[parallel_handoff] 并行跨轮脉络注入失败（非致命）: {_pn_e}"
+                )
+            # ── 同场实况注入（2026-09-19：此刻谁在后台干活）──────────
+            # 与跨轮脉络互补：脉络是「上一轮谁说了什么」，实况是「此刻谁在干什么」。
+            # 数据源 TaskRunner.tasks，仅在确实有活跃/刚完成任务时返回非空，
+            # 没别人在跑就零注入零 token 开销。
+            try:
+                _live_note = self._build_live_status_note(_sess)
+                if _live_note:
+                    for _c in calls:
+                        _c["input"] = _live_note + (_c.get("input") or "")
+                    logger.info(
+                        f"[parallel_handoff] 同场实况注入 "
+                        f"{len(calls)} 个调用 session={_sess}"
+                    )
+            except Exception as _ls_e:
+                logger.warning(
+                    f"[parallel_handoff] 同场实况注入失败（非致命）: {_ls_e}"
+                )
             tasks = [
                 self._call_one(
                     c,
@@ -1295,6 +1305,10 @@ Args:
                         r.get("order") if r.get("order") is not None else 999999
                     )
                 )
+            # ── 并行结束：本场脉络写入会话级缓存（跨轮续接用）────────
+            # [2026-09-19] 与 chained 共用同一份缓存与写入逻辑，
+            # 使「并行 → 并行」「并行 → 接龙」两种续接都能看到上一场谁说了什么。
+            self._save_chain_round_ctx(_sess, results)
         total_latency_ms = int((time.perf_counter() - t_total) * 1000)
 
         # ── 跟踪最近调用的子代理（用于消歧） ─────────────────
@@ -1592,6 +1606,64 @@ Args:
         "**你退回一个错误的判断，比多干十步活更值钱**。\n"
     )
 
+    def _build_live_status_note(self, session_key: str) -> str:
+        """构造「同场实况」注入块：此刻谁在后台干活、跑了多久、谁刚跑完。
+
+        [2026-09-19 用户拍板·需求 b] 并行模式下子代理同时起跑、互不知情，
+        要像「同一间办公室」——她知道我还在卡着，我知道她已经查完了。
+        与「跨轮脉络」（上一轮谁说了什么）互补：本方法是「此刻谁在干什么」。
+
+        数据源：TaskRunner.tasks（按 session_key 过滤），无需改 task_runner.py。
+        仅在存在活跃任务（pending/running）或近期完成时返回非空——没别人在跑
+        就不注，零注入零 token 开销。
+
+        注入块以 _strip_chain_injection 可识别的 marker 包裹，用完即烧，
+        不污染子代理长期记忆（memory.py markers 需同步）。
+        """
+        runner = getattr(self, "_task_runner", None)
+        if runner is None:
+            return ""
+        try:
+            running: list[str] = []
+            finished: list[str] = []
+            now = time.time()
+            for rec in getattr(runner, "tasks", {}).values():
+                if getattr(rec, "session_key", "") != session_key:
+                    continue
+                st = getattr(rec, "status", "")
+                agent_name = getattr(rec, "agent", "") or ""
+                label = getattr(rec, "label", "") or "任务"
+                if st in ("pending", "running"):
+                    base = getattr(rec, "started_at", None) or getattr(
+                        rec, "created_at", now
+                    )
+                    elapsed = max(0, int(now - base))
+                    running.append(
+                        f"【{self._display_name(agent_name)}】正在处理「{label}」，"
+                        f"已 {elapsed} 秒"
+                    )
+                elif st == "done":
+                    base = getattr(rec, "created_at", now)
+                    el = round((getattr(rec, "finished_at", None) or now) - base, 1)
+                    finished.append(
+                        f"【{self._display_name(agent_name)}】已完成「{label}」，"
+                        f"用时 {el} 秒"
+                    )
+            if not running and not finished:
+                return ""
+            lines = ["（同场实况·后台任务）："]
+            lines.extend(running)
+            lines.extend(finished)
+            # 结尾行：必须存在，供 _strip_chain_injection 定位注入块终点。
+            # 缺失会导致「截到注入起点为止」把后面的用户真实提问一并吞掉。
+            lines.append("（以上为同场实况，仅供你了解同事情形，不必复述）")
+            return "\n".join(lines)
+        except Exception as _ls_e:
+            logger.warning(
+                f"[parallel_handoff] 同场实况构造失败（非致命）: {_ls_e}"
+            )
+            return ""
+
     def _build_prev_round_note(self, session_id: str, cur_agents: list) -> str:
         """上一轮 chained 结束后，为新一轮续接构造「上一场脉络」注入块。
 
@@ -1622,6 +1694,48 @@ Args:
             lines.append(f"【{sp.get('display', sp.get('agent', ''))}】{sp.get('text', '')}")
         lines.append("顺着上一场的话茬自然往下：")
         return "\n".join(lines)
+
+    def _save_chain_round_ctx(self, session_id: str, results: list) -> None:
+        """把本场「在场者组 + 每人发言」按 session 写进会话级缓存（跨轮续接用）。
+
+        [2026-09-19] 从 chained 分支抽出，并行模式共用同一份缓存与写入逻辑，
+        使「并行→并行」「并行→接龙」两种续接也能看到上一场谁说了什么。
+
+        背景：多代理同场续接第二轮时首发者失忆，误拉其他角色进场、在场者被晾，
+        根因是全场脉络是单次调用局部变量。
+
+        读取方：_build_prev_round_note（自带 5min 时间窗 + 本轮名单交集校验，
+        避免串场污染）。写入失败仅告警，不影响回复。
+        """
+        try:
+            _round_ctx = getattr(self, "_chain_round_ctx", None)
+            if _round_ctx is None:
+                _round_ctx = self._chain_round_ctx = {}
+            _round_ctx[session_id] = {
+                "ts": time.time(),
+                "agents": [
+                    r.get("agent_name")
+                    for r in results
+                    if r.get("success") and r.get("agent_name")
+                ],
+                "speeches": [
+                    {
+                        "agent": r.get("agent_name"),
+                        "display": self._display_name(r.get("agent_name", "")),
+                        "text": (r.get("response", "") or "")[:600],
+                    }
+                    for r in results
+                    if r.get("success") and r.get("response")
+                ],
+            }
+            logger.info(
+                f"[parallel_handoff] 跨轮脉络缓存 OK session={session_id} "
+                f"agents={_round_ctx[session_id]['agents']}"
+            )
+        except Exception as _ctx_e:
+            logger.warning(
+                f"[parallel_handoff] 跨轮脉络缓存写入失败（非致命）: {_ctx_e}"
+            )
 
     # ── 统一单代理路由实现（装饰器 @llm_tool 在 main.py 壳方法上） ──
     async def call_subagent(
