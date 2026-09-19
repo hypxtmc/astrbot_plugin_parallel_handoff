@@ -246,12 +246,18 @@ class DirectiveMixin:
             call_mode = str(mcfg.get("call_mode", "parallel")).strip().lower()
             timeout = mcfg.get("timeout", 120)
             kind_label = "技术干活"
-            mode_label = (
-                f"route_mode={route_mode}（子代理回复返回主代理汇总） + "
-                f"call_mode={call_mode}（并行调度，主代理当统帅收卷）"
-                if route_mode == "relay"
-                else f"route_mode={route_mode} + call_mode={call_mode}（timeout={timeout}s）"
-            )
+            if route_mode == "relay":
+                mode_label = (
+                    f"route_mode=relay（子代理回复返回主代理汇总） + "
+                    f"call_mode={call_mode}（并行调度，主代理当统帅收卷）"
+                )
+            elif route_mode == "both":
+                mode_label = (
+                    f"route_mode=both（子代理回复直发用户端，同时完整回传主代理） + "
+                    f"call_mode={call_mode}（并行调度，主代理当统帅收卷）"
+                )
+            else:
+                mode_label = f"route_mode={route_mode} + call_mode={call_mode}（timeout={timeout}s）"
         elif task_kind == "affection":
             mcfg = self._get_mode_config("affection")
             route_mode = str(mcfg.get("route_mode", "direct")).strip().lower()
@@ -311,6 +317,10 @@ class DirectiveMixin:
 
         if route_mode == "relay":
             lines.append("- 路由模式 relay：非黑名单子代理回复返回主代理，由主代理把关后转述，不直接发用户端")
+        elif route_mode == "both":
+            lines.append(f"- 路由模式 both（双投递）：以下子代理回复直接分段转发用户端，同时完整回传主代理：{name_str}")
+            lines.append("- 用户已看到子代理原文。你照常可以说话，但只做增量（决策、下一步、风险提示），不要复述子代理原话")
+            lines.append("- 其余非黑名单子代理走 relay：回复返回主代理，由主代理把关后转述")
         else:
             lines.append(f"- 路由模式 direct：以下子代理回复直接分段转发用户端，不经主代理转述：{name_str}")
             lines.append("- 其余非黑名单子代理走 relay：回复返回主代理，由主代理把关后转述")

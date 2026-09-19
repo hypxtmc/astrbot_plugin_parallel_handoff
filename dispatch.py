@@ -1054,6 +1054,12 @@ Args:
 
         call_mode = (call_mode or self._cfg("call_mode", "parallel")).strip().lower()
         route_mode = (route_mode or self._cfg("route_mode", "direct")).strip().lower()
+        # both = 双投递：子代理回复既直发用户端，也完整回传主代理。
+        # 对既有投递逻辑而言它就是 direct；额外那份回传由 also_return 单独控制，
+        # 不动 _is_direct_delivery 的语义——那判定被三处复用（流式直发/统一转发/旁听窗记录）。
+        also_return = route_mode == "both"
+        if also_return:
+            route_mode = "direct"
 
         # ── 读取直接发送名单（提前定义，供接龙流式转发使用） ────
         direct_agents_str = self._cfg("direct_delivery_agents", "")
@@ -1166,6 +1172,7 @@ Args:
                     if r.get("success") and self._is_direct_delivery(r.get("agent_name", ""), direct_agents, route_mode):
                         # direct 代理：已流式转发，统一转发阶段跳过
                         r["_sent"] = True
+                        r["_directed"] = True  # 只标“真直发过”，与 _sent（还含失败通知）区分
                         await self._forward_segmented(r.get("response", ""), event)
                         # [2026-09-12 旁听窗] 流式路径补记录（原仅统一转发路径记录），
                         # 供主代理下一轮可见性注入
@@ -1345,11 +1352,19 @@ Args:
                 is_direct = self._is_direct_delivery(agent_name, direct_agents, route_mode)
 
                 # 接龙模式下该条已流式发送/通知，跳过避免重复
+                # both 模式例外：已成功直发的条目也要回传主代理（失败通知不在此列，故按 _directed 判）
                 if r.get("_sent"):
+                    if also_return and r.get("_directed") and r.get("success"):
+                        if agent_name not in [ra.get("agent_name") for ra in return_agent_results]:
+                            return_agent_results.append(r)
                     continue
 
                 if r.get("success") and is_direct:
+                    r["_directed"] = True
                     await self._forward_segmented(r.get("response", ""), event)
+                    # both：直发的同时完整回传，让主代理知道子代理说了什么
+                    if also_return and agent_name not in [ra.get("agent_name") for ra in return_agent_results]:
+                        return_agent_results.append(r)
                 elif r.get("success"):
                     # 非直接发送代理 — 收集完整回复返回给主代理
                     if agent_name not in [ra.get("agent_name") for ra in return_agent_results]:
@@ -1358,16 +1373,27 @@ Args:
                     await self._send_failure_notify(r, event)
 
             # ── 构建返回摘要 ─────────────────────────────────
+            # both 下已回传全文的条目，results 里只留一句指路，避免同一份回复占两份上下文
+            _returned_names = (
+                {ra.get("agent_name") for ra in return_agent_results} if also_return else set()
+            )
             summary = {
                 "segmented_forward": True,
-                "note": "各子代理回复已分条直接发送给用户,以下为摘要",
+                "note": (
+                    "各子代理回复已分条直接发送给用户，以下为摘要。"
+                    "带 returned_agents 的条目，完整回复也已回传给你；用户看过原文，你只做增量，不要复述。"
+                    if also_return
+                    else "各子代理回复已分条直接发送给用户,以下为摘要"
+                ),
                 "results": [
                     {
                         "agent_name": r.get("agent_name"),
                         "success": r.get("success"),
                         "latency_ms": r.get("latency_ms"),
                         "response_preview": (
-                            (r.get("response", "") or "")[:_preview_chars]
+                            "（全文已回传，见 returned_agents）"
+                            if r.get("agent_name") in _returned_names
+                            else (r.get("response", "") or "")[:_preview_chars]
                             + (
                                 "…"
                                 if len(r.get("response", "") or "") > _preview_chars
@@ -1391,8 +1417,10 @@ Args:
             # 如有非直接发送代理的完整回复，附加到摘要中
             if return_agent_results:
                 summary["note"] = (
-                    "以下子代理的回复已直接发送给用户。"
-                    "以下子代理的完整回复返回给主代理处理。"
+                    "以下子代理的完整回复已回传给你。both 模式下用户也看到了原文，"
+                    "你只做增量（决策/下一步/风险），不要复述。"
+                    if also_return
+                    else "以下子代理的完整回复返回给主代理处理。"
                 )
                 summary["returned_agents"] = [
                     {

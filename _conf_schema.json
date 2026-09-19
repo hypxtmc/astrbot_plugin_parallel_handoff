@@ -15,7 +15,7 @@
         "description": "子代理路由模式",
         "type": "string",
         "default": "direct",
-        "hint": "direct=用call_subagent路由，子代理回复直接发用户端不中转；relay=用transfer_to_*路由，子代理回复返回主代理转发。强制直连黑名单（handoff_blacklist_agents）中的子代理不受本配置影响，永远走 transfer_to_* 直连。WebUI切换后直接生效，无需重启。"
+        "hint": "direct=用call_subagent路由，子代理回复直接发用户端不中转；relay=用transfer_to_*路由，子代理回复返回主代理转发；both=双投递，子代理回复既直发用户端、也把完整回复回传主代理——用户能看见子代理对主代理说了什么，主代理照常可以说话，但只做增量不复述原文。强制直连黑名单（handoff_blacklist_agents）中的子代理不受本配置影响，永远走 transfer_to_* 直连。WebUI切换后直接生效，无需重启。"
     },
     "call_mode": {
         "description": "子代理调用模式",
