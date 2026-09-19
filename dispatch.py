@@ -489,11 +489,13 @@ class DispatchMixin:
         success_count: int,
         fail_count: int,
         total_latency_ms: int,
+        enable_segmented_forward: bool = True,
     ) -> str:
         """分段转发投递 + 构建返回摘要（2026-09-19 从 parallel_handoff 提出，纯搬移）。
 
         返回值即调用方要 return 的字符串（pending_text 或摘要 JSON）。
         """
+        _preview_chars = int(self._cfg("subagent_response_preview_chars", 4000))
         if enable_segmented_forward:
             self._suppress_mainagent_prefix = True
             self._suppress_mainagent_ts = time.time()
@@ -648,6 +650,7 @@ class DispatchMixin:
             return await self._emit_results(
                 results, event, direct_agents, route_mode, also_return,
                 return_agent_results, success_count, fail_count, total_latency_ms,
+                enable_segmented_forward=enable_segmented_forward,
             )
 
         # ── 默认：合并返回 ───────────────────────────────────
