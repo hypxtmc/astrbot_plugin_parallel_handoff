@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import time
 
 # 2026-09-16 00:26 假绿防护：运行时类方法换血指纹
@@ -479,6 +480,7 @@ class DispatchMixin:
         enable_name_prefix: bool,
         timeout: int,
         speaker: str = None,
+        dual_output: bool = False,
     ) -> dict:
         """调用单个子代理，带超时和错误隔离。
 
@@ -701,7 +703,7 @@ class DispatchMixin:
             )
             # [PROF-PROMPT 2026-09-12] 请求体分解打点（一次性实验，完事即撤）
             try:
-                _sys_p = self._subagent_system_prompt(handoff, agent_name)
+                _sys_p = self._subagent_system_prompt(handoff, agent_name, dual_output=dual_output)
                 _ctx_chars = sum(len(m.content or "") for m in (_ctx_contexts or []))
                 _tl = getattr(subagent_tools, "tools", None) or subagent_tools or []
                 _tools_chars = 0
@@ -726,7 +728,7 @@ class DispatchMixin:
                 )
             except Exception as _pe:  # 打点绝不拖垮主链
                 logger.warning(f"[PROF-PROMPT] 打点失败: {_pe}")
-                _sys_p = self._subagent_system_prompt(handoff, agent_name)
+                _sys_p = self._subagent_system_prompt(handoff, agent_name, dual_output=dual_output)
             _m_t0_sub = time.monotonic()
             llm_resp = await asyncio.wait_for(
                 self.context.tool_loop_agent(
@@ -1165,10 +1167,13 @@ Args:
                     enable_name_prefix=enable_name_prefix,
                     timeout=timeout,
                     speaker=speaker,
+                    dual_output=also_return,
                 )
                 results.append(r)
                 # ── 流式转发：本条立刻发出，不等整条链 ──
-                if enable_segmented_forward:
+                # both 模式禁用流式：双段要等全文出来才能拆【日常】/【技术】，
+                # 边生成边发会把两段标记一起发出去。
+                if enable_segmented_forward and not also_return:
                     if r.get("success") and self._is_direct_delivery(r.get("agent_name", ""), direct_agents, route_mode):
                         # direct 代理：已流式转发，统一转发阶段跳过
                         r["_sent"] = True
@@ -1233,6 +1238,7 @@ Args:
                         enable_name_prefix=enable_name_prefix,
                         timeout=timeout,
                         speaker=speaker,
+                        dual_output=also_return,
                     )),
                 )
                 submitted.append(
@@ -1299,6 +1305,7 @@ Args:
                     enable_name_prefix=enable_name_prefix,
                     timeout=timeout,
                     speaker=speaker,
+                    dual_output=also_return,
                 )
                 for c in calls
             ]
@@ -1361,10 +1368,15 @@ Args:
                     continue
 
                 if r.get("success") and is_direct:
-                    await self._forward_segmented(r.get("response", ""), event)
-                    # both：直发的同时完整回传，让主代理知道子代理说了什么
-                    if also_return and agent_name not in [ra.get("agent_name") for ra in return_agent_results]:
-                        return_agent_results.append(r)
+                    if also_return:
+                        # 双段投递：用户端发【日常】，主代理收【技术】
+                        _user_part, _tech_part = self._split_dual_output(r.get("response", ""))
+                        r["_tech_response"] = _tech_part
+                        await self._forward_segmented(_user_part, event)
+                        if agent_name not in [ra.get("agent_name") for ra in return_agent_results]:
+                            return_agent_results.append(r)
+                    else:
+                        await self._forward_segmented(r.get("response", ""), event)
                 elif r.get("success"):
                     # 非直接发送代理 — 收集完整回复返回给主代理
                     if agent_name not in [ra.get("agent_name") for ra in return_agent_results]:
@@ -1417,7 +1429,7 @@ Args:
             # 如有非直接发送代理的完整回复，附加到摘要中
             if return_agent_results:
                 summary["note"] = (
-                    "以下子代理的完整回复已回传给你。both 模式下用户也看到了原文，"
+                    "以下子代理回传给你的是【技术】段（用户端看到的是【日常】段，两段分开写）。"
                     "你只做增量（决策/下一步/风险），不要复述。"
                     if also_return
                     else "以下子代理的完整回复返回给主代理处理。"
@@ -1427,7 +1439,7 @@ Args:
                         "agent_name": ra.get("agent_name"),
                         "success": True,
                         "latency_ms": ra.get("latency_ms"),
-                        "full_response": ra.get("response", ""),
+                        "full_response": ra.get("_tech_response") or ra.get("response", ""),
                     }
                     for ra in return_agent_results
                 ]
@@ -1580,7 +1592,28 @@ Args:
         "⑥ 主代理还需要你的判断时，只加一行「判断：……」，不展开论证。\n"
     )
 
-    def _subagent_system_prompt(self, handoff, agent_name: str = "") -> str:
+    # ── 双段输出（both 模式专用）────────────────────
+    # 场景：route_mode=both 时子代理回复分两路投递——【日常】直发用户，【技术】回传主代理。
+    # 动机：输出纪律要求「结论 + 证据、每条一到两行」是为了压延迟（实测 500 token 6.7s
+    #      vs 500-1200 token 18.6s），可这套格式直发给用户观感很差——会被空行与句末标点
+    #      切成十几条技术短句。所以让她分开写：给用户那段用她自己的口吻。
+    _SUBAGENT_DUAL_OUTPUT = (
+        "\n\n【本次回复分两路投递】\n"
+        "你的这条回复会被拆成两段分别送出去，请按下面格式写：\n"
+        "【日常】\n"
+        "（写给用户看的那段。用你自己的口吻，就像平时聊天——不要出现文件名、行号、"
+        "函数名、token、commit 这类技术词，不要用「结论 + 证据」那套格式，也别分点。"
+        "一到三句，说人话。）\n"
+        "【技术】\n"
+        "（写给主代理看的那段。按原有输出纪律：结论 + 证据（文件:行），每条一到两行，"
+        "压掉叙述。）\n"
+        "两段都要写。用户只看得到【日常】那段，主代理只看得到【技术】那段，"
+        "别把该说的只写在一段里。"
+    )
+
+    def _subagent_system_prompt(
+        self, handoff, agent_name: str = "", dual_output: bool = False
+    ) -> str:
         """子代理系统提示 = 人格指令 + 关系档案 + 检索纪律 + 任务卡解读。
 
         [2026-09-13] 关系档案（家庭关系/近况）从 extra_user_content 迁移到 system 稳定层：
@@ -1597,7 +1630,27 @@ Args:
             + self._SUBAGENT_RETRIEVAL_DISCIPLINE
             + self._SUBAGENT_TASKCARD_GUIDE
             + self._SUBAGENT_OUTPUT_DISCIPLINE   # 2026-09-15：放最末，最靠近对话，注意力最强
+            + (self._SUBAGENT_DUAL_OUTPUT if dual_output else "")
         )
+
+    # both 双段输出的拆解：直发用户取【日常】，回传主代理取【技术】。
+    # 兜底策略是「宁可重复，不可丢」——没写标记就两路都用全文，
+    # 只写了一段就那一段兜两路。格式没写对不该导致内容消失。
+    _DUAL_USER_RE = re.compile(r"【日常】\s*(.*?)(?=【技术】|$)", re.S)
+    _DUAL_TECH_RE = re.compile(r"【技术】\s*(.*)$", re.S)
+
+    def _split_dual_output(self, text: str) -> tuple:
+        """把双段输出拆成 (日常段, 技术段)。缺标记时返回 (全文, 全文)。"""
+        _t = (text or "").strip()
+        if not _t:
+            return "", ""
+        _mu = self._DUAL_USER_RE.search(_t)
+        _mt = self._DUAL_TECH_RE.search(_t)
+        if not (_mu or _mt):
+            return _t, _t
+        _user = _mu.group(1).strip() if _mu else ""
+        _tech = _mt.group(1).strip() if _mt else ""
+        return (_user or _t), (_tech or _t)
 
     # ── 任务卡解读（2026-09-11 用户拍板）──────────────────────────
     # 目的：把「派单格式」变成双方共识——下发侧按块写，接收侧按块读。
