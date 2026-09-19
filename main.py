@@ -41,7 +41,6 @@ try:
     from . import task_runner as _task_runner_mod
     from . import router as _router_mod
     from . import arbitrate as _arbitrate_mod
-    from . import side_pulse as _side_pulse_mod
     from . import metrics as _metrics_mod
 except ImportError:
     import config as _config_mod
@@ -55,7 +54,6 @@ except ImportError:
     import task_runner as _task_runner_mod
     import router as _router_mod
     import arbitrate as _arbitrate_mod
-    import side_pulse as _side_pulse_mod
     import metrics as _metrics_mod
 
 
@@ -95,7 +93,6 @@ class ParallelHandoffPlugin(
     _config_mod.ConfigMixin,
     _router_mod.RouterMixin,
     _arbitrate_mod.ArbitrationMixin,
-    _side_pulse_mod.FamilyPulseMixin,
     _metrics_mod.MetricsMixin,
     Star,
 ):
@@ -218,12 +215,6 @@ class ParallelHandoffPlugin(
         不碰 func_tool，工具全保留；已含标记则跳过，避免循环重复注入。
         子代理走 llm_generate，不触发本事件。
         """
-        # [2026-09-04 用户拍板] 拉用户接回旁路：主代理链路零侵入检测用户私聊回复，
-        # 命中则注入旁轨日志 + 异步触发接茬（不 stop_event、不拦截，主代理照常回复用户）。
-        try:
-            self._pulse_draft_reply_check(event)
-        except Exception:  # noqa: BLE001
-            pass
         return await super()._route_directive_inject(event, req)
 
     # ── 事件注册：小模型路由层（T1规则/T2小模型/T3兜底，实现见 router.py RouterMixin） ──
@@ -245,26 +236,6 @@ class ParallelHandoffPlugin(
         命中则直发 + stop_event，未命中放行。
         """
         return await super()._busy_bypass_check(event)
-
-
-    # ── 生命周期：旁路模块定时任务（实现见 side_pulse.py FamilyPulseMixin） ──
-    async def initialize(self):
-        """加载/热重载时注册旁路模块 cron（幂等，先清同名遗留）。
-
-        enable_side_pulse 默认 False，关闭时零注册、零行为变化。
-        """
-        if self._cfg("enable_side_pulse", False):
-            try:
-                await self.setup_pulse_jobs()
-            except Exception as e:  # noqa: BLE001
-                logger.error(f"[parallel_handoff] 旁路模块注册失败: {e}")
-
-    async def terminate(self):
-        """卸载/重载时拆掉旁路模块定时任务，不留垃圾。"""
-        try:
-            await self.teardown_pulse_jobs()
-        except Exception:  # noqa: BLE001
-            pass
 
     # ── 热重载（插件入口命令，完整实现保留本模块） ────────────
     @filter.regex(r"^(热重载一下并行子代理调用插件|热重载并行插件|重载插件|reload_parallel)$")
@@ -290,8 +261,8 @@ class ParallelHandoffPlugin(
             except Exception as e:
                 logger.error(f"[parallel_handoff] 热重载异常: {e}")
 
-        # [审查修复 2026-09-12] create_task 弱引用语义：不留强引用会被 GC；
-        # 对齐 side_pulse 修例（set + done_callback）。
+        # [审查修复 2026-09-12] create_task 弱引用语义：不留强引用会被 GC
+        # （set + done_callback）。
         if not hasattr(self, "_reload_tasks"):
             self._reload_tasks = set()
         _rt = asyncio.create_task(_delayed_reload())
@@ -303,15 +274,6 @@ class ParallelHandoffPlugin(
     async def toggle_prefix(self, event: AstrMessageEvent):
         """开关某个子代理的名字前缀。例：「关掉（助手A）的前缀」。"""
         return await super().toggle_prefix(event)
-
-    # ── 事件注册：唤即看（用户私聊回看旁轨日志，实现见 side_pulse.py FamilyPulseMixin） ──
-    @filter.regex(r"^(看看家里|看家里|家里今天|家里动静|看看她们聊了啥|看看大家)")
-    async def pulse_peek(self, event: AstrMessageEvent):
-        """私聊发「看看家里」→ 回看旁轨日志原文（今天/昨天/前天）。
-
-        只认用户私聊；其他会话或他人消息内部放行，不影响正常对话。
-        """
-        return await super()._pulse_peek(event)
 
     # ── LLM 工具注册：parallel_handoff（实现见 dispatch.py DispatchMixin） ──
     @llm_tool(name="parallel_handoff")

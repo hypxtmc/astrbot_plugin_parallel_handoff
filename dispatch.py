@@ -152,7 +152,7 @@ class DispatchMixin:
         try:
             # [审查修复 2026-09-12] 原为硬编码部署根绝对路径（非本机部署必失效）；
             # 改为相对解析：插件目录向上三级到 AstrBot 根，再进 data/relationships
-            # （与 side_pulse._pulse_affinity_path 同款，支持 _relationship_root 覆盖）。
+            # （支持 _relationship_root 覆盖）。
             _root = getattr(self, "_relationship_root", None)
             _rel_path = os.path.join(
                 _root

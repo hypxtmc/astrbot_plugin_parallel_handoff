@@ -10,8 +10,7 @@
 
 ## 设计（复用插件内既有模式，不另起炉灶）
 
-插件的 `side_pulse.py` 已经有一套成熟的 append-only JSONL 落盘 + 容错读回
-（`_pulse_append` / `_pulse_read_day`）。本模块沿用同一套路子：
+本模块用 append-only JSONL 落盘 + 容错读回的路子：
 
 - **append-only JSONL**：一行一条，只追加不重写
 - **原子写**：临时文件 + `os.replace`，避免半截文件

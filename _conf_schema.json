@@ -1,506 +1,380 @@
 {
-    "user_address": {
-        "description": "主对话者称呼（系统文本用）",
-        "type": "string",
-        "default": "用户",
-        "hint": "多人共享记录（如「▍称呼：」）、记忆沉淀模板等系统生成文本中，对主对话者的称呼。子代理在对话里怎么称呼用户（如「主人」「宝宝」）由各子代理自身人格设定决定，与该项无关。"
-    },
-    "main_agent_name": {
-        "description": "主代理显示名",
-        "type": "string",
-        "default": "主代理",
-        "hint": "启用主代理姓名前缀时使用的中文显示名。"
-    },
-    "route_mode": {
-        "description": "子代理路由模式",
-        "type": "string",
-        "default": "direct",
-        "hint": "direct=用call_subagent路由，子代理回复直接发用户端不中转；relay=用transfer_to_*路由，子代理回复返回主代理转发；both=双投递，子代理回复既直发用户端、也把完整回复回传主代理——用户能看见子代理对主代理说了什么，主代理照常可以说话，但只做增量不复述原文。强制直连黑名单（handoff_blacklist_agents）中的子代理不受本配置影响，永远走 transfer_to_* 直连。WebUI切换后直接生效，无需重启。"
-    },
-    "call_mode": {
-        "description": "子代理调用模式",
-        "type": "string",
-        "default": "parallel",
-        "hint": "parallel=并行调用所有子代理（快，各说各话）；chained=接龙式串行调用（慢，前一个子代理的回复自动传给下一个作为上下文，剧情连贯）。direct/relay 路由模式不受影响，接龙时两者均正常工作。"
-    },
-    "tech_mode_config": {
-        "description": "技术干活模式调度配置（JSON）",
-        "type": "string",
-        "default": "{\"route_mode\": \"relay\", \"call_mode\": \"parallel\", \"timeout\": 120}",
-        "hint": "自定义技术模式调度方式，JSON格式：{\"route_mode\": \"relay|direct\", \"call_mode\": \"parallel|chained\", \"timeout\": 秒数}。route_mode=relay 子代理回复返回主代理汇总（统帅收卷），direct 直接发用户端；call_mode=parallel 并行调度，chained 接龙串行。配置永远优先：mode命中时此配置无条件覆盖模型显式传参。改动即时生效。"
-    },
-    "affection_mode_config": {
-        "description": "日常贴贴模式调度配置（JSON）",
-        "type": "string",
-        "default": "{\"route_mode\": \"direct\", \"call_mode\": \"chained\", \"timeout\": 120}",
-        "hint": "自定义日常贴贴模式调度方式，JSON格式：{\"route_mode\": \"relay|direct\", \"call_mode\": \"parallel|chained\", \"timeout\": 秒数}。route_mode=direct 子代理回复直接分段转发用户端（主代理隐身），relay 返回主代理；call_mode=chained 接龙串行，parallel 并行。配置永远优先：mode命中时此配置无条件覆盖模型显式传参。改动即时生效。"
-    },
-    "enable_subagent_name_prefix": {
-        "description": "子代理消息启用姓名前缀",
-        "type": "bool",
-        "default": true,
-        "hint": "并行回复时每个子代理结果前加【名字】前缀，方便区分发言人。替代旧配置项 enable_name_prefix。"
-    },
-    "enable_mainagent_name_prefix": {
-        "description": "主代理消息启用姓名前缀",
-        "type": "bool",
-        "default": false,
-        "hint": "主代理（调用本工具的一方）回复消息时是否通过 on_decorating_result 钩子自动加【名字】前缀。"
-    },
-    "enable_mainagent_segmented": {
-        "description": "主代理启用分段转发",
-        "type": "bool",
-        "default": false,
-        "hint": "开启后主代理自身回复按空行拆分，逐条单独发送。关闭则整个回复作为一条消息发送。子代理分段转发由 enable_segmented_forward 独立控制。"
-    },
-    "enable_segmented_forward": {
-        "description": "启用分段转发",
-        "type": "bool",
-        "default": true,
-        "hint": "子代理回复按括号/换行拆分后逐条发送，提升阅读体验。关闭则合并为一条 JSON 返回。"
-    },
-    "min_fragment_length": {
-        "description": "最小分段长度（字符）",
-        "type": "int",
-        "default": 5,
-        "hint": "括号内动作描写短于此长度时，会合并到下一段对话，避免零碎输出。"
-    },
-    "fragment_interval": {
-        "description": "分段发送间隔（秒）",
-        "type": "float",
-        "default": 0.3,
-        "hint": "分段转发模式下，每条片段之间的发送间隔。建议 0.2-0.5 秒，避免触发平台风控。"
-    },
-    "allow_mainagent_after_direct": {
-        "description": "子代理直发后允许主代理发言",
-        "type": "bool",
-        "default": true,
-        "hint": "direct 分段转发子代理回复后，若主代理生成了实质台词则加【名字】前缀放行；false 时恢复旧行为（无条件清空主代理输出）。关闭可防重复，开启可让主代理下场说话。"
-    },
-    "forbid_pre_tool_mainagent_talk": {
-        "description": "子代理直发前禁止主代理抢先发言",
-        "type": "bool",
-        "default": true,
-        "hint": "开启后，路由子代理时主代理必须在调用 parallel_handoff 工具前留空、不输出任何导语/转述/解释（如“我这就叫她”“她应你了”），直接发起工具调用让子代理亲口说话。与 allow_mainagent_after_direct（管直发后）互补，管住直发前。"
-    },
-    "mainagent_disable_md_split": {
-        "description": "主代理禁用 Markdown 智能分段",
-        "type": "bool",
-        "default": false,
-        "hint": "开启后主代理长文永远走整条渲染，不做按块拆分。默认关。"
-    },
-    "mainagent_md_split_max_chars": {
-        "description": "主代理分段最大字符数",
-        "type": "int",
-        "default": 900,
-        "hint": "主代理 Markdown 智能分段的单段字符预算，超过才拆。默认 900。"
-    },
-    "mainagent_md_split_progress": {
-        "description": "主代理分段带进度标识",
-        "type": "bool",
-        "default": false,
-        "hint": "开启后分段消息带（1/3）之类的进度标识（旧行为）。默认关。"
-    },
-    "name_display_map": {
-        "description": "子代理显示名映射",
-        "type": "string",
-        "default": "{}",
-        "hint": "留空即可：自动使用内置显示名。仅当需要自定义显示名时才填，JSON 格式：{\"agent_a\": \"自定义名\"}"
-    },
-    "name_prefix_overrides": {
-        "description": "子代理前缀覆盖表（JSON格式）",
-        "type": "string",
-        "default": "{}",
-        "hint": "留空即可：所有子代理统一走全局开关（enable_subagent_name_prefix），自动显示【内置中文名】前缀。只有当个别子代理需要特殊开关时才填，JSON格式：{\"agent_a\": false}。添加新子代理后无需在此配置"
-    },
-    "direct_delivery_agents": {
-        "description": "直接发送到用户的子代理列表",
-        "type": "string",
-        "default": "",
-        "hint": "逗号分隔的子代理名。列表中的子代理回复会直接分段发送到用户。不在列表中的非黑名单子代理回复会返回给主代理处理。强制直连黑名单（handoff_blacklist_agents）中的子代理不受此配置影响，永远走 transfer_to_* 直连。"
-    },
-    "handoff_blacklist_agents": {
-        "description": "强制直连子代理黑名单（transfer_to_* 直连，不走并行插件中转）",
-        "type": "string",
-        "default": "tech,技术Agent",
-        "hint": "逗号分隔的子代理名。列出的子代理（如 tech/技术Agent）永远不走 parallel_handoff 插件的 relay 中转，必须由主代理直接调用 transfer_to_xxx 工具直连；parallel_handoff / call_subagent 调用这些代理会被拦截并提示改用 transfer_to_*。"
-    },
-    "enable_route_directive": {
-        "description": "启用路由强制指令注入（OnLLMRequestEvent 钩子）",
-        "type": "bool",
-        "default": true,
-        "hint": "开启后插件在每次主代理 LLM 请求时，按 route_mode/call_mode/direct_delivery_agents 自动生成路由路径规范注入 extra_user_content_parts，主代理必须照走；工具全保留不摘除。关闭则纯靠主代理自觉。"
-    },
-    "subagent_visibility_inject": {
-        "description": "子代理直发「旁听窗」注入",
-        "type": "bool",
-        "default": true,
-        "hint": "开启后，子代理直发回复（如某个子代理对你说的话）会以「旁听窗」形式附给主代理下一次请求——主代理能看到她说了什么并自然承接（「她说还在看呢，你别急」），实现三方自然对话。10分钟窗口+同条去重。关闭=恢复旧行为。"
-    },
-    "directive_inject_mode": {
-        "description": "路由指令注入模式",
-        "type": "string",
-        "default": "smart",
-        "hint": "smart=智能按需（默认）：仅当消息疑似路由意图（点名子代理/领域词/会话承接）才注入完整指令，日常闲聊与技术任务零注入，省 token 不污染上下文；always=每轮都注入（旧行为）。"
-    },
-    "enable_smart_router": {
-        "description": "小模型路由层总开关",
-        "type": "bool",
-        "default": false,
-        "hint": "开启后消息进入主代理 LLM 前先用 T1规则/T2小模型判向，命中子代理直发并短路主代理。默认关，开启后观察路由命中与误伤。"
-    },
-    "enable_disambiguation": {
-        "description": "启用消息消歧（无指名自动路由）",
-        "type": "bool",
-        "default": true,
-        "hint": "开启后：没有指名子代理的消息，自动路由给上一次回复过你的那位子代理（会话级连续对话）。默认开。"
-    },
-    "router_provider_id": {
-        "description": "T2路由小模型 Provider ID",
-        "type": "string",
-        "default": "dmxapi/glm-4-flash",
-        "hint": "用于判向的小模型，必须是 AstrBot 中已配置的 provider id。免费 glm-4-flash 即可，勿用主模型。"
-    },
-    "router_confidence_threshold": {
-        "description": "T2小模型路由置信度阈值",
-        "type": "float",
-        "default": 0.8,
-        "hint": ">= 该值才直连子代理，低于则落回主代理。阈值越高越保守（宁可多过主代理），推荐 0.8。"
-    },
-    "router_timeout": {
-        "description": "T2路由判向超时（秒）",
-        "type": "float",
-        "default": 5,
-        "hint": "小模型判向超时直接放行主代理，不影响体验。"
-    },
-    "subagent_reply_timeout": {
-        "description": "子代理回复最大等待超时（秒）",
-        "type": "int",
-        "default": 120,
-        "hint": "单个子代理回复的最大允许等待秒数（工具参数 timeout 不传时的默认上限）。按需配置、无硬上限（常用 300~1800）。注意：后台任务路径另受 subagent_task_turn_timeout 看门狗管控，建议两边同步。"
-    },
-    "subagent_tool_call_timeout": {
-        "description": "子代理单次工具调用超时（秒）",
-        "type": "int",
-        "default": 45,
-        "hint": "单步工具执行的等待上限。官方默认 120，需低于总超时才有意义。"
-    },
-    "metrics_enabled": {
-        "description": "子代理效率实验 · token 计量开关",
-        "type": "bool",
-        "default": false,
-        "hint": "开启后每次 LLM 调用落一行 JSONL，用于测通信税。默认关；本地长期验收在配置里显式开。"
-    },
-    "metrics_path": {
-        "description": "token 计量落盘路径（留空 = 插件 data/metrics.jsonl）",
-        "type": "string",
-        "default": "",
-        "hint": "本地长期验收填 <插件数据目录>/experiments/subagent_efficiency/metrics.jsonl"
-    },
-    "subagent_max_steps": {
-        "description": "子代理工具循环最大步数",
-        "type": "int",
-        "default": 10,
-        "hint": "子代理单次任务内最多执行几轮工具调用。官方默认 30，过高容易在 120 秒总超时内跑不完。实测 8 步对「4 问 / 3 文件」的检索刚好卡边界，提到 10 留出余量。"
-    },
-    "subagent_response_preview_chars": {
-        "description": "返回主代理的子代理回复预览长度（字符）",
-        "type": "int",
-        "default": 4000,
-        "hint": "分段转发模式下子代理回复直发用户，返回给主代理的是预览。原为硬编码 120 字（2026-09-11 提到 800）。[2026-09-12 深夜] 用户反馈 800 不够、正经交付物（如审查口述 2279 字）被生硬截断，默认提到 4000；截断时 preview 尾部加 … 标识，配 response_chars / response_truncated 字段被吞多少一眼可见。"
-    },
-    "qq_md_plainify": {
-        "description": "子代理消息 markdown 降级（纯文本平台友好）",
-        "type": "bool",
-        "default": true,
-        "hint": "开启后，子代理直发消息里 **加粗**、`代码`、### 标题等 markdown 符号会降级为纯文本（◆/·/去标记），QQ 等不吃 markdown 的平台观感更干净。发支持 md 的平台可关。"
-    },
-    "subagent_tools": {
-        "description": "子代理工具白名单（逗号分隔，留空用默认读写档 37 项）",
-        "type": "string",
-        "default": "",
-        "hint": "默认集含文件读写（safe_edit/safe_write/multi_edit/file_patch/file_preview/safe_rollback/file_remove/file_move/file_zip/file_unzip/config_diff/symbol_rename）、门禁（syntax_check/lint_runner/test_runner）、本地 git（status/diff/log/commit/branch/remote/changelog）、读工具与原 read 集。高风险工具（shell_exec / astrbot_execute_shell / hot_reload_plugin / git_push / gh_*）刻意不在默认集，需单独授权后写进本项。"
-    },
-    "subagent_readonly_tools": {
-        "description": "【旧键·兼容保留】子代理工具白名单，已被 subagent_tools 取代",
-        "type": "string",
-        "default": "",
-        "hint": "优先读 subagent_tools；本键仅在 subagent_tools 为空时生效，留空回落内置默认（读写档）。"
-    },
-    "subagent_context_enabled": {
-        "description": "启用跨轮对话上下文",
-        "type": "bool",
-        "default": true,
-        "hint": "开启后子代理会记住本轮 session 内的对话历史（tech/技术Agent 始终不启用）。关闭则每次调用都是独立的新对话。"
-    },
-    "subagent_context_max_turns": {
-        "description": "最大历史轮数",
-        "type": "int",
-        "default": 100,
-        "hint": "对话历史超过此轮数后会触发压缩（LLM 摘要 + 保留最近 N 轮完整对话）。每轮 = 一对 user+assistant 消息。"
-    },
-    "subagent_session_persist": {
-        "description": "会话落盘（跨重启保留子代理对话历史）",
-        "type": "bool",
-        "default": true,
-        "hint": "开启后子代理的对话历史写入磁盘，主代理重启后历史仍在——这是子代理从『临时工』变成『常驻同事』的关键。关闭则回落纯内存（与改造前行为完全一致），重启即失忆。落盘失败自动降级并记日志，绝不阻断对话。"
-    },
-    "subagent_prefetch_enabled": {
-        "description": "子代理预取线索（派单时本地 rg 打定位锚点）",
-        "type": "bool",
-        "default": true,
-        "hint": "开启后，派单那一刻用本地 ripgrep 把任务文本里点名的实体（绝对路径 / 文件名 / 代码标识符）先定位一遍，把「文件:行」锚点随 extra 一并注入子代理，让她开局直接精读、省掉开局盲搜（实测每步约 7.4 秒）。纯本地检索、232ms 量级、不调 LLM、不砍任何原有注入；rg 不可用或无命中时静默跳过，绝不阻断派单。关闭则子代理完全靠自己的检索直觉。"
-    },
-    "subagent_session_retention_days": {
-        "description": "会话历史保留天数",
-        "type": "int",
-        "default": 30,
-        "hint": "超过此天数的会话文件会被清理（清理是手动的，本参数只定阈值）。注意：内存窗口 subagent_context_max_turns 截断的是内存，磁盘保留全量——所以把窗口调小不会永久丢历史。"
-    },
-    "subagent_task_max_concurrent": {
-        "description": "后台任务全局并发上限",
-        "type": "int",
-        "default": 20,
-        "hint": "二期后台任务（parallel_handoff 传 background=true 时生效）：同时运行的任务数上限，超过则拒绝新任务并返回错误（不排队）。"
-    },
-    "subagent_task_max_per_session": {
-        "description": "后台任务单会话并发上限",
-        "type": "int",
-        "default": 5,
-        "hint": "二期后台任务：同一个会话最多同时跑几个任务，防止单个会话把全局额度吃光。"
-    },
-    "subagent_task_turn_timeout": {
-        "description": "后台任务单任务超时（秒）",
-        "type": "int",
-        "default": 900,
-        "hint": "二期后台任务：看门狗。单个任务超过此时长会被强杀并标记为 interrupted，避免卡死的任务永远占着并发额度。建议与 subagent_reply_timeout 同步设置（后台路径的实际上限）。"
-    },
-    "recall_enabled": {
-        "description": "子代理长期记忆开关",
-        "type": "bool",
-        "default": true,
-        "hint": "开启后子代理可召回/存储长期记忆（主代理记忆参数不受影响，独立设置）"
-    },
-    "recall_default_k": {
-        "description": "子代理默认记忆召回条数",
-        "type": "int",
-        "default": 5,
-        "hint": "子代理调用记忆召回时的默认条数，可低于主代理（如设3）"
-    },
-    "recall_max_k": {
-        "description": "子代理记忆召回条数上限",
-        "type": "int",
-        "default": 10,
-        "hint": "召回条数的硬上限，防止一次注入过多记忆"
-    },
-    "exclude_agents": {
-        "description": "子代理记忆排除名单（逗号分隔）",
-        "type": "string",
-        "default": "tech,技术Agent",
-        "hint": "列出的子代理不启用长期记忆，逗号分隔"
-    },
-    "enable_scene_inject": {
-        "description": "启用场景注入",
-        "type": "bool",
-        "default": true,
-        "hint": "调用子代理时自动在 input 中注入当前场景信息（对话对象、群聊/私聊）。群聊场景还会附上对方的群内身份（群名片/昵称 + 角色：群主/管理员/群成员），走平台接口自动获取、带 5 分钟缓存，查询失败静默跳过。"
-    },
-    "enable_daily_random_life": {
-        "description": "子代理今日随机生活状态注入",
-        "type": "bool",
-        "default": false,
-        "hint": "开启后每次调用子代理时，把 ta 今日的心情/手头事/话题域（每日确定性随机，可选 LLM 离线读对话微调）注入 ta 的对话，让每个角色真正『过着』今天而不是千人一面。每日每场景只补一次 LLM 离线注入，其余走内存态。默认关=零行为变化。"
-    },
-    "daily_life_provider_id": {
-        "description": "今日状态注入 LLM Provider ID（留空=跟随会话）",
-        "type": "string",
-        "default": "",
-        "hint": "『读对话推断子代理今日心情』用的模型，完全可选。留空=跟随当前会话模型（或没模型就跳过注入、保留纯规则随机）；也可填任何便宜快的模型 id。修复说明：模型读不出信息时的输出只会被跳过（保留规则随机），绝不写空白状态，可放心配小模型。"
-    },
-    "chain_summary_enabled": {
-        "description": "接龙长回复精简开关",
-        "type": "bool",
-        "default": true,
-        "hint": "开启后，接龙模式下上一位子代理回复超过阈值时自动压缩为摘要+首尾，避免长文塞爆下一位的上下文。关闭则原样传递完整回复。"
-    },
-    "chain_summary_model": {
-        "description": "接龙精简模型（Provider ID）",
-        "type": "string",
-        "default": "",
-        "hint": "用于压缩接龙长回复的模型 Provider ID（如 deepseek、glm-4.7-flash 等，需与 AstrBot 中已配置的 provider id 一致）。留空则使用当前会话的模型。"
-    },
-    "chain_summary_threshold": {
-        "description": "接龙精简触发阈值（字符数）",
-        "type": "int",
-        "default": 600,
-        "hint": "上一位子代理回复超过该字符数才触发精简，未超过则原样传递。"
-    },
-    "chain_summary_keep_head_tail": {
-        "description": "精简时保留首尾字符数",
-        "type": "int",
-        "default": 120,
-        "hint": "压缩时保留原文开头和结尾各 N 个字符，中间用摘要衔接，兼顾剧情连贯与上下文压缩。"
-    },
-    "enable_read_air_arbitrate": {
-        "description": "【实验性】读空气仲裁总开关",
-        "type": "bool",
-        "default": false,
-        "hint": "⚠️ 实验性功能：未经长期运行验证，请谨慎开启。开启后在自动路由犹豫点做「宁静权」克制（群聊杂谈/弱路由时让主代理自然接住，而非逢消息就抢派子代理）。默认关=零行为变化。绝不拦用户明确点名的人（点名神圣不可侵）。"
-    },
-    "read_air_enforce": {
-        "description": "读空气·真实拦截开关（宁静权落地闸门）",
-        "type": "bool",
-        "default": false,
-        "hint": "二级闸门，仅在总开关 enable_read_air_arbitrate 开启后才有意义。false=段二观察模式，只打「想不想克制」日志、绝不改路由（零行为变化）；true=宁静权真实拦截：读空气倾向克制时放行主代理自然接住，并同步清掉承接记忆（防 T0.5 粘滞把同组续上）。回退只需置回 false，无需改码。"
-    },
-    "read_air_presence_window": {
-        "description": "读空气在场发言窗口（条）",
-        "type": "int",
-        "default": 6,
-        "hint": "记录每个会话最近 N 条发言，供仲裁判断「刚说到哪、该谁接」。越大越能感知长对话气口，越小越省内存。"
-    },
-    "arbitrate_old_grudge_agent": {
-        "description": "旧怨组子代理（读空气仲裁特例，逗号分隔英文 id）",
-        "type": "string",
-        "default": "",
-        "hint": "可选。填子代理英文 id（逗号分隔，如 agent_a,agent_b）。当主代理与该组在近期对话里密集互抛（各 ≥2 次）时，仲裁倾向主代理兜住收尾。留空 = 该规则关闭（零行为变化）。"
-    },
-    "enable_chain_memory_persist": {
-        "description": "【实验性】多人接龙整场记忆沉淀开关",
-        "type": "bool",
-        "default": true,
-        "hint": "⚠️ 实验性功能：未经长期验证，普通场景建议保持默认。开启后，接龙模式（多人）结束时把整场剧情按各角色各自视角沉淀进各角色 livingmemory（每人一份主观视角，可自由回忆，日常不跳脸）。关闭则多人剧情不留长期记忆，仅当场临时上下文（仍不污染日常）。"
-    },
-    "persona_suffix_agents": {
-        "description": "人格真名带「-子代理」后缀的子代理（逗号分隔英文 id）",
-        "type": "string",
-        "default": "",
-        "hint": "可选。若某子代理在 personas 表里按「显示名-子代理」后缀登记（如提炼专用分身），在此声明其英文 id（逗号分隔）。留空 = 全部按显示名原样映射（默认行为）。"
-    },
-    "enable_side_pulse": {
-        "description": "【实验性】旁路模块（她们之间的小日子）",
-        "type": "bool",
-        "default": false,
-        "hint": "⚠️ 实验性功能：未经长期运行验证，请谨慎开启并留意日志。开启后：每小时一次心跳让常驻池里 2 人按今日状态闲聊两句（内部转，不打扰用户），每晚推送一条「家里动静」摘要到用户私聊。关闭=零注册零行为。"
-    },
-    "side_pulse_members": {
-        "description": "旁路模块常驻池（JSON 数组，子代理英文 id）",
-        "type": "string",
-        "default": "[]",
-        "hint": "填入参与旁轨的子代理英文 id，JSON 数组格式，如 [\"agent_a\",\"agent_b\"]；至少 2 个才生效，非法值回退默认。"
-    },
-    "side_pulse_bold_agents": {
-        "description": "性子放开的子代理（抢话权重加成，逗号分隔英文 id）",
-        "type": "string",
-        "default": "",
-        "hint": "可选。声明「爱接话」的子代理英文 id（逗号分隔），列表成员在旁轨抢话仲裁里获得权重加成。留空 = 不加成（纯按亲密度+随机）。"
-    },
-    "side_pulse_cron": {
-        "description": "旁路模块心跳 cron",
-        "type": "string",
-        "default": "17 * * * *",
-        "hint": "每小时第 17 分一次心跳（错开整点高峰）。作息式调频可改此表达式：活跃时段加密、深夜放疏。"
-    },
-    "side_pulse_digest_cron": {
-        "description": "家里动静摘要推送 cron",
-        "type": "string",
-        "default": "50 21 * * *",
-        "hint": "每晚 21:50 把当天旁轨对话原样汇成一条推给用户。无日志不发送。"
-    },
-    "side_pulse_provider_id": {
-        "description": "旁路模块 LLM Provider ID",
-        "type": "string",
-        "default": "dmxapi/glm-4-flash",
-        "hint": "闲聊生成用的便宜模型（同 daily_life GLM-4-Flash）。LLM 挂了心跳静默跳过，绝不致命。"
-    },
-    "side_pulse_digest_umo": {
-        "description": "摘要推送目标会话 UMO",
-        "type": "string",
-        "default": "",
-        "hint": "推送目标私聊的会话 UMO。留空则不推送。"
-    },
-    "side_pulse_memory_umo": {
-        "description": "【实验性】旁轨子代理记忆归属会话",
-        "type": "string",
-        "default": "side_pulse:FriendMessage:subagents",
-        "hint": "旁轨里子代理的记忆沉淀到哪个会话 UMO。默认共用 subagents 会话。"
-    },
-    "side_pulse_recent_hours": {
-        "description": "「家里动静」查看窗口（小时）",
-        "type": "int",
-        "default": 6,
-        "hint": "用户私聊问子代理「你们聊了什么」时，只注入最近 N 小时的旁轨家常原文（替代全量累积注入）。更早的生活线由子代理 recall 工具按需自查。"
-    },
-    "side_pulse_window_start": {
-        "description": "心跳活跃窗起点（CST）",
-        "type": "string",
-        "default": "06:17",
-        "hint": "作息式心跳：每天这个时间开始活跃"
-    },
-    "side_pulse_window_end": {
-        "description": "心跳活跃窗终点（CST，跨零点）",
-        "type": "string",
-        "default": "01:00",
-        "hint": "到点后家里静默到明早起点"
-    },
-    "side_pulse_interval_min": {
-        "description": "心跳区间长（分钟）",
-        "type": "int",
-        "default": 120,
-        "hint": "活跃窗按此长度切段，每段内随机心跳一次（任意分钟）"
-    },
-    "side_pulse_interlope_chance": {
-        "description": "自由插话概率（路线 B）",
-        "type": "float",
-        "default": 0.45,
-        "hint": "围坐主链之外，未入座的人每轮冒话的概率 0~1。0=关掉插话（纯围坐）；调高=爱接话的人更多。"
-    },
-    "side_pulse_interlope_max": {
-        "description": "一场最多插话次数",
-        "type": "int",
-        "default": 2,
-        "hint": "一场心跳最多让旁观者插几次话，防止插话刷屏盖过主链。"
-    },
-    "side_pulse_host_chance": {
-        "description": "主代理参与旁轨插话概率",
-        "type": "float",
-        "default": 0.3,
-        "hint": "围坐闲聊时主代理以自己身份插话的概率 0~1。0=主代理不参与（默认纯子代理围坐）；调高=主代理更常冒话。"
-    },
-    "side_pulse_host_max": {
-        "description": "主代理一场最多插话次数",
-        "type": "int",
-        "default": 2,
-        "hint": "一场心跳里主代理最多插几次话，防止喧宾夺主。"
-    },
-    "side_pulse_draft_enable": {
-        "description": "【实验性】拉用户进旁轨总开关",
-        "type": "bool",
-        "default": false,
-        "hint": "⚠️ 实验性功能：未经长期运行验证，请谨慎开启。围坐聊到兴头把用户拉进来一起聊。默认关，开启后生效。"
-    },
-    "side_pulse_draft_chance_workday": {
-        "description": "工作日拉用户概率",
-        "type": "float",
-        "default": 0.1,
-        "hint": "工作日聊到兴头把用户拉进来的概率 0~1，拉得少。"
-    },
-    "side_pulse_draft_chance_holiday": {
-        "description": "节假日（含双休）拉用户概率",
-        "type": "float",
-        "default": 0.3,
-        "hint": "节假日/双休把用户拉进来的概率 0~1，拉得多。"
-    },
-    "side_pulse_draft_quota_workday": {
-        "description": "工作日每日拉用户次数上限",
-        "type": "int",
-        "default": 2,
-        "hint": "工作日一天最多拉用户几次，防骚扰。"
-    },
-    "side_pulse_draft_quota_holiday": {
-        "description": "节假日每日拉用户次数上限",
-        "type": "int",
-        "default": 5,
-        "hint": "节假日/双休一天最多拉用户几次。"
-    }
+  "user_address": {
+    "description": "主对话者称呼（系统文本用）",
+    "type": "string",
+    "default": "用户",
+    "hint": "多人共享记录（如「▍称呼：」）、记忆沉淀模板等系统生成文本中，对主对话者的称呼。子代理在对话里怎么称呼用户（如「主人」「宝宝」）由各子代理自身人格设定决定，与该项无关。"
+  },
+  "main_agent_name": {
+    "description": "主代理显示名",
+    "type": "string",
+    "default": "主代理",
+    "hint": "启用主代理姓名前缀时使用的中文显示名。"
+  },
+  "route_mode": {
+    "description": "子代理路由模式",
+    "type": "string",
+    "default": "direct",
+    "hint": "direct=用call_subagent路由，子代理回复直接发用户端不中转；relay=用transfer_to_*路由，子代理回复返回主代理转发；both=双投递，子代理回复既直发用户端、也把完整回复回传主代理——用户能看见子代理对主代理说了什么，主代理照常可以说话，但只做增量不复述原文。强制直连黑名单（handoff_blacklist_agents）中的子代理不受本配置影响，永远走 transfer_to_* 直连。WebUI切换后直接生效，无需重启。"
+  },
+  "call_mode": {
+    "description": "子代理调用模式",
+    "type": "string",
+    "default": "parallel",
+    "hint": "parallel=并行调用所有子代理（快，各说各话）；chained=接龙式串行调用（慢，前一个子代理的回复自动传给下一个作为上下文，剧情连贯）。direct/relay 路由模式不受影响，接龙时两者均正常工作。"
+  },
+  "tech_mode_config": {
+    "description": "技术干活模式调度配置（JSON）",
+    "type": "string",
+    "default": "{\"route_mode\": \"relay\", \"call_mode\": \"parallel\", \"timeout\": 120}",
+    "hint": "自定义技术模式调度方式，JSON格式：{\"route_mode\": \"relay|direct\", \"call_mode\": \"parallel|chained\", \"timeout\": 秒数}。route_mode=relay 子代理回复返回主代理汇总（统帅收卷），direct 直接发用户端；call_mode=parallel 并行调度，chained 接龙串行。配置永远优先：mode命中时此配置无条件覆盖模型显式传参。改动即时生效。"
+  },
+  "affection_mode_config": {
+    "description": "日常贴贴模式调度配置（JSON）",
+    "type": "string",
+    "default": "{\"route_mode\": \"direct\", \"call_mode\": \"chained\", \"timeout\": 120}",
+    "hint": "自定义日常贴贴模式调度方式，JSON格式：{\"route_mode\": \"relay|direct\", \"call_mode\": \"parallel|chained\", \"timeout\": 秒数}。route_mode=direct 子代理回复直接分段转发用户端（主代理隐身），relay 返回主代理；call_mode=chained 接龙串行，parallel 并行。配置永远优先：mode命中时此配置无条件覆盖模型显式传参。改动即时生效。"
+  },
+  "enable_subagent_name_prefix": {
+    "description": "子代理消息启用姓名前缀",
+    "type": "bool",
+    "default": true,
+    "hint": "并行回复时每个子代理结果前加【名字】前缀，方便区分发言人。替代旧配置项 enable_name_prefix。"
+  },
+  "enable_mainagent_name_prefix": {
+    "description": "主代理消息启用姓名前缀",
+    "type": "bool",
+    "default": false,
+    "hint": "主代理（调用本工具的一方）回复消息时是否通过 on_decorating_result 钩子自动加【名字】前缀。"
+  },
+  "enable_mainagent_segmented": {
+    "description": "主代理启用分段转发",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后主代理自身回复按空行拆分，逐条单独发送。关闭则整个回复作为一条消息发送。子代理分段转发由 enable_segmented_forward 独立控制。"
+  },
+  "enable_segmented_forward": {
+    "description": "启用分段转发",
+    "type": "bool",
+    "default": true,
+    "hint": "子代理回复按括号/换行拆分后逐条发送，提升阅读体验。关闭则合并为一条 JSON 返回。"
+  },
+  "min_fragment_length": {
+    "description": "最小分段长度（字符）",
+    "type": "int",
+    "default": 5,
+    "hint": "括号内动作描写短于此长度时，会合并到下一段对话，避免零碎输出。"
+  },
+  "fragment_interval": {
+    "description": "分段发送间隔（秒）",
+    "type": "float",
+    "default": 0.3,
+    "hint": "分段转发模式下，每条片段之间的发送间隔。建议 0.2-0.5 秒，避免触发平台风控。"
+  },
+  "allow_mainagent_after_direct": {
+    "description": "子代理直发后允许主代理发言",
+    "type": "bool",
+    "default": true,
+    "hint": "direct 分段转发子代理回复后，若主代理生成了实质台词则加【名字】前缀放行；false 时恢复旧行为（无条件清空主代理输出）。关闭可防重复，开启可让主代理下场说话。"
+  },
+  "forbid_pre_tool_mainagent_talk": {
+    "description": "子代理直发前禁止主代理抢先发言",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，路由子代理时主代理必须在调用 parallel_handoff 工具前留空、不输出任何导语/转述/解释（如“我这就叫她”“她应你了”），直接发起工具调用让子代理亲口说话。与 allow_mainagent_after_direct（管直发后）互补，管住直发前。"
+  },
+  "mainagent_disable_md_split": {
+    "description": "主代理禁用 Markdown 智能分段",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后主代理长文永远走整条渲染，不做按块拆分。默认关。"
+  },
+  "mainagent_md_split_max_chars": {
+    "description": "主代理分段最大字符数",
+    "type": "int",
+    "default": 900,
+    "hint": "主代理 Markdown 智能分段的单段字符预算，超过才拆。默认 900。"
+  },
+  "mainagent_md_split_progress": {
+    "description": "主代理分段带进度标识",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后分段消息带（1/3）之类的进度标识（旧行为）。默认关。"
+  },
+  "name_display_map": {
+    "description": "子代理显示名映射",
+    "type": "string",
+    "default": "{}",
+    "hint": "留空即可：自动使用内置显示名。仅当需要自定义显示名时才填，JSON 格式：{\"agent_a\": \"自定义名\"}"
+  },
+  "name_prefix_overrides": {
+    "description": "子代理前缀覆盖表（JSON格式）",
+    "type": "string",
+    "default": "{}",
+    "hint": "留空即可：所有子代理统一走全局开关（enable_subagent_name_prefix），自动显示【内置中文名】前缀。只有当个别子代理需要特殊开关时才填，JSON格式：{\"agent_a\": false}。添加新子代理后无需在此配置"
+  },
+  "direct_delivery_agents": {
+    "description": "直接发送到用户的子代理列表",
+    "type": "string",
+    "default": "",
+    "hint": "逗号分隔的子代理名。列表中的子代理回复会直接分段发送到用户。不在列表中的非黑名单子代理回复会返回给主代理处理。强制直连黑名单（handoff_blacklist_agents）中的子代理不受此配置影响，永远走 transfer_to_* 直连。"
+  },
+  "handoff_blacklist_agents": {
+    "description": "强制直连子代理黑名单（transfer_to_* 直连，不走并行插件中转）",
+    "type": "string",
+    "default": "tech,技术Agent",
+    "hint": "逗号分隔的子代理名。列出的子代理（如 tech/技术Agent）永远不走 parallel_handoff 插件的 relay 中转，必须由主代理直接调用 transfer_to_xxx 工具直连；parallel_handoff / call_subagent 调用这些代理会被拦截并提示改用 transfer_to_*。"
+  },
+  "enable_route_directive": {
+    "description": "启用路由强制指令注入（OnLLMRequestEvent 钩子）",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后插件在每次主代理 LLM 请求时，按 route_mode/call_mode/direct_delivery_agents 自动生成路由路径规范注入 extra_user_content_parts，主代理必须照走；工具全保留不摘除。关闭则纯靠主代理自觉。"
+  },
+  "subagent_visibility_inject": {
+    "description": "子代理直发「旁听窗」注入",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，子代理直发回复（如某个子代理对你说的话）会以「旁听窗」形式附给主代理下一次请求——主代理能看到她说了什么并自然承接（「她说还在看呢，你别急」），实现三方自然对话。10分钟窗口+同条去重。关闭=恢复旧行为。"
+  },
+  "directive_inject_mode": {
+    "description": "路由指令注入模式",
+    "type": "string",
+    "default": "smart",
+    "hint": "smart=智能按需（默认）：仅当消息疑似路由意图（点名子代理/领域词/会话承接）才注入完整指令，日常闲聊与技术任务零注入，省 token 不污染上下文；always=每轮都注入（旧行为）。"
+  },
+  "enable_smart_router": {
+    "description": "小模型路由层总开关",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后消息进入主代理 LLM 前先用 T1规则/T2小模型判向，命中子代理直发并短路主代理。默认关，开启后观察路由命中与误伤。"
+  },
+  "enable_disambiguation": {
+    "description": "启用消息消歧（无指名自动路由）",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后：没有指名子代理的消息，自动路由给上一次回复过你的那位子代理（会话级连续对话）。默认开。"
+  },
+  "router_provider_id": {
+    "description": "T2路由小模型 Provider ID",
+    "type": "string",
+    "default": "dmxapi/glm-4-flash",
+    "hint": "用于判向的小模型，必须是 AstrBot 中已配置的 provider id。免费 glm-4-flash 即可，勿用主模型。"
+  },
+  "router_confidence_threshold": {
+    "description": "T2小模型路由置信度阈值",
+    "type": "float",
+    "default": 0.8,
+    "hint": ">= 该值才直连子代理，低于则落回主代理。阈值越高越保守（宁可多过主代理），推荐 0.8。"
+  },
+  "router_timeout": {
+    "description": "T2路由判向超时（秒）",
+    "type": "float",
+    "default": 5,
+    "hint": "小模型判向超时直接放行主代理，不影响体验。"
+  },
+  "subagent_reply_timeout": {
+    "description": "子代理回复最大等待超时（秒）",
+    "type": "int",
+    "default": 120,
+    "hint": "单个子代理回复的最大允许等待秒数（工具参数 timeout 不传时的默认上限）。按需配置、无硬上限（常用 300~1800）。注意：后台任务路径另受 subagent_task_turn_timeout 看门狗管控，建议两边同步。"
+  },
+  "subagent_tool_call_timeout": {
+    "description": "子代理单次工具调用超时（秒）",
+    "type": "int",
+    "default": 45,
+    "hint": "单步工具执行的等待上限。官方默认 120，需低于总超时才有意义。"
+  },
+  "metrics_enabled": {
+    "description": "子代理效率实验 · token 计量开关",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后每次 LLM 调用落一行 JSONL，用于测通信税。默认关；本地长期验收在配置里显式开。"
+  },
+  "metrics_path": {
+    "description": "token 计量落盘路径（留空 = 插件 data/metrics.jsonl）",
+    "type": "string",
+    "default": "",
+    "hint": "本地长期验收填 <插件数据目录>/experiments/subagent_efficiency/metrics.jsonl"
+  },
+  "subagent_max_steps": {
+    "description": "子代理工具循环最大步数",
+    "type": "int",
+    "default": 10,
+    "hint": "子代理单次任务内最多执行几轮工具调用。官方默认 30，过高容易在 120 秒总超时内跑不完。实测 8 步对「4 问 / 3 文件」的检索刚好卡边界，提到 10 留出余量。"
+  },
+  "subagent_response_preview_chars": {
+    "description": "返回主代理的子代理回复预览长度（字符）",
+    "type": "int",
+    "default": 4000,
+    "hint": "分段转发模式下子代理回复直发用户，返回给主代理的是预览。原为硬编码 120 字（2026-09-11 提到 800）。[2026-09-12 深夜] 用户反馈 800 不够、正经交付物（如审查口述 2279 字）被生硬截断，默认提到 4000；截断时 preview 尾部加 … 标识，配 response_chars / response_truncated 字段被吞多少一眼可见。"
+  },
+  "qq_md_plainify": {
+    "description": "子代理消息 markdown 降级（纯文本平台友好）",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，子代理直发消息里 **加粗**、`代码`、### 标题等 markdown 符号会降级为纯文本（◆/·/去标记），QQ 等不吃 markdown 的平台观感更干净。发支持 md 的平台可关。"
+  },
+  "subagent_tools": {
+    "description": "子代理工具白名单（逗号分隔，留空用默认读写档 37 项）",
+    "type": "string",
+    "default": "",
+    "hint": "默认集含文件读写（safe_edit/safe_write/multi_edit/file_patch/file_preview/safe_rollback/file_remove/file_move/file_zip/file_unzip/config_diff/symbol_rename）、门禁（syntax_check/lint_runner/test_runner）、本地 git（status/diff/log/commit/branch/remote/changelog）、读工具与原 read 集。高风险工具（shell_exec / astrbot_execute_shell / hot_reload_plugin / git_push / gh_*）刻意不在默认集，需单独授权后写进本项。"
+  },
+  "subagent_readonly_tools": {
+    "description": "【旧键·兼容保留】子代理工具白名单，已被 subagent_tools 取代",
+    "type": "string",
+    "default": "",
+    "hint": "优先读 subagent_tools；本键仅在 subagent_tools 为空时生效，留空回落内置默认（读写档）。"
+  },
+  "subagent_context_enabled": {
+    "description": "启用跨轮对话上下文",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后子代理会记住本轮 session 内的对话历史（tech/技术Agent 始终不启用）。关闭则每次调用都是独立的新对话。"
+  },
+  "subagent_context_max_turns": {
+    "description": "最大历史轮数",
+    "type": "int",
+    "default": 100,
+    "hint": "对话历史超过此轮数后会触发压缩（LLM 摘要 + 保留最近 N 轮完整对话）。每轮 = 一对 user+assistant 消息。"
+  },
+  "subagent_session_persist": {
+    "description": "会话落盘（跨重启保留子代理对话历史）",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后子代理的对话历史写入磁盘，主代理重启后历史仍在——这是子代理从『临时工』变成『常驻同事』的关键。关闭则回落纯内存（与改造前行为完全一致），重启即失忆。落盘失败自动降级并记日志，绝不阻断对话。"
+  },
+  "subagent_prefetch_enabled": {
+    "description": "子代理预取线索（派单时本地 rg 打定位锚点）",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，派单那一刻用本地 ripgrep 把任务文本里点名的实体（绝对路径 / 文件名 / 代码标识符）先定位一遍，把「文件:行」锚点随 extra 一并注入子代理，让她开局直接精读、省掉开局盲搜（实测每步约 7.4 秒）。纯本地检索、232ms 量级、不调 LLM、不砍任何原有注入；rg 不可用或无命中时静默跳过，绝不阻断派单。关闭则子代理完全靠自己的检索直觉。"
+  },
+  "subagent_session_retention_days": {
+    "description": "会话历史保留天数",
+    "type": "int",
+    "default": 30,
+    "hint": "超过此天数的会话文件会被清理（清理是手动的，本参数只定阈值）。注意：内存窗口 subagent_context_max_turns 截断的是内存，磁盘保留全量——所以把窗口调小不会永久丢历史。"
+  },
+  "subagent_task_max_concurrent": {
+    "description": "后台任务全局并发上限",
+    "type": "int",
+    "default": 20,
+    "hint": "二期后台任务（parallel_handoff 传 background=true 时生效）：同时运行的任务数上限，超过则拒绝新任务并返回错误（不排队）。"
+  },
+  "subagent_task_max_per_session": {
+    "description": "后台任务单会话并发上限",
+    "type": "int",
+    "default": 5,
+    "hint": "二期后台任务：同一个会话最多同时跑几个任务，防止单个会话把全局额度吃光。"
+  },
+  "subagent_task_turn_timeout": {
+    "description": "后台任务单任务超时（秒）",
+    "type": "int",
+    "default": 900,
+    "hint": "二期后台任务：看门狗。单个任务超过此时长会被强杀并标记为 interrupted，避免卡死的任务永远占着并发额度。建议与 subagent_reply_timeout 同步设置（后台路径的实际上限）。"
+  },
+  "recall_enabled": {
+    "description": "子代理长期记忆开关",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后子代理可召回/存储长期记忆（主代理记忆参数不受影响，独立设置）"
+  },
+  "recall_default_k": {
+    "description": "子代理默认记忆召回条数",
+    "type": "int",
+    "default": 5,
+    "hint": "子代理调用记忆召回时的默认条数，可低于主代理（如设3）"
+  },
+  "recall_max_k": {
+    "description": "子代理记忆召回条数上限",
+    "type": "int",
+    "default": 10,
+    "hint": "召回条数的硬上限，防止一次注入过多记忆"
+  },
+  "exclude_agents": {
+    "description": "子代理记忆排除名单（逗号分隔）",
+    "type": "string",
+    "default": "tech,技术Agent",
+    "hint": "列出的子代理不启用长期记忆，逗号分隔"
+  },
+  "enable_scene_inject": {
+    "description": "启用场景注入",
+    "type": "bool",
+    "default": true,
+    "hint": "调用子代理时自动在 input 中注入当前场景信息（对话对象、群聊/私聊）。群聊场景还会附上对方的群内身份（群名片/昵称 + 角色：群主/管理员/群成员），走平台接口自动获取、带 5 分钟缓存，查询失败静默跳过。"
+  },
+  "enable_daily_random_life": {
+    "description": "子代理今日随机生活状态注入",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后每次调用子代理时，把 ta 今日的心情/手头事/话题域（每日确定性随机，可选 LLM 离线读对话微调）注入 ta 的对话，让每个角色真正『过着』今天而不是千人一面。每日每场景只补一次 LLM 离线注入，其余走内存态。默认关=零行为变化。"
+  },
+  "daily_life_provider_id": {
+    "description": "今日状态注入 LLM Provider ID（留空=跟随会话）",
+    "type": "string",
+    "default": "",
+    "hint": "『读对话推断子代理今日心情』用的模型，完全可选。留空=跟随当前会话模型（或没模型就跳过注入、保留纯规则随机）；也可填任何便宜快的模型 id。修复说明：模型读不出信息时的输出只会被跳过（保留规则随机），绝不写空白状态，可放心配小模型。"
+  },
+  "chain_summary_enabled": {
+    "description": "接龙长回复精简开关",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，接龙模式下上一位子代理回复超过阈值时自动压缩为摘要+首尾，避免长文塞爆下一位的上下文。关闭则原样传递完整回复。"
+  },
+  "chain_summary_model": {
+    "description": "接龙精简模型（Provider ID）",
+    "type": "string",
+    "default": "",
+    "hint": "用于压缩接龙长回复的模型 Provider ID（如 deepseek、glm-4.7-flash 等，需与 AstrBot 中已配置的 provider id 一致）。留空则使用当前会话的模型。"
+  },
+  "chain_summary_threshold": {
+    "description": "接龙精简触发阈值（字符数）",
+    "type": "int",
+    "default": 600,
+    "hint": "上一位子代理回复超过该字符数才触发精简，未超过则原样传递。"
+  },
+  "chain_summary_keep_head_tail": {
+    "description": "精简时保留首尾字符数",
+    "type": "int",
+    "default": 120,
+    "hint": "压缩时保留原文开头和结尾各 N 个字符，中间用摘要衔接，兼顾剧情连贯与上下文压缩。"
+  },
+  "enable_read_air_arbitrate": {
+    "description": "【实验性】读空气仲裁总开关",
+    "type": "bool",
+    "default": false,
+    "hint": "⚠️ 实验性功能：未经长期运行验证，请谨慎开启。开启后在自动路由犹豫点做「宁静权」克制（群聊杂谈/弱路由时让主代理自然接住，而非逢消息就抢派子代理）。默认关=零行为变化。绝不拦用户明确点名的人（点名神圣不可侵）。"
+  },
+  "read_air_enforce": {
+    "description": "读空气·真实拦截开关（宁静权落地闸门）",
+    "type": "bool",
+    "default": false,
+    "hint": "二级闸门，仅在总开关 enable_read_air_arbitrate 开启后才有意义。false=段二观察模式，只打「想不想克制」日志、绝不改路由（零行为变化）；true=宁静权真实拦截：读空气倾向克制时放行主代理自然接住，并同步清掉承接记忆（防 T0.5 粘滞把同组续上）。回退只需置回 false，无需改码。"
+  },
+  "read_air_presence_window": {
+    "description": "读空气在场发言窗口（条）",
+    "type": "int",
+    "default": 6,
+    "hint": "记录每个会话最近 N 条发言，供仲裁判断「刚说到哪、该谁接」。越大越能感知长对话气口，越小越省内存。"
+  },
+  "arbitrate_old_grudge_agent": {
+    "description": "旧怨组子代理（读空气仲裁特例，逗号分隔英文 id）",
+    "type": "string",
+    "default": "",
+    "hint": "可选。填子代理英文 id（逗号分隔，如 agent_a,agent_b）。当主代理与该组在近期对话里密集互抛（各 ≥2 次）时，仲裁倾向主代理兜住收尾。留空 = 该规则关闭（零行为变化）。"
+  },
+  "enable_chain_memory_persist": {
+    "description": "【实验性】多人接龙整场记忆沉淀开关",
+    "type": "bool",
+    "default": true,
+    "hint": "⚠️ 实验性功能：未经长期验证，普通场景建议保持默认。开启后，接龙模式（多人）结束时把整场剧情按各角色各自视角沉淀进各角色 livingmemory（每人一份主观视角，可自由回忆，日常不跳脸）。关闭则多人剧情不留长期记忆，仅当场临时上下文（仍不污染日常）。"
+  },
+  "persona_suffix_agents": {
+    "description": "人格真名带「-子代理」后缀的子代理（逗号分隔英文 id）",
+    "type": "string",
+    "default": "",
+    "hint": "可选。若某子代理在 personas 表里按「显示名-子代理」后缀登记（如提炼专用分身），在此声明其英文 id（逗号分隔）。留空 = 全部按显示名原样映射（默认行为）。"
+  }
 }

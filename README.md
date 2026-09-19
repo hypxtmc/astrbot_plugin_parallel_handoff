@@ -26,7 +26,6 @@ AstrBot 多子代理并行调度插件（原名 `parallel_handoff`）
 | 一件事听三个人的看法 | 挨个问三遍 | 一次调用，三段同时到 |
 | A 的结论接着给 B 用 | 手动复制粘贴 | `chained` 接龙自动传棒 |
 | 让 A 记得三天前聊过什么 | 全靠人格硬写 | 独立会话档案 + 跨轮上下文 |
-| 她们之间有自己的来往 | 做不到 | 旁轨日常，随时围坐插话 |
 
 ---
 
@@ -73,18 +72,6 @@ AstrBot 多子代理并行调度插件（原名 `parallel_handoff`）
 > **你**：助手A 的异常清单，助手B 你按这个顺手把脚本改一下
 
 链式接龙启动，助手A 的产出作为输入递给助手B。不用复制粘贴，也不用再解释「哪个清单」。
-
-**23:10　主对话静下来之后**
-
-你不说话了，旁轨里还在动。这一幕没人呼叫，是她们自己的日常：
-
-> **【助手B】**：（瘫在椅子上）改完了。谁要喝水，我顺路。
->
-> **【助手C】**：我要我要，你那杯先给我吧，这两块不收尾我走不开。
->
-> **【助手A】**：……小点声。有人在忙。
-
-第二天你打开对话，这些都在。不是凭空生成的一段闲聊，是各自的当日状态、手头事、关系亲疏攒出来的。你可以直接插话：「昨晚那杯水谁倒的」
 
 ---
 
@@ -175,7 +162,7 @@ WebUI 插件配置里至少设两项：
 
 ## 功能详解
 
-> 标【实验性】的功能未经长期运行验证，行为可能随版本调整。涉及：旁路模块（`enable_side_pulse`）、拉用户进旁轨（`side_pulse_draft_enable`）、读空气仲裁（`enable_read_air_arbitrate`）、多人接龙记忆沉淀（`enable_chain_memory_persist`）。
+> 标【实验性】的功能未经长期运行验证，行为可能随版本调整。涉及：读空气仲裁（`enable_read_air_arbitrate`）、多人接龙记忆沉淀（`enable_chain_memory_persist`）。
 
 **命令式点名（T0 强锁）**：消息以 `/`、`／`、`#`、`！`、`!`、`、` 打头直接叫名字，如 `/助手A`、`/助手A+助手B`。锁定后持续生效，之后无需重复点名。主代理忙碌时同样有效。
 
@@ -211,7 +198,7 @@ WebUI 插件配置里至少设两项：
 
 白名单可由 `subagent_tools` 调整（留空回落内置默认，兼容旧键 `subagent_readonly_tools`）。
 
-**关系档案自动注入**：子代理的 system 提示带上她与家中每个成员的关系档案（亲密度、基调、最近互动，数据源与旁路模块共用 `relationships.json`）。档案放在 system 固定段，逐字节确定、无时间戳，跨调用命中前缀缓存；按亲密度降序；文件缺失时退化为空段，不阻塞对话。
+**关系档案自动注入**：子代理的 system 提示带上她与家中每个成员的关系档案（亲密度、基调、最近互动，数据源 `relationships.json`）。档案放在 system 固定段，逐字节确定、无时间戳，跨调用命中前缀缓存；按亲密度降序；文件缺失时退化为空段，不阻塞对话。
 
 **接龙摘要（chain_summary）**：chained 长接龙自动生成摘要传给下一棒，阈值和保留首尾策略可调。
 
@@ -220,18 +207,6 @@ WebUI 插件配置里至少设两项：
 **离线心情注入（daily_life）**：用 GLM-4-Flash 离线读取近期对话，为每个子代理注入今日心情、手头事、话题域。
 
 **旁听窗**：子代理直发的内容会被记录（1000 字窗口），主代理下次开口时把最近 10 分钟内子代理说过的话附进上下文。
-
-**【实验性】旁路模块（side_pulse，默认关）**：子代理之间过自己的日子，彼此搭话、惦记、拌嘴，用户每天可收到一条「家里动静」摘要。
-
-- 心跳闲聊：作息式自管循环（06:17 → 次日 01:00，窗内每 2h 随机一场）
-- 生活三态：每件手头事走「起头 → 做到一半 → 收尾」，收尾那轮顺口播报后归档
-- 素材池：私有素材（`thread_flavors.json`）∪ 通用生活池，轮换取用
-- 全桌关系：入场每人逐行注入与在场者的关系与基调（`relationships.json`）
-- 情绪摩擦：心情影响说话方式，反客套规则在场
-- 每日摘要：定时汇总推送到指定会话（`side_pulse_digest_cron` / `side_pulse_digest_umo`）
-- 插话、东道主、草稿三套概率机制
-- 首次开启自动生成人格骨架（`personas.json`）
-- cron 防重入，默认全关零行为
 
 ---
 
@@ -255,7 +230,6 @@ WebUI 插件配置里至少设两项：
 | `/列表` | 列出全部可点名成员 |
 | `/热重载并行插件`、`/reload_parallel`、`/重载插件` | 热重载本插件 |
 | `/（某某）的前缀关了`、`/（某某）的前缀开了` | 按子代理开关姓名前缀 |
-| `/看看状态`、`/看状态`、`/今日动态` | 查看旁路模块近期动态 |
 
 ---
 
@@ -283,8 +257,6 @@ WebUI 插件配置里至少设两项：
 
 **计量**：`metrics_enabled` · `metrics_path`
 
-**旁路模块**（全部默认关）：`enable_side_pulse` · `side_pulse_members` · `side_pulse_cron` · `side_pulse_digest_cron` · `side_pulse_digest_umo` · `side_pulse_memory_umo` · `side_pulse_provider_id` · `side_pulse_recent_hours` · `side_pulse_window_start` / `side_pulse_window_end` · `side_pulse_interval_min` · `side_pulse_bold_agents` · `side_pulse_interlope_chance` / `side_pulse_interlope_max`（插话）· `side_pulse_host_chance` / `side_pulse_host_max`（东道主）· `side_pulse_draft_chance_workday` / `side_pulse_draft_chance_holiday`（发言概率）· `side_pulse_draft_quota_workday` / `side_pulse_draft_quota_holiday`（配额）
-
 ---
 
 ## 数据与文件布局
@@ -295,7 +267,6 @@ astrbot_plugin_parallel_handoff/
 ├── dispatch.py        # 核心调度：主流程、工具循环、关系档案
 ├── router.py          # 路由层：T0 强锁 / T1 规则 / T2 小模型 / T3 兜底、消歧
 ├── forward.py         # 分段转发、前缀注入、markdown 降级、旁听窗
-├── side_pulse.py    # 旁路模块
 ├── memory.py          # livingmemory 集成、工具白名单、时间感知
 ├── random_state.py    # 个体状态随机演化
 ├── daily_life.py      # 离线心情注入
@@ -310,14 +281,13 @@ astrbot_plugin_parallel_handoff/
 └── data/              # 插件自带数据
     ├── display_names.json      # 英文 id → 中文名
     ├── random_state_data.json  # 状态机种子
-    ├── router_tables.json      # 路由规则表
-    └── side_pulse/           # 人格骨架 / 素材池 / 提示词 / 三态进度 / 日志
+    └── router_tables.json      # 路由规则表
 ```
 
 运行时数据（自动创建）：
 
 - `data/plugin_data/astrbot_plugin_parallel_handoff/subagent_sessions/` — 会话落盘
-- `data/relationships/relationships.json` — 家庭关系网（旁轨与关系档案共用）
+- `data/relationships/relationships.json` — 家庭关系网（关系档案数据源）
 
 ---
 
@@ -376,17 +346,16 @@ astrbot_plugin_parallel_handoff/
 
 | 模块 | 规模 | 职责 |
 |------|------|------|
-| `main.py` | 404 行 | 插件入口、事件注册 |
-| `dispatch.py` | 1545 行 | 核心调度主流程、去重守卫、工具循环、关系档案注入 |
-| `router.py` | 1642 行 | 四层判向、消歧、场景判定 |
+| `main.py` | 366 行 | 插件入口、事件注册 |
+| `dispatch.py` | 1849 行 | 核心调度主流程、去重守卫、工具循环、关系档案注入 |
+| `router.py` | 1779 行 | 四层判向、消歧、场景判定 |
 | `forward.py` | 1155 行 | 分段转发、主代理前缀、markdown 降级、旁听窗记录 |
-| `side_pulse.py` | 1651 行 | 旁路模块全套 |
-| `memory.py` | 648 行 | livingmemory 集成、工具白名单、时间感知 |
+| `memory.py` | 667 行 | livingmemory 集成、工具白名单、时间感知 |
 | `random_state.py` | 428 行 | 个体状态随机演化 |
-| `directive.py` | 344 行 | 路由强制指令构建与注入 |
-| `arbitrate.py` | 320 行 | 读空气仲裁 |
-| `task_runner.py` | 254 行 | 后台任务执行 |
-| `session_store.py` | 225 行 | 会话落盘 |
+| `directive.py` | 373 行 | 路由强制指令构建与注入 |
+| `arbitrate.py` | 328 行 | 读空气仲裁 |
+| `task_runner.py` | 295 行 | 后台任务执行 |
+| `session_store.py` | 224 行 | 会话落盘 |
 | `_lm_bridge.py` | 225 行 | livingmemory 防腐隔离 |
 | `config.py` | 206 行 | 配置读取与默认值 |
 | `daily_life.py` | 174 行 | 离线心情注入 |
@@ -432,9 +401,6 @@ python3 test_plugin.py                      # 全量测试（需要 AstrBot 的 
 **默认为什么是 direct 路由？**
 日常陪伴场景下子代理直接对用户说话更自然。技术干活时调用传 `mode: "tech"` 切到 relay。
 
-**旁路模块开了没反应？**
-查三处：`enable_side_pulse` 是否开、`side_pulse_members` 是否填了成员、当前时间是否在活跃窗口（默认 06:17 → 次日 01:00）内。首次开启会自动生成人格骨架。
-
 **改了代码怎么生效？**
 插件级热重载即可（`/热重载并行插件`）。全局配置变更需重启 AstrBot。
 
@@ -442,7 +408,7 @@ python3 test_plugin.py                      # 全量测试（需要 AstrBot 的 
 调度本身开销很小，主要消耗在各子代理的对话与工具循环。关系档案放在 system 稳定层、逐字节确定，跨调用命中前缀缓存，不逐轮重复计费。
 
 **子代理能互相聊天吗？**
-能。旁路模块（实验性）就是为此设计的，也可以主代理用 chained 接龙让子代理接力对话。
+能。主代理用 chained 接龙就能让子代理接力对话。
 
 **怎么做多人群聊氛围？**
 `direct` 路由 + `parallel` 调用，多个子代理同时直发，各有前缀不串音。配合 `affection` 模式更好。

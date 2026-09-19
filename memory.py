@@ -213,7 +213,7 @@ class MemoryMixin:
         def _sync() -> str:
             # [2026-09-15 修] 必须带 --no-ignore：AstrBot 根 .gitignore 第 23 行有 `data`，
             # rg 默认遵守它 → 从 AstrBot 根搜时把 data/plugins 整个跳过，永远零命中。
-            # 实测直搜插件目录能命中 side_pulse.py:36，全库搜零命中，就是被忽略规则吃掉的。
+            # 实测直搜插件目录能命中目标文件，全库搜零命中，就是被忽略规则吃掉的。
             import time
 
             lines = []
@@ -334,15 +334,6 @@ class MemoryMixin:
                         f"[parallel_handoff] {agent_name} 记忆召回为空"
                         f"（插件就绪，无匹配记忆）"
                     )
-                # 2026-09-04 方案 A（用户拍板）：用户私聊直问子代理时并入旁轨会话记忆。
-                # 旁轨记忆落在 side_pulse:FriendMessage:subagents 会话 + agent persona
-                # 维度，用户私聊会话召回查不到（livingmemory 按 session+persona 双条件
-                # 过滤），导致「问某子代理今天家里聊了什么」她说不记得。此处用旁轨桩
-                # 再造一次召回，把家里的记忆也带给子代理；旁轨心跳链路本身已是旁轨
-                # 会话，自动跳过不重复。
-                parts = await self._merge_pulse_memory_recall(
-                    parts, event, agent_name, clean_input, livingmemory_plugin
-                )
                 return parts
             except Exception as e:
                 logger.warning(
@@ -351,134 +342,6 @@ class MemoryMixin:
                 )
                 return []
         return []
-
-    # ── 旁轨家常并入（2026-09-04 方案 A → 2026-09-05 用户改版：只抓最近 6 小时） ──
-    async def _merge_pulse_memory_recall(
-        self,
-        parts: list,
-        event: AstrMessageEvent,
-        agent_name: str,
-        clean_input: str,
-        livingmemory_plugin,
-    ) -> list:
-        """用户私聊直问子代理时，并入「最近 N 小时家里动静」（jsonl 滑动窗口）。
-
-        2026-09-05 用户改版：方案 A 原实现并入 livingmemory 旁轨会话的长期
-        记忆，从上线起几天累积下来，每次问都把几天历史全部堆进上下文，
-        非常难看。用户拍板改成只抓最近 6 小时的闲聊：家里动静的权威来源
-        是旁轨 jsonl（心跳对话原文），按滑动时间窗过滤后注入；更早的生活
-        线由子代理自己的 recall_long_term_memory 工具按需查询（记忆工具
-        仍在手上），不再自动堆叠历史。
-
-        旁轨心跳链路（_pulse_llm）传进来的 event 本身就是旁轨桩，此处直接
-        跳过，不重复注入。窗口小时数可配 side_pulse_recent_hours（默认 6）。
-        任何失败静默降级，不影响主召回。
-        """
-        try:
-            # 2026-09-12 用户指令：旁轨已关（enable_side_pulse=False），
-            # 旁轨记忆不再自动注入子代理上下文（查看链路保留，按需自取）。
-            if not self._cfg("enable_side_pulse", False):
-                return parts
-            pulse_umo = self._cfg(
-                "side_pulse_memory_umo", "side_pulse:FriendMessage:subagents"
-            )
-            cur_umo = getattr(event, "unified_msg_origin", "")
-            if not pulse_umo or cur_umo == pulse_umo:
-                return parts  # 已在旁轨会话，或未配置旁轨会话，跳过
-            pulse_parts = self._pulse_log_fallback(agent_name)
-            if pulse_parts:
-                logger.info(
-                    f"[parallel_handoff] 旁轨近窗家常注入 OK [{agent_name}]: "
-                    f"{len(pulse_parts)} 条"
-                )
-                return parts + pulse_parts
-            return parts
-        except Exception as e:
-            logger.warning(
-                f"[parallel_handoff] 旁轨家常注入失败(静默) "
-                f"[{agent_name}]: {e}"
-            )
-            return parts
-
-    # ── 旁轨近窗家常注入（2026-09-05 用户改版：滑动时间窗，默认 6 小时） ──
-    def _pulse_log_fallback(self, agent_name: str, max_lines: int = 15) -> list:
-        """「家里动静」查看链路的注入源：旁轨 jsonl 按最近 N 小时窗口过滤。
-
-        2026-09-05 用户改版：原来取「当天全部最近 max_lines 句」，一天下来
-        从早到晚全堆进上下文；现在只取最近 side_pulse_recent_hours
-        （默认 6）小时内的家常。ts 为当天 "HH:MM"，窗口跨零点时 jsonl
-        只有当天文件、无法回溯昨日，退化为取当天零点后全部再截尾。
-        更早的生活线由子代理 recall_long_term_memory 工具按需查询。
-        任何失败静默降级，不阻塞主召回。
-        """
-        try:
-            read_day = getattr(self, "_pulse_read_day", None)
-            if not callable(read_day):
-                return []
-            logs = read_day()
-            if not logs:
-                return []
-            import datetime
-            from zoneinfo import ZoneInfo
-
-            now = datetime.datetime.now(ZoneInfo("Asia/Shanghai"))
-            hours = 6
-            try:
-                hours = float(self._cfg("side_pulse_recent_hours", 6) or 6)
-            except Exception:
-                pass
-            floor_min = max(0, int(now.hour * 60 + now.minute - hours * 60))
-
-            in_window = []
-            for r in logs:
-                ts = str(r.get("ts", ""))
-                try:
-                    hh, mm = ts.split(":")
-                    r_min = int(hh) * 60 + int(mm)
-                except Exception:
-                    continue  # ts 缺损/非当天格式，不注入
-                if r_min >= floor_min:
-                    in_window.append(r)
-            logs = in_window[-max_lines:]
-            lines = []
-            for r in logs:
-                name = r.get("display", r.get("agent", ""))
-                text = (r.get("text") or "").strip()
-                if not text:
-                    continue
-                # 2026-09-05 过滤：用户贴来的日志块（如带 [Core]/[INFO] 的系统日志）
-                # 会被 _pulse_append 原样写进旁轨日志，不适合当「家里聊了什么」注入
-                if text.startswith("[20") and (
-                    "[Core]" in text or "[INFO]" in text or "core.event_bus" in text
-                ):
-                    continue
-                if len(text) > 500 and (
-                    "[INFO]" in text or "[WARN" in text or "[ERROR]" in text
-                ):
-                    continue
-                lines.append(f"{r.get('ts', '')} · {name}：{text}")
-            if not lines:
-                return []
-            today = now.strftime("%Y-%m-%d")
-            body = "\n".join(lines)
-            # 2026-09-05 修复：extra_user_content_parts 元素必须是 TextPart 对象
-            # （裸字符串会触发 provider 端「不支持的额外内容块类型: <class 'str'>」），
-            # 与 livingmemory 注入方式对齐：TextPart(text=...).mark_as_temp()
-            from astrbot.core.agent.message import TextPart
-
-            return [
-                TextPart(
-                    text=(
-                        f"【家里最近 {hours:g} 小时】{today} 的旁轨家常"
-                        f"（{len(lines)} 句）：\n{body}"
-                    )
-                ).mark_as_temp()
-            ]
-        except Exception as e:
-            logger.warning(
-                f"[parallel_handoff] 旁轨家常注入失败(静默): {e}"
-            )
-            return []
 
     # ── 构建子代理工具集（记忆工具过滤） ──
     # 子代理工具白名单默认值。
@@ -572,7 +435,7 @@ class MemoryMixin:
 
     @staticmethod
     def _subagent_event_stub(event, agent_name: str):
-        """造子代理专属记忆会话桩（仿 side_pulse._pulse_event_stub）。
+        """造子代理专属记忆会话桩。
 
         umo = 「{原会话}:subagent:{agent_name}」——存储/召回/提炼三条链路
         共用同一专属会话，与主代理会话彻底隔离；鸭子类型兼容 livingmemory
