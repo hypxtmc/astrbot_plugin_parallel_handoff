@@ -21,6 +21,8 @@ import time
 # 不一致即内存跑的是旧血——这是热重载假绿的硬判据（不依赖行号/日志/探针）。
 RUNTIME_BUILD_TAG = "build-2026-09-16-0026-r10"
 
+from types import SimpleNamespace
+
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 from astrbot.core.agent.message import TextPart
@@ -476,73 +478,206 @@ class DispatchMixin:
         return json.dumps({"success": True, "response": str(r)}, ensure_ascii=False)
 
     # 2026-09-16 00:06 现场制造一行「行号位移」验证 runtime 换血检测——产品实验
-    async def _call_one(
+    async def _emit_results(
         self,
-        call: dict,
-        *,
+        results: list,
         event,
-        handoff_map: dict,
-        scene_prefix: str,
-        livingmemory_plugin,
-        enable_name_prefix: bool,
-        timeout: int,
-        speaker: str = None,
-        dual_output: bool = False,
-    ) -> dict:
-        """调用单个子代理，带超时和错误隔离。
+        direct_agents: set,
+        route_mode: str,
+        also_return: bool,
+        return_agent_results: list,
+        success_count: int,
+        fail_count: int,
+        total_latency_ms: int,
+    ) -> str:
+        """分段转发投递 + 构建返回摘要（2026-09-19 从 parallel_handoff 提出，纯搬移）。
 
-        原为 parallel_handoff 内嵌闭包，捕获 6 个外层变量——
-        提升为显式方法，捕获变量转显式参数（同一引用，行为等价），
-        使消费点/分支可被单测直接调用定位。
+        返回值即调用方要 return 的字符串（pending_text 或摘要 JSON）。
         """
-        agent_name = (call.get("agent_name") or "").strip()
-        # 中文名/大小写兼容：中文名 -> 英文 id，大写 -> 小写（写回 call，后续统一用英文 id）
-        agent_name = self._resolve_agent_name(agent_name)
-        call["agent_name"] = agent_name
-        input_text = (call.get("input") or "").strip()
-        order = call.get("order")
+        if enable_segmented_forward:
+            self._suppress_mainagent_prefix = True
+            self._suppress_mainagent_ts = time.time()
+            self._suppress_mainagent_msg = (event.get_message_str() or "").strip()
+            pending_text = ""
+            for r in results:
+                agent_name = r.get("agent_name", "")
+                is_direct = self._is_direct_delivery(agent_name, direct_agents, route_mode)
 
-        if not agent_name:
-            return {
-                "agent_name": "(missing)",
-                "success": False,
-                "response": "Missing agent_name field",
-                "order": order,
-            }
-        if not input_text:
-            return {
-                "agent_name": agent_name,
-                "success": False,
-                "response": "Missing input field",
-                "order": order,
-            }
+                # 接龙模式下该条已流式发送/通知，跳过避免重复
+                # both 模式例外：已成功直发的条目也要回传主代理。
+                # 判据用 is_direct + success：_sent 的两个来源里只有“direct 且成功”那条满足，
+                # 失败通知只打 _sent，不会误收。（原先靠手动置位的 _directed 已删，它是冗余的）
+                if r.get("_sent"):
+                    if also_return and is_direct and r.get("success"):
+                        if agent_name not in [ra.get("agent_name") for ra in return_agent_results]:
+                            return_agent_results.append(r)
+                    continue
 
-        handoff = handoff_map.get(agent_name)
-        if not handoff:
-            return {
-                "agent_name": agent_name,
-                "success": False,
-                "response": (
-                    f"Subagent '{agent_name}' not found. "
-                    f"Available: {sorted(handoff_map.keys())}"
+                if r.get("success") and is_direct:
+                    if also_return:
+                        # 双段投递：用户端发【日常】，主代理收【技术】
+                        _user_part, _tech_part = self._split_dual_output(r.get("response", ""))
+                        r["_tech_response"] = _tech_part
+                        r["_user_response"] = _user_part
+                        await self._forward_segmented(_user_part, event)
+                        if agent_name not in [ra.get("agent_name") for ra in return_agent_results]:
+                            return_agent_results.append(r)
+                    else:
+                        await self._forward_segmented(r.get("response", ""), event)
+                elif r.get("success"):
+                    # 非直接发送代理 — 收集完整回复返回给主代理
+                    if agent_name not in [ra.get("agent_name") for ra in return_agent_results]:
+                        return_agent_results.append(r)
+                else:
+                    await self._send_failure_notify(r, event)
+
+            # ── 构建返回摘要 ─────────────────────────────────
+            # both 下已回传全文的条目，results 里只留一句指路，避免同一份回复占两份上下文
+            _returned_names = (
+                {ra.get("agent_name") for ra in return_agent_results} if also_return else set()
+            )
+            summary = {
+                "segmented_forward": True,
+                "note": (
+                    "各子代理回复已分条直接发送给用户，以下为摘要。"
+                    "带 returned_agents 的条目，完整回复也已回传给你；用户看过原文，你只做增量，不要复述。"
+                    if also_return
+                    else "各子代理回复已分条直接发送给用户,以下为摘要"
                 ),
-                "order": order,
+                "results": [
+                    {
+                        "agent_name": r.get("agent_name"),
+                        "success": r.get("success"),
+                        "latency_ms": r.get("latency_ms"),
+                        "response_preview": (
+                            "（全文已回传，见 returned_agents）"
+                            if r.get("agent_name") in _returned_names
+                            else (r.get("response", "") or "")[:_preview_chars]
+                            + (
+                                "…"
+                                if len(r.get("response", "") or "") > _preview_chars
+                                else ""
+                            )
+                        ),
+                        # 被吞了多少一眼看得见：总量 + 是否截断
+                        "response_chars": len(r.get("response", "") or ""),
+                        "response_truncated": len(r.get("response", "") or "")
+                        > _preview_chars,
+                    }
+                    for r in results
+                ],
+                "summary": {
+                    "total": len(results),
+                    "success": success_count,
+                    "failed": fail_count,
+                    "total_latency_ms": total_latency_ms,
+                },
             }
+            # 如有非直接发送代理的完整回复，附加到摘要中
+            if return_agent_results:
+                summary["note"] = (
+                    "以下子代理回传给你的是【技术】段（用户端看到的是【日常】段，两段分开写）。"
+                    "你只做增量（决策/下一步/风险），不要复述。"
+                    if also_return
+                    else "以下子代理的完整回复返回给主代理处理。"
+                )
+                summary["returned_agents"] = [
+                    {
+                        "agent_name": ra.get("agent_name"),
+                        "success": True,
+                        "latency_ms": ra.get("latency_ms"),
+                        "full_response": ra.get("_tech_response") or ra.get("response", ""),
+                    }
+                    for ra in return_agent_results
+                ]
+            # 注释掉: 此flag由钩子清空chain后自行复位, 不在工具内复位以拦截后续回显
+            # self._suppress_mainagent_prefix = False
+            # 返回子代理回复文本供主代理转发。
+            # 修复：非 direct 代理的完整回复收集在 return_agent_results 中，
+            # 只返回 pending_text 会把回复吞成 "✓"——有完整回复时必须返回摘要 JSON。
+            if pending_text:
+                return pending_text
+            # 全失败时也必须返回摘要 JSON——以前返回 "✓" 会让主代理对失败完全无感知
+            # （2026-09-03 实测：deepseek-v4-flash 端点挂起双双超时，主代理只见 "✓"）
+            return json.dumps(summary, ensure_ascii=False)
 
-        # 强制直连黑名单拦截：黑名单子代理不走并行插件中转，
-        # 必须由主代理直接调用 transfer_to_xxx 直连（用户 2026-08-08 硬性指令）
-        if agent_name in self._get_handoff_blacklist():
-            return {
-                "agent_name": agent_name,
-                "success": False,
-                "response": (
-                    f"子代理 '{agent_name}' 在强制直连黑名单中：不允许通过 "
-                    f"parallel_handoff / call_subagent 调用，请改用 "
-                    f"transfer_to_{agent_name} 工具直连调用。"
-                ),
-                "order": order,
-            }
+    async def _finalize_dispatch(
+        self,
+        results: list,
+        event,
+        t_total: float,
+        enable_disambiguation: bool,
+        enable_segmented_forward: bool,
+        direct_agents: set,
+        route_mode: str,
+        also_return: bool,
+        return_agent_results: list,
+    ) -> str:
+        """调度收尾：统计 + 消歧记录 + 投递 + 返回（2026-09-19 从 parallel_handoff 提出，纯搬移）。"""
+        total_latency_ms = int((time.perf_counter() - t_total) * 1000)
 
+        # ── 跟踪最近调用的子代理（用于消歧） ─────────────────
+        if enable_disambiguation:
+            session_id = event.unified_msg_origin
+            for r in results:
+                if r.get("success") and r.get("agent_name"):
+                    self._last_agent[session_id] = r["agent_name"]
+                    if self._is_direct_delivery(r.get("agent_name", ""), direct_agents, route_mode):
+                        # 直发成功的回复尾部记入路由记忆（T2 剧情参照用）
+                        self._record_direct_reply(
+                            session_id,
+                            r["agent_name"],
+                            r.get("_user_response") or r.get("response", "") or "",
+                        )
+
+        success_count = sum(1 for r in results if r.get("success"))
+        fail_count = len(results) - success_count
+        logger.info(
+            f"[parallel_handoff] Completed: {success_count}/{len(results)} succeeded, "
+            f"{fail_count} failed, total {total_latency_ms}ms"
+        )
+
+        # （direct_agents / return_agent_results 已在调度前定义，此处复用）
+
+        # ── 分段转发：按中文括号拆分逐条发送 ─────────────────
+        # 2026-09-11 用户拍板：回传截断可配置化。
+        # 原 preview 硬编码 120 字，segmented_forward 下主代理只拿得到 120 字摘要，
+        # 无法做汇总/复核（今晚实测撞三次：子代理答卷、盲评表、G3 交付物）。
+        _preview_chars = int(self._cfg("subagent_response_preview_chars", 4000))
+        if enable_segmented_forward:
+            return await self._emit_results(
+                results, event, direct_agents, route_mode, also_return,
+                return_agent_results, success_count, fail_count, total_latency_ms,
+            )
+
+        # ── 默认：合并返回 ───────────────────────────────────
+        return json.dumps(
+            {
+                "results": results,
+                "summary": {
+                    "total": len(results),
+                    "success": success_count,
+                    "failed": fail_count,
+                    "total_latency_ms": total_latency_ms,
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    async def _build_subagent_input(
+        self,
+        input_text: str,
+        scene_prefix: str,
+        speaker,
+        event,
+        agent_name: str,
+        livingmemory_plugin,
+    ) -> tuple:
+        """场景前缀 + 用户身份/说话者身份注入 + 记忆召回（2026-09-19 从 _call_one 提出，纯搬移）。
+
+        返回 (final_input, memory_extra_parts)。
+        """
         # 场景前缀消费点：由 _apply_scene_prefix 决定
         final_input = self._apply_scene_prefix(input_text, scene_prefix)
 
@@ -572,7 +707,19 @@ class DispatchMixin:
         memory_extra_parts = await self._memory_recall(
             event, agent_name, clean_input, livingmemory_plugin
         )
+        return final_input, memory_extra_parts
+    async def _build_extra_parts(
+        self,
+        memory_extra_parts: list,
+        final_input: str,
+        event,
+        agent_name: str,
+        handoff_map: dict,
+    ) -> list:
+        """三层 extra 注入：时间感知 + 预取线索 + 今日状态（2026-09-19 从 _call_one 提出，纯搬移）。
 
+        三层都失败静默跳过，绝不阻断派单。返回更新后的 memory_extra_parts。
+        """
         # ── 时间感知注入：子代理 unaware 时间（walkaround on_llm_request 钩子只拦主代理），
         #    与主代理 LLMPerception 的感知信息同位，注入 extra_user_content 头部 ──
         #    对齐主代理格式，走 Asia/Shanghai 时区（主代理 2026-09-02 按用户指示）
@@ -655,11 +802,29 @@ class DispatchMixin:
                         )
         except Exception as _e:
             logger.warning(f"[parallel_handoff] 今日状态注入失败 [{agent_name}]: {_e}")
+        return memory_extra_parts
 
-        # ── 构建子代理工具集（memory.py 记忆工具 + 只读白名单） ──
-        subagent_tools = self._build_memory_tools(agent_name)
+    async def _run_subagent_llm(
+        self,
+        call: dict,
+        agent_name: str,
+        handoff,
+        order,
+        final_input: str,
+        memory_extra_parts: list,
+        subagent_tools: list,
+        t0: float,
+        *,
+        event,
+        enable_name_prefix: bool,
+        timeout: int,
+        livingmemory_plugin,
+        dual_output: bool = False,
+    ) -> dict:
+        """子代理 LLM 调用 + 空回复兜底 + 记忆落库 + 前缀（2026-09-19 从 _call_one 提出，纯搬移）。
 
-        t0 = time.perf_counter()
+        原为 _call_one 的主 try 整体，捕获变量转显式参数（同一引用，行为等价）。
+        """
         try:
             umo = event.unified_msg_origin
             session_prov = await self.context.get_current_chat_provider_id(umo)
@@ -862,6 +1027,92 @@ class DispatchMixin:
                 "order": order,
             }
 
+    async def _call_one(
+        self,
+        call: dict,
+        *,
+        event,
+        handoff_map: dict,
+        scene_prefix: str,
+        livingmemory_plugin,
+        enable_name_prefix: bool,
+        timeout: int,
+        speaker: str = None,
+        dual_output: bool = False,
+    ) -> dict:
+        """调用单个子代理，带超时和错误隔离。
+
+        原为 parallel_handoff 内嵌闭包，捕获 6 个外层变量——
+        提升为显式方法，捕获变量转显式参数（同一引用，行为等价），
+        使消费点/分支可被单测直接调用定位。
+        """
+        agent_name = (call.get("agent_name") or "").strip()
+        # 中文名/大小写兼容：中文名 -> 英文 id，大写 -> 小写（写回 call，后续统一用英文 id）
+        agent_name = self._resolve_agent_name(agent_name)
+        call["agent_name"] = agent_name
+        input_text = (call.get("input") or "").strip()
+        order = call.get("order")
+
+        if not agent_name:
+            return {
+                "agent_name": "(missing)",
+                "success": False,
+                "response": "Missing agent_name field",
+                "order": order,
+            }
+        if not input_text:
+            return {
+                "agent_name": agent_name,
+                "success": False,
+                "response": "Missing input field",
+                "order": order,
+            }
+
+        handoff = handoff_map.get(agent_name)
+        if not handoff:
+            return {
+                "agent_name": agent_name,
+                "success": False,
+                "response": (
+                    f"Subagent '{agent_name}' not found. "
+                    f"Available: {sorted(handoff_map.keys())}"
+                ),
+                "order": order,
+            }
+
+        # 强制直连黑名单拦截：黑名单子代理不走并行插件中转，
+        # 必须由主代理直接调用 transfer_to_xxx 直连（用户 2026-08-08 硬性指令）
+        if agent_name in self._get_handoff_blacklist():
+            return {
+                "agent_name": agent_name,
+                "success": False,
+                "response": (
+                    f"子代理 '{agent_name}' 在强制直连黑名单中：不允许通过 "
+                    f"parallel_handoff / call_subagent 调用，请改用 "
+                    f"transfer_to_{agent_name} 工具直连调用。"
+                ),
+                "order": order,
+            }
+
+        final_input, memory_extra_parts = await self._build_subagent_input(
+            input_text, scene_prefix, speaker, event, agent_name, livingmemory_plugin,
+        )
+
+        memory_extra_parts = await self._build_extra_parts(
+            memory_extra_parts, final_input, event, agent_name, handoff_map,
+        )
+
+        # ── 构建子代理工具集（memory.py 记忆工具 + 只读白名单） ──
+        subagent_tools = self._build_memory_tools(agent_name)
+
+        t0 = time.perf_counter()
+        return await self._run_subagent_llm(
+            call, agent_name, handoff, order, final_input, memory_extra_parts,
+            subagent_tools, t0,
+            event=event, enable_name_prefix=enable_name_prefix, timeout=timeout,
+            livingmemory_plugin=livingmemory_plugin, dual_output=dual_output,
+        )
+
     # ── 核心 tool 实现（装饰器 @llm_tool 在 main.py 壳方法上） ──
     # ── 接龙长回复精简（2026-09-10 补实现） ──
     async def _summarize_chain_reply(
@@ -912,6 +1163,282 @@ class DispatchMixin:
         if summary:
             return f"{head}\n……（中段 {len(mid)} 字，压缩为）{summary}……\n{tail}"
         return f"{head}\n……（中段 {len(mid)} 字略）……\n{tail}"
+
+    async def _run_chained(self, calls: list, ctx, message: str) -> list:
+        """接龙模式：串行调用 + 全场脉络注入 + 流式转发（2026-09-19 从 parallel_handoff 提出，纯搬移）。"""
+        event = ctx.event
+        handoff_map = ctx.handoff_map
+        scene_prefix = ctx.scene_prefix
+        livingmemory_plugin = ctx.livingmemory_plugin
+        enable_name_prefix = ctx.enable_name_prefix
+        timeout = ctx.timeout
+        speaker = ctx.speaker
+        also_return = ctx.dual_output
+        direct_agents = ctx.direct_agents
+        route_mode = ctx.route_mode
+        enable_segmented_forward = ctx.enable_segmented_forward
+        _sess = event.unified_msg_origin
+        # ── 接龙模式：串行调用，前一个子代理的回复注入下一个的输入 ──
+        # 注：direct/relay 均为发送方式，与接龙的调用方式正交，互不冲突。
+        # 流式转发：每条完成后立刻发送（direct 直接发/失败立刻通知），
+        # 无需等整条链跑完；失败的子代理在链上标注，下一个能看到谁掉队。
+        results = []
+        # ── 跨轮多代理续接：首发者防失忆（2026-09-08 用户实测）──────
+        # 上一轮 chained 结束把「在场者+各自发言」按 session 存入 _chain_round_ctx。
+        # 本轮若与上轮在场者有交集（续接场景），把上轮脉络注入首发者 input，
+        # 让她知道「上一轮谁说了什么、谁还在场」——否则首发者只凭自己记忆召回，
+        # 会把不在场的人叫进来（实测：误拉其他角色进场、在场者被晾）。
+        _prev_note = self._build_prev_round_note(
+            _sess, [c.get("agent_name") for c in calls]
+        )
+        # ── 全场剧情脉络（2026-09-07 修复多代理同场自说自话）──────────
+        # 原 chained 只把上一位回复注入下一位（results[-1]），多人联动时
+        # 丙只看乙、丁只看丙，看不见用户原话和更早的发言 → 各编各的。
+        # 这里维护 transcript：用户原话(首行) + 到目前为止所有成功发言，
+        # 每轮注入"全场脉络"而非只见上家，让每个角色接得住全场的话茬。
+        # 变量是本方法局部作用域：一场 parallel_handoff 结束即销毁，
+        # 多代理同场结束后绝无残留注入（配合 memory.py _strip_chain_injection 剥离）。
+        transcript_blocks = []
+        if message and str(message).strip():
+            transcript_blocks.append(f"▍{self._get_user_address()}：{str(message).strip()}")
+        for i, c in enumerate(calls):
+            # ── 跨轮续接：首发者（i==0）也要看上一轮脉络 ──
+            # chained 默认只把前面人的回复注入后面人，i==0 的首发者无注入；
+            # 多代理续接场景下，她必须知道上轮每个人的发言，
+            # 否则只能凭长期记忆瞎召回 → 拉错人（未在场角色乱入、在场者被晾）。
+            if i == 0 and _prev_note:
+                c = dict(c)
+                c["input"] = _prev_note + (c.get("input") or "")
+            if i > 0 and results:
+                c = dict(c)
+                # 重建全场：用户原话 + 当前角色前所有成功/失败发言（每人标注是谁说的）
+                transcript_blocks_cur = list(transcript_blocks)
+                for prev in results:
+                    prev_display = self._display_name(prev.get("agent_name", ""))
+                    if prev.get("success"):
+                        prev_text = prev.get('response', '')
+                        # ── 接龙长回复精简：开关开启且超阈值 → 摘要+首尾 ──
+                        summary_enabled = bool(self._cfg("chain_summary_enabled", True))
+                        threshold = int(self._cfg("chain_summary_threshold", 600))
+                        if summary_enabled and len(prev_text) > threshold:
+                            try:
+                                summary_prov = str(self._cfg("chain_summary_model", "") or "").strip()
+                                if not summary_prov:
+                                    summary_prov = await self.context.get_current_chat_provider_id(
+                                        event.unified_msg_origin
+                                    )
+                                summarized = await self._summarize_chain_reply(
+                                    prev_display, prev_text, summary_prov, timeout
+                                )
+                                if summarized:
+                                    prev_text = summarized
+                            except Exception as e:
+                                logger.warning(
+                                    f"[parallel_handoff] 接龙精简准备失败，降级原样注入: {e}"
+                                )
+                        transcript_blocks_cur.append(f"【{prev_display}】{prev_text}")
+                    else:
+                        transcript_blocks_cur.append(f"【{prev_display}】（未接/超时）")
+                # 拼接注入块：全场脉络 包裹在当前角色的 [决策注入] 之前
+                cur_name = self._display_name(c.get("agent_name", ""))
+                chain_note = (
+                    "（接龙·全场脉络，到目前为止）：\n"
+                    + "\n".join(transcript_blocks_cur)
+                    + f"\n\n请接续上文，现在轮到你（【{cur_name}】）回应，顺着全场的话茬自然往下："
+                )
+                c["input"] = chain_note + (c.get("input") or "")
+            r = await self._call_one(
+                c,
+                event=event,
+                handoff_map=handoff_map,
+                scene_prefix=scene_prefix,
+                livingmemory_plugin=livingmemory_plugin,
+                enable_name_prefix=enable_name_prefix,
+                timeout=timeout,
+                speaker=speaker,
+                dual_output=also_return,
+            )
+            results.append(r)
+            # ── 流式转发：本条立刻发出，不等整条链 ──
+            # both 模式禁用流式：双段要等全文出来才能拆【日常】/【技术】，
+            # 边生成边发会把两段标记一起发出去。
+            if enable_segmented_forward and not also_return:
+                if r.get("success") and self._is_direct_delivery(r.get("agent_name", ""), direct_agents, route_mode):
+                    # direct 代理：已流式转发，统一转发阶段跳过
+                    r["_sent"] = True
+                    await self._forward_segmented(r.get("response", ""), event)
+                    # [2026-09-12 旁听窗] 流式路径补记录（原仅统一转发路径记录），
+                    # 供主代理下一轮可见性注入
+                    self._record_direct_reply(
+                        event.unified_msg_origin,
+                        r.get("agent_name", ""),
+                        r.get("response", "") or "",
+                    )
+                elif not r.get("success"):
+                    # 失败：已通知，统一转发阶段跳过
+                    r["_sent"] = True
+                    await self._send_failure_notify(r, event)
+                # 非 direct 且成功：不打 _sent，
+                # 交由统一转发阶段收集进 return_agent_results 返回完整回复
+        # ── 接龙结束：整场沉淀进各角色 livingmemory（可选，默认开）──
+        # 用户拍板（2026-09-07）：多代理同场可以留长期记忆——记整场剧情脉络、
+        # 落各角色 livingmemory、且每人存各自主观视角（不共享一份上帝视角）。
+        # 但必须是"可自由回忆起"而非"日常强制浮现"：低 importance + 检索式召回，
+        # 她主动检索/语境触及才捞到，日常对话不跳脸、不污染正常对话。
+        # 开关 enable_chain_memory_persist 默认开，用户任何时刻可一键关。
+        if self._cfg("enable_chain_memory_persist", True):
+            try:
+                await self._persist_chain_memories(
+                    message or "",
+                    results,
+                    livingmemory_plugin,
+                    event,
+                )
+            except Exception as _persist_e:
+                logger.warning(
+                    f"[parallel_handoff] 整场记忆沉淀失败（非致命，不影响回复）: {_persist_e}"
+                )
+        # ── 接龙结束：本场脉络写入会话级缓存（跨轮续接用）────────
+        # 2026-09-08 用户实测：多代理同场续接第二轮时首发者失忆，
+        # 误拉其他角色进场、在场者被晾——根因是 chained 全场脉络是单次调用局部变量。
+        # 2026-09-19：逻辑抽到 _save_chain_round_ctx，并行模式共用同一份缓存，
+        # 使「并行→并行」「并行→接龙」两种续接也能看到上一场谁说了什么。
+        self._save_chain_round_ctx(_sess, results)
+        # 接龙模式保持调用顺序发送，不按 order 重排（order 仅对并行模式生效）
+        return results
+    async def _run_background(self, calls: list, ctx) -> str:
+        """后台并行：每个子代理各起一个后台任务，立即返回 task_id（2026-09-19 从 parallel_handoff 提出，纯搬移）。"""
+        event = ctx.event
+        handoff_map = ctx.handoff_map
+        scene_prefix = ctx.scene_prefix
+        livingmemory_plugin = ctx.livingmemory_plugin
+        enable_name_prefix = ctx.enable_name_prefix
+        timeout = ctx.timeout
+        speaker = ctx.speaker
+        also_return = ctx.dual_output
+        direct_agents = ctx.direct_agents
+        route_mode = ctx.route_mode
+        enable_segmented_forward = ctx.enable_segmented_forward
+        _sess = event.unified_msg_origin
+        # ── 二期：后台并行（不阻塞主代理）─────────────────
+        # 默认关闭（background=False 走下面的 gather 原路径，行为零变化）。
+        # 开启后每个子代理各自一个后台任务，本方法立即返回 task_id，
+        # 主代理可以继续跟用户说话，结果用 task_result 取。
+        session_key = getattr(event, "unified_msg_origin", "") or "default"
+        submitted = []
+        for _c in calls:
+            _agent = _c.get("agent_name") or ""
+            _tid, _err = self._task_runner.submit(
+                session_key,
+                _agent,
+                (_c.get("input") or "")[:60],
+                (lambda _cc=_c: self._run_one_as_text(
+                    _cc,
+                    event=event,
+                    handoff_map=handoff_map,
+                    scene_prefix=scene_prefix,
+                    livingmemory_plugin=livingmemory_plugin,
+                    enable_name_prefix=enable_name_prefix,
+                    timeout=timeout,
+                    speaker=speaker,
+                    dual_output=also_return,
+                )),
+            )
+            submitted.append(
+                {"agent": _agent, "task_id": _tid, "error": _err}
+            )
+        return json.dumps(
+            {
+                "background": True,
+                "tasks": submitted,
+                "hint": (
+                    "任务已在后台执行，主代理无需等待。"
+                    "用 task_result 取结果（会等），task_status 查进度，"
+                    "task_stop 取消。"
+                ),
+            },
+            ensure_ascii=False,
+        )
+    async def _run_parallel(self, calls: list, ctx) -> list:
+        """并行模式：gather 并发 + 跨轮脉络/同场实况注入 + order 重排（2026-09-19 从 parallel_handoff 提出，纯搬移）。"""
+        event = ctx.event
+        handoff_map = ctx.handoff_map
+        scene_prefix = ctx.scene_prefix
+        livingmemory_plugin = ctx.livingmemory_plugin
+        enable_name_prefix = ctx.enable_name_prefix
+        timeout = ctx.timeout
+        speaker = ctx.speaker
+        also_return = ctx.dual_output
+        direct_agents = ctx.direct_agents
+        route_mode = ctx.route_mode
+        enable_segmented_forward = ctx.enable_segmented_forward
+        _sess = event.unified_msg_origin
+        # ── 并行模式（默认）──
+        # ── 跨轮脉络注入（2026-09-19：并行模式也吃上）──────────
+        # 用户拍板（2026-09-19）：并行模式下子代理各跑各的、互不知情，
+        # 要像「同一间办公室」——上一轮谁说过什么、谁还在场，注入给本轮每个调用。
+        # 复用 chained 的 _build_prev_round_note（自带 5min 窗口 + 名单交集校验），
+        # 无上轮缓存/名单无交集时返回空串，零注入零开销。
+        try:
+            _prev_note = self._build_prev_round_note(
+                _sess, [c.get("agent_name") for c in calls]
+            )
+            if _prev_note:
+                for _c in calls:
+                    _c["input"] = _prev_note + (_c.get("input") or "")
+                logger.info(
+                    f"[parallel_handoff] 并行跨轮脉络注入 "
+                    f"{len(calls)} 个调用 session={_sess}"
+                )
+        except Exception as _pn_e:
+            logger.warning(
+                f"[parallel_handoff] 并行跨轮脉络注入失败（非致命）: {_pn_e}"
+            )
+        # ── 同场实况注入（2026-09-19：此刻谁在后台干活）──────────
+        # 与跨轮脉络互补：脉络是「上一轮谁说了什么」，实况是「此刻谁在干什么」。
+        # 数据源 TaskRunner.tasks，仅在确实有活跃/刚完成任务时返回非空，
+        # 没别人在跑就零注入零 token 开销。
+        try:
+            _live_note = self._build_live_status_note(_sess)
+            if _live_note:
+                for _c in calls:
+                    _c["input"] = _live_note + (_c.get("input") or "")
+                logger.info(
+                    f"[parallel_handoff] 同场实况注入 "
+                    f"{len(calls)} 个调用 session={_sess}"
+                )
+        except Exception as _ls_e:
+            logger.warning(
+                f"[parallel_handoff] 同场实况注入失败（非致命）: {_ls_e}"
+            )
+        tasks = [
+            self._call_one(
+                c,
+                event=event,
+                handoff_map=handoff_map,
+                scene_prefix=scene_prefix,
+                livingmemory_plugin=livingmemory_plugin,
+                enable_name_prefix=enable_name_prefix,
+                timeout=timeout,
+                speaker=speaker,
+                dual_output=also_return,
+            )
+            for c in calls
+        ]
+        results = await asyncio.gather(*tasks)
+        # 按 order 排序（如果有的话）
+        has_order = any(r.get("order") is not None for r in results)
+        if has_order:
+            results.sort(
+                key=lambda r: (
+                    r.get("order") if r.get("order") is not None else 999999
+                )
+            )
+        # ── 并行结束：本场脉络写入会话级缓存（跨轮续接用）────────
+        # [2026-09-19] 与 chained 共用同一份缓存与写入逻辑，
+        # 使「并行 → 并行」「并行 → 接龙」两种续接都能看到上一场谁说了什么。
+        self._save_chain_round_ctx(_sess, results)
+        return results
 
     async def parallel_handoff(
         self,
@@ -1054,390 +1581,24 @@ Args:
         t_total = time.perf_counter()
         # [2026-09-19] _sess 提到分支外：并行模式也要用（跨轮脉络注入/缓存）
         _sess = event.unified_msg_origin
-        if call_mode == "chained":
-            # ── 接龙模式：串行调用，前一个子代理的回复注入下一个的输入 ──
-            # 注：direct/relay 均为发送方式，与接龙的调用方式正交，互不冲突。
-            # 流式转发：每条完成后立刻发送（direct 直接发/失败立刻通知），
-            # 无需等整条链跑完；失败的子代理在链上标注，下一个能看到谁掉队。
-            results = []
-            # ── 跨轮多代理续接：首发者防失忆（2026-09-08 用户实测）──────
-            # 上一轮 chained 结束把「在场者+各自发言」按 session 存入 _chain_round_ctx。
-            # 本轮若与上轮在场者有交集（续接场景），把上轮脉络注入首发者 input，
-            # 让她知道「上一轮谁说了什么、谁还在场」——否则首发者只凭自己记忆召回，
-            # 会把不在场的人叫进来（实测：误拉其他角色进场、在场者被晾）。
-            _prev_note = self._build_prev_round_note(
-                _sess, [c.get("agent_name") for c in calls]
-            )
-            # ── 全场剧情脉络（2026-09-07 修复多代理同场自说自话）──────────
-            # 原 chained 只把上一位回复注入下一位（results[-1]），多人联动时
-            # 丙只看乙、丁只看丙，看不见用户原话和更早的发言 → 各编各的。
-            # 这里维护 transcript：用户原话(首行) + 到目前为止所有成功发言，
-            # 每轮注入"全场脉络"而非只见上家，让每个角色接得住全场的话茬。
-            # 变量是本方法局部作用域：一场 parallel_handoff 结束即销毁，
-            # 多代理同场结束后绝无残留注入（配合 memory.py _strip_chain_injection 剥离）。
-            transcript_blocks = []
-            if message and str(message).strip():
-                transcript_blocks.append(f"▍{self._get_user_address()}：{str(message).strip()}")
-            for i, c in enumerate(calls):
-                # ── 跨轮续接：首发者（i==0）也要看上一轮脉络 ──
-                # chained 默认只把前面人的回复注入后面人，i==0 的首发者无注入；
-                # 多代理续接场景下，她必须知道上轮每个人的发言，
-                # 否则只能凭长期记忆瞎召回 → 拉错人（未在场角色乱入、在场者被晾）。
-                if i == 0 and _prev_note:
-                    c = dict(c)
-                    c["input"] = _prev_note + (c.get("input") or "")
-                if i > 0 and results:
-                    c = dict(c)
-                    # 重建全场：用户原话 + 当前角色前所有成功/失败发言（每人标注是谁说的）
-                    transcript_blocks_cur = list(transcript_blocks)
-                    for prev in results:
-                        prev_display = self._display_name(prev.get("agent_name", ""))
-                        if prev.get("success"):
-                            prev_text = prev.get('response', '')
-                            # ── 接龙长回复精简：开关开启且超阈值 → 摘要+首尾 ──
-                            summary_enabled = bool(self._cfg("chain_summary_enabled", True))
-                            threshold = int(self._cfg("chain_summary_threshold", 600))
-                            if summary_enabled and len(prev_text) > threshold:
-                                try:
-                                    summary_prov = str(self._cfg("chain_summary_model", "") or "").strip()
-                                    if not summary_prov:
-                                        summary_prov = await self.context.get_current_chat_provider_id(
-                                            event.unified_msg_origin
-                                        )
-                                    summarized = await self._summarize_chain_reply(
-                                        prev_display, prev_text, summary_prov, timeout
-                                    )
-                                    if summarized:
-                                        prev_text = summarized
-                                except Exception as e:
-                                    logger.warning(
-                                        f"[parallel_handoff] 接龙精简准备失败，降级原样注入: {e}"
-                                    )
-                            transcript_blocks_cur.append(f"【{prev_display}】{prev_text}")
-                        else:
-                            transcript_blocks_cur.append(f"【{prev_display}】（未接/超时）")
-                    # 拼接注入块：全场脉络 包裹在当前角色的 [决策注入] 之前
-                    cur_name = self._display_name(c.get("agent_name", ""))
-                    chain_note = (
-                        "（接龙·全场脉络，到目前为止）：\n"
-                        + "\n".join(transcript_blocks_cur)
-                        + f"\n\n请接续上文，现在轮到你（【{cur_name}】）回应，顺着全场的话茬自然往下："
-                    )
-                    c["input"] = chain_note + (c.get("input") or "")
-                r = await self._call_one(
-                    c,
-                    event=event,
-                    handoff_map=handoff_map,
-                    scene_prefix=scene_prefix,
-                    livingmemory_plugin=livingmemory_plugin,
-                    enable_name_prefix=enable_name_prefix,
-                    timeout=timeout,
-                    speaker=speaker,
-                    dual_output=also_return,
-                )
-                results.append(r)
-                # ── 流式转发：本条立刻发出，不等整条链 ──
-                # both 模式禁用流式：双段要等全文出来才能拆【日常】/【技术】，
-                # 边生成边发会把两段标记一起发出去。
-                if enable_segmented_forward and not also_return:
-                    if r.get("success") and self._is_direct_delivery(r.get("agent_name", ""), direct_agents, route_mode):
-                        # direct 代理：已流式转发，统一转发阶段跳过
-                        r["_sent"] = True
-                        await self._forward_segmented(r.get("response", ""), event)
-                        # [2026-09-12 旁听窗] 流式路径补记录（原仅统一转发路径记录），
-                        # 供主代理下一轮可见性注入
-                        self._record_direct_reply(
-                            event.unified_msg_origin,
-                            r.get("agent_name", ""),
-                            r.get("response", "") or "",
-                        )
-                    elif not r.get("success"):
-                        # 失败：已通知，统一转发阶段跳过
-                        r["_sent"] = True
-                        await self._send_failure_notify(r, event)
-                    # 非 direct 且成功：不打 _sent，
-                    # 交由统一转发阶段收集进 return_agent_results 返回完整回复
-            # ── 接龙结束：整场沉淀进各角色 livingmemory（可选，默认开）──
-            # 用户拍板（2026-09-07）：多代理同场可以留长期记忆——记整场剧情脉络、
-            # 落各角色 livingmemory、且每人存各自主观视角（不共享一份上帝视角）。
-            # 但必须是"可自由回忆起"而非"日常强制浮现"：低 importance + 检索式召回，
-            # 她主动检索/语境触及才捞到，日常对话不跳脸、不污染正常对话。
-            # 开关 enable_chain_memory_persist 默认开，用户任何时刻可一键关。
-            if self._cfg("enable_chain_memory_persist", True):
-                try:
-                    await self._persist_chain_memories(
-                        message or "",
-                        results,
-                        livingmemory_plugin,
-                        event,
-                    )
-                except Exception as _persist_e:
-                    logger.warning(
-                        f"[parallel_handoff] 整场记忆沉淀失败（非致命，不影响回复）: {_persist_e}"
-                    )
-            # ── 接龙结束：本场脉络写入会话级缓存（跨轮续接用）────────
-            # 2026-09-08 用户实测：多代理同场续接第二轮时首发者失忆，
-            # 误拉其他角色进场、在场者被晾——根因是 chained 全场脉络是单次调用局部变量。
-            # 2026-09-19：逻辑抽到 _save_chain_round_ctx，并行模式共用同一份缓存，
-            # 使「并行→并行」「并行→接龙」两种续接也能看到上一场谁说了什么。
-            self._save_chain_round_ctx(_sess, results)
-            # 接龙模式保持调用顺序发送，不按 order 重排（order 仅对并行模式生效）
-        elif background and getattr(self, "_task_runner", None) is not None:
-            # ── 二期：后台并行（不阻塞主代理）─────────────────
-            # 默认关闭（background=False 走下面的 gather 原路径，行为零变化）。
-            # 开启后每个子代理各自一个后台任务，本方法立即返回 task_id，
-            # 主代理可以继续跟用户说话，结果用 task_result 取。
-            session_key = getattr(event, "unified_msg_origin", "") or "default"
-            submitted = []
-            for _c in calls:
-                _agent = _c.get("agent_name") or ""
-                _tid, _err = self._task_runner.submit(
-                    session_key,
-                    _agent,
-                    (_c.get("input") or "")[:60],
-                    (lambda _cc=_c: self._run_one_as_text(
-                        _cc,
-                        event=event,
-                        handoff_map=handoff_map,
-                        scene_prefix=scene_prefix,
-                        livingmemory_plugin=livingmemory_plugin,
-                        enable_name_prefix=enable_name_prefix,
-                        timeout=timeout,
-                        speaker=speaker,
-                        dual_output=also_return,
-                    )),
-                )
-                submitted.append(
-                    {"agent": _agent, "task_id": _tid, "error": _err}
-                )
-            return json.dumps(
-                {
-                    "background": True,
-                    "tasks": submitted,
-                    "hint": (
-                        "任务已在后台执行，主代理无需等待。"
-                        "用 task_result 取结果（会等），task_status 查进度，"
-                        "task_stop 取消。"
-                    ),
-                },
-                ensure_ascii=False,
-            )
-        else:
-            # ── 并行模式（默认）──
-            # ── 跨轮脉络注入（2026-09-19：并行模式也吃上）──────────
-            # 用户拍板（2026-09-19）：并行模式下子代理各跑各的、互不知情，
-            # 要像「同一间办公室」——上一轮谁说过什么、谁还在场，注入给本轮每个调用。
-            # 复用 chained 的 _build_prev_round_note（自带 5min 窗口 + 名单交集校验），
-            # 无上轮缓存/名单无交集时返回空串，零注入零开销。
-            try:
-                _prev_note = self._build_prev_round_note(
-                    _sess, [c.get("agent_name") for c in calls]
-                )
-                if _prev_note:
-                    for _c in calls:
-                        _c["input"] = _prev_note + (_c.get("input") or "")
-                    logger.info(
-                        f"[parallel_handoff] 并行跨轮脉络注入 "
-                        f"{len(calls)} 个调用 session={_sess}"
-                    )
-            except Exception as _pn_e:
-                logger.warning(
-                    f"[parallel_handoff] 并行跨轮脉络注入失败（非致命）: {_pn_e}"
-                )
-            # ── 同场实况注入（2026-09-19：此刻谁在后台干活）──────────
-            # 与跨轮脉络互补：脉络是「上一轮谁说了什么」，实况是「此刻谁在干什么」。
-            # 数据源 TaskRunner.tasks，仅在确实有活跃/刚完成任务时返回非空，
-            # 没别人在跑就零注入零 token 开销。
-            try:
-                _live_note = self._build_live_status_note(_sess)
-                if _live_note:
-                    for _c in calls:
-                        _c["input"] = _live_note + (_c.get("input") or "")
-                    logger.info(
-                        f"[parallel_handoff] 同场实况注入 "
-                        f"{len(calls)} 个调用 session={_sess}"
-                    )
-            except Exception as _ls_e:
-                logger.warning(
-                    f"[parallel_handoff] 同场实况注入失败（非致命）: {_ls_e}"
-                )
-            tasks = [
-                self._call_one(
-                    c,
-                    event=event,
-                    handoff_map=handoff_map,
-                    scene_prefix=scene_prefix,
-                    livingmemory_plugin=livingmemory_plugin,
-                    enable_name_prefix=enable_name_prefix,
-                    timeout=timeout,
-                    speaker=speaker,
-                    dual_output=also_return,
-                )
-                for c in calls
-            ]
-            results = await asyncio.gather(*tasks)
-            # 按 order 排序（如果有的话）
-            has_order = any(r.get("order") is not None for r in results)
-            if has_order:
-                results.sort(
-                    key=lambda r: (
-                        r.get("order") if r.get("order") is not None else 999999
-                    )
-                )
-            # ── 并行结束：本场脉络写入会话级缓存（跨轮续接用）────────
-            # [2026-09-19] 与 chained 共用同一份缓存与写入逻辑，
-            # 使「并行 → 并行」「并行 → 接龙」两种续接都能看到上一场谁说了什么。
-            self._save_chain_round_ctx(_sess, results)
-        total_latency_ms = int((time.perf_counter() - t_total) * 1000)
-
-        # ── 跟踪最近调用的子代理（用于消歧） ─────────────────
-        if enable_disambiguation:
-            session_id = event.unified_msg_origin
-            for r in results:
-                if r.get("success") and r.get("agent_name"):
-                    self._last_agent[session_id] = r["agent_name"]
-                    if self._is_direct_delivery(r.get("agent_name", ""), direct_agents, route_mode):
-                        # 直发成功的回复尾部记入路由记忆（T2 剧情参照用）
-                        self._record_direct_reply(
-                            session_id,
-                            r["agent_name"],
-                            r.get("_user_response") or r.get("response", "") or "",
-                        )
-
-        success_count = sum(1 for r in results if r.get("success"))
-        fail_count = len(results) - success_count
-        logger.info(
-            f"[parallel_handoff] Completed: {success_count}/{len(results)} succeeded, "
-            f"{fail_count} failed, total {total_latency_ms}ms"
+        _call_ctx = SimpleNamespace(
+            event=event, handoff_map=handoff_map, scene_prefix=scene_prefix,
+            livingmemory_plugin=livingmemory_plugin,
+            enable_name_prefix=enable_name_prefix, timeout=timeout,
+            speaker=speaker, dual_output=also_return,
+            direct_agents=direct_agents, route_mode=route_mode,
+            enable_segmented_forward=enable_segmented_forward,
         )
-
-        # （direct_agents / return_agent_results 已在调度前定义，此处复用）
-
-        # ── 分段转发：按中文括号拆分逐条发送 ─────────────────
-        # 2026-09-11 用户拍板：回传截断可配置化。
-        # 原 preview 硬编码 120 字，segmented_forward 下主代理只拿得到 120 字摘要，
-        # 无法做汇总/复核（今晚实测撞三次：子代理答卷、盲评表、G3 交付物）。
-        _preview_chars = int(self._cfg("subagent_response_preview_chars", 4000))
-        if enable_segmented_forward:
-            self._suppress_mainagent_prefix = True
-            self._suppress_mainagent_ts = time.time()
-            self._suppress_mainagent_msg = (event.get_message_str() or "").strip()
-            pending_text = ""
-            for r in results:
-                agent_name = r.get("agent_name", "")
-                is_direct = self._is_direct_delivery(agent_name, direct_agents, route_mode)
-
-                # 接龙模式下该条已流式发送/通知，跳过避免重复
-                # both 模式例外：已成功直发的条目也要回传主代理。
-                # 判据用 is_direct + success：_sent 的两个来源里只有“direct 且成功”那条满足，
-                # 失败通知只打 _sent，不会误收。（原先靠手动置位的 _directed 已删，它是冗余的）
-                if r.get("_sent"):
-                    if also_return and is_direct and r.get("success"):
-                        if agent_name not in [ra.get("agent_name") for ra in return_agent_results]:
-                            return_agent_results.append(r)
-                    continue
-
-                if r.get("success") and is_direct:
-                    if also_return:
-                        # 双段投递：用户端发【日常】，主代理收【技术】
-                        _user_part, _tech_part = self._split_dual_output(r.get("response", ""))
-                        r["_tech_response"] = _tech_part
-                        r["_user_response"] = _user_part
-                        await self._forward_segmented(_user_part, event)
-                        if agent_name not in [ra.get("agent_name") for ra in return_agent_results]:
-                            return_agent_results.append(r)
-                    else:
-                        await self._forward_segmented(r.get("response", ""), event)
-                elif r.get("success"):
-                    # 非直接发送代理 — 收集完整回复返回给主代理
-                    if agent_name not in [ra.get("agent_name") for ra in return_agent_results]:
-                        return_agent_results.append(r)
-                else:
-                    await self._send_failure_notify(r, event)
-
-            # ── 构建返回摘要 ─────────────────────────────────
-            # both 下已回传全文的条目，results 里只留一句指路，避免同一份回复占两份上下文
-            _returned_names = (
-                {ra.get("agent_name") for ra in return_agent_results} if also_return else set()
-            )
-            summary = {
-                "segmented_forward": True,
-                "note": (
-                    "各子代理回复已分条直接发送给用户，以下为摘要。"
-                    "带 returned_agents 的条目，完整回复也已回传给你；用户看过原文，你只做增量，不要复述。"
-                    if also_return
-                    else "各子代理回复已分条直接发送给用户,以下为摘要"
-                ),
-                "results": [
-                    {
-                        "agent_name": r.get("agent_name"),
-                        "success": r.get("success"),
-                        "latency_ms": r.get("latency_ms"),
-                        "response_preview": (
-                            "（全文已回传，见 returned_agents）"
-                            if r.get("agent_name") in _returned_names
-                            else (r.get("response", "") or "")[:_preview_chars]
-                            + (
-                                "…"
-                                if len(r.get("response", "") or "") > _preview_chars
-                                else ""
-                            )
-                        ),
-                        # 被吞了多少一眼看得见：总量 + 是否截断
-                        "response_chars": len(r.get("response", "") or ""),
-                        "response_truncated": len(r.get("response", "") or "")
-                        > _preview_chars,
-                    }
-                    for r in results
-                ],
-                "summary": {
-                    "total": len(results),
-                    "success": success_count,
-                    "failed": fail_count,
-                    "total_latency_ms": total_latency_ms,
-                },
-            }
-            # 如有非直接发送代理的完整回复，附加到摘要中
-            if return_agent_results:
-                summary["note"] = (
-                    "以下子代理回传给你的是【技术】段（用户端看到的是【日常】段，两段分开写）。"
-                    "你只做增量（决策/下一步/风险），不要复述。"
-                    if also_return
-                    else "以下子代理的完整回复返回给主代理处理。"
-                )
-                summary["returned_agents"] = [
-                    {
-                        "agent_name": ra.get("agent_name"),
-                        "success": True,
-                        "latency_ms": ra.get("latency_ms"),
-                        "full_response": ra.get("_tech_response") or ra.get("response", ""),
-                    }
-                    for ra in return_agent_results
-                ]
-            # 注释掉: 此flag由钩子清空chain后自行复位, 不在工具内复位以拦截后续回显
-            # self._suppress_mainagent_prefix = False
-            # 返回子代理回复文本供主代理转发。
-            # 修复：非 direct 代理的完整回复收集在 return_agent_results 中，
-            # 只返回 pending_text 会把回复吞成 "✓"——有完整回复时必须返回摘要 JSON。
-            if pending_text:
-                return pending_text
-            # 全失败时也必须返回摘要 JSON——以前返回 "✓" 会让主代理对失败完全无感知
-            # （2026-09-03 实测：deepseek-v4-flash 端点挂起双双超时，主代理只见 "✓"）
-            return json.dumps(summary, ensure_ascii=False)
-
-        # ── 默认：合并返回 ───────────────────────────────────
-        return json.dumps(
-            {
-                "results": results,
-                "summary": {
-                    "total": len(results),
-                    "success": success_count,
-                    "failed": fail_count,
-                    "total_latency_ms": total_latency_ms,
-                },
-            },
-            ensure_ascii=False,
-            indent=2,
+        if call_mode == "chained":
+            results = await self._run_chained(calls, _call_ctx, message)
+        elif background and getattr(self, "_task_runner", None) is not None:
+            return await self._run_background(calls, _call_ctx)
+        else:
+            results = await self._run_parallel(calls, _call_ctx)
+        return await self._finalize_dispatch(
+            results, event, t_total, enable_disambiguation,
+            enable_segmented_forward, direct_agents, route_mode,
+            also_return, return_agent_results,
         )
 
     # ── 跨轮上下文已迁至 ctx_engine.ContextEngine ──
