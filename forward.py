@@ -44,6 +44,41 @@ def _get_baby_feed():
 class ForwardMixin:
     """子代理分段转发 / 主代理分段转发 / 姓名前缀 / 主代理前缀注入"""
 
+    # ── 投递判定与双段拆解（2026-09-19 从 dispatch.py 迁出）──────────
+    # 「这次调用是否直发用户端」和 both 模式的双段拆解，语义上都属投递，
+    # 归本模块——_forward_segmented / _send_mainagent_segmented 都在这儿。
+    def _is_direct_delivery(self, agent_name: str, direct_agents: set, route_mode: str) -> bool:
+        """判定某子代理本次调用是否直发用户端。
+
+        route_mode=relay 时全员走 relay（回复返回主代理汇总）；
+        route_mode=direct/auto 时按直发名单判定。
+        """
+        if route_mode == "relay":
+            return False
+        return (agent_name or "").lower() in direct_agents
+
+    # both 双段输出的拆解：直发用户取【日常】，回传主代理取【技术】。
+    # 兜底策略是「宁可重复，不可丢」——没写标记就两路都用全文，
+    # 只写了一段就那一段兜两路。格式没写对不该导致内容消失。
+    # 注意：user 组要连【日常】标记之前的内容一起收——子代理的名字前缀（【助手B】）
+    # 是 _maybe_prefix 加在整段回复最前面的，落在标记之外，只取标记之后会把前缀丢掉，
+    # 用户就不知道是谁在说话。
+    _DUAL_USER_RE = re.compile(r"^(.*?)【日常】\s*(.*?)(?=【技术】|$)", re.S)
+    _DUAL_TECH_RE = re.compile(r"【技术】\s*(.*)$", re.S)
+
+    def _split_dual_output(self, text: str) -> tuple:
+        """把双段输出拆成 (日常段, 技术段)。缺标记时返回 (全文, 全文)。"""
+        _t = (text or "").strip()
+        if not _t:
+            return "", ""
+        _mu = self._DUAL_USER_RE.search(_t)
+        _mt = self._DUAL_TECH_RE.search(_t)
+        if not (_mu or _mt):
+            return _t, _t
+        _user = (_mu.group(1) + _mu.group(2)).strip() if _mu else ""
+        _tech = _mt.group(1).strip() if _mt else ""
+        return (_user or _t), (_tech or _t)
+
     async def _forward_segmented(self, text, event):
         """单条子代理回复的分段直接发送（流式转发/统一转发共用）。"""
         try:

@@ -24,6 +24,22 @@ RUNTIME_BUILD_TAG = "build-2026-09-16-0026-r10"
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 from astrbot.core.agent.message import TextPart
+
+# 子代理系统提示词常量（2026-09-19 迁出到 prompts.py，改文案不再碰调度代码）
+try:
+    from .prompts import (
+        SUBAGENT_DUAL_OUTPUT,
+        SUBAGENT_OUTPUT_DISCIPLINE,
+        SUBAGENT_RETRIEVAL_DISCIPLINE,
+        SUBAGENT_TASKCARD_GUIDE,
+    )
+except ImportError:  # 顶层包兜底（对齐本文件其他双分支导入）
+    from prompts import (
+        SUBAGENT_DUAL_OUTPUT,
+        SUBAGENT_OUTPUT_DISCIPLINE,
+        SUBAGENT_RETRIEVAL_DISCIPLINE,
+        SUBAGENT_TASKCARD_GUIDE,
+    )
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -113,15 +129,6 @@ class DispatchMixin:
         self._tool_call_seen[dedup_key] = (now_ts, None)
         return None
 
-    def _is_direct_delivery(self, agent_name: str, direct_agents: set, route_mode: str) -> bool:
-        """判定某子代理本次调用是否直发用户端。
-
-        route_mode=relay 时全员走 relay（回复返回主代理汇总）；
-        route_mode=direct/auto 时按直发名单判定。
-        """
-        if route_mode == "relay":
-            return False
-        return (agent_name or "").lower() in direct_agents
 
     def _maybe_prefix(self, agent_name: str, text: str, enable_name_prefix: bool) -> str:
         """子代理回复姓名前缀（render 块方法化）：先查覆盖表，再走全局开关"""
@@ -657,23 +664,6 @@ class DispatchMixin:
             umo = event.unified_msg_origin
             session_prov = await self.context.get_current_chat_provider_id(umo)
             prov_id = handoff.provider_id or session_prov
-            # PROV_DEBUG 打点（2026-08-26 排查：子代理烧 session provider 而非配置 provider）
-            try:
-                _prov = await self.context.provider_manager.get_provider_by_id(prov_id)
-                if _prov is not None:
-                    _src = getattr(_prov, "provider_source_id", None)
-                    logger.info(
-                        f"[PROV_DEBUG] agent={agent_name} handoff={handoff.provider_id} "
-                        f"session={session_prov} final={prov_id} "
-                        f"instance=OK id={getattr(_prov, 'id', None)} source={_src}"
-                    )
-                else:
-                    logger.info(
-                        f"[PROV_DEBUG] agent={agent_name} handoff={handoff.provider_id} "
-                        f"session={session_prov} final={prov_id} instance=MISSING"
-                    )
-            except Exception as e:
-                logger.info(f"[PROV_DEBUG] agent={agent_name} final={prov_id} err={e}")
 
             # ── 上下文注入：跨轮对话历史（ContextEngine 独立引擎） ──
             # 2026-09-11 改造（用户拍板）：历史走结构化 contexts，不再拼成一条
@@ -701,34 +691,10 @@ class DispatchMixin:
             prompt_with_extra = (
                 f"{final_input}\n\n{_extra_text}" if _extra_text else final_input
             )
-            # [PROF-PROMPT 2026-09-12] 请求体分解打点（一次性实验，完事即撤）
-            try:
-                _sys_p = self._subagent_system_prompt(handoff, agent_name, dual_output=dual_output)
-                _ctx_chars = sum(len(m.content or "") for m in (_ctx_contexts or []))
-                _tl = getattr(subagent_tools, "tools", None) or subagent_tools or []
-                _tools_chars = 0
-                for _t in _tl:
-                    _tools_chars += len(str(getattr(_t, "name", "") or "")) + len(
-                        str(getattr(_t, "description", "") or "")
-                    )
-                    _p = getattr(_t, "parameters", None)
-                    if _p:
-                        try:
-                            _tools_chars += len(
-                                json.dumps(_p, ensure_ascii=False, default=str)
-                            )
-                        except Exception:
-                            pass
-                logger.info(
-                    f"[PROF-PROMPT] agent={agent_name} sys={len(_sys_p)} "
-                    f"ctx={_ctx_chars}({len(_ctx_contexts or [])}条) "
-                    f"tools={len(_tl)}({_tools_chars}) "
-                    f"extra={len(_extra_text)} input={len(final_input)} "
-                    f"prompt={len(prompt_with_extra)}"
-                )
-            except Exception as _pe:  # 打点绝不拖垮主链
-                logger.warning(f"[PROF-PROMPT] 打点失败: {_pe}")
-                _sys_p = self._subagent_system_prompt(handoff, agent_name, dual_output=dual_output)
+            # 子代理系统提示（打点块删除后此处是唯一构造点，2026-09-19）
+            _sys_p = self._subagent_system_prompt(
+                handoff, agent_name, dual_output=dual_output
+            )
             _m_t0_sub = time.monotonic()
             llm_resp = await asyncio.wait_for(
                 self.context.tool_loop_agent(
@@ -1546,75 +1512,6 @@ Args:
                 )
 
     # ── 跨轮脉络注入块构造（2026-09-08 用户实测：多代理续接首发者失忆）────────
-    # ── 子代理检索纪律（2026-09-11 用户点名修复） ──────────────────
-    # 实证：样本子代理拿到 14 个只读工具、也真的调了 rg_search，但一次搜出 150 条
-    # 命中——关键词太宽 + 用中文描述词搜代码，信号被噪音淹没，导致 4 问只答上 2 问。
-    # 工具没毛病，缺的是「怎么用」；把检索顺序写进系统提示，不依赖模型自悟。
-    # [2026-09-15] 四条并发编排约束（实测依据：≥3 步的派单里 93% 是搜索/读取类串行，
-    # 每步边际 7.3~7.8 秒、步数-延迟皮尔逊 r=0.716，p90 24.3s 全由多步累加而来）。
-    # 只强化「怎么发工具」，不减任何工具、不动 extra。
-    _SUBAGENT_RETRIEVAL_DISCIPLINE = (
-        "\n\n【工具检索纪律——必读】\n"
-        "查代码/文件事实时严格按下面顺序，不要一上来就读全文或凭印象作答：\n"
-        "1. **同一步并发发多个候选**：rg_search / es_search / dir_list / safe_read 这类只读工具，"
-        "同一意图下的多个候选（不同字面量、不同变体、不同目录/文件）**必须在同一回合内一次并发"
-        "发出去**（一次 tool_calls 里带上 3~4 个）。实测每步往返约 7.4 秒：一次并发和四次单发拿到"
-        "的是同样的证据——**禁止「搜一次→看一眼→再搜一次」的串行试探**。\n"
-        "2. 关键词必须用代码里**真实存在的字面量**——函数名、变量名、字符串常量"
-        "（例：`_call_one`、`llm_timeout`、`Timeout after`、`max_steps`）。"
-        "**不要用中文描述词**（如「超时文案」「空回复逻辑」），中文词在代码里搜不到，只会浪费步数。\n"
-        "3. 一批搜完**换维度再发下一批**（换工具、换层次、换文件），"
-        "不要在同一维度上换着词连试——那等于把本该并发的候选拆成了串行。\n"
-        "4. 命中位置后用 safe_read 带 start_line/end_line **只读那一段**上下文，"
-        "不要读整个文件（大文件会被截断，关键段落在后面就漏了）；"
-        "**要读的文件不确定时，一次并发读 2~3 个**，别一个一个试。\n"
-        "5. **一批批完必须收口**：证据够了就给结论，不要再补一轮「顺手再搜一下」。"
-        "确实没读到原文，就直说「未读到原文」——**绝对不要编造行号或原文**。\n"
-        "6. 题目有多个小问时，每一问都要分别落实证据再作答，不要答完一问就收手。\n"
-        "7. 步数预算有限：把步数花在**并发覆盖面上**，不是花在重复试探上；"
-        "优先「定位→精读→核实」，少做无目标的宽泛搜索。"
-    )
-
-    # ── 输出纪律（2026-09-15 顾主拍板，只做这一条）────────────────
-    # 依据：延迟归因实测（31 笔有步数切分样本）——
-    #   单步延迟 ≈ 2.4s(TTFB) + 输出token/58tps + 工具 ~0.3s；
-    #   out   0-500 tokens 档延迟中位  6,668ms；
-    #   out 500-1200 tokens 档延迟中位 18,636ms —— 2.8 倍全在叙述上。
-    #   步数不是唯一杆杆：单步派单 p50 已到 14,049ms，光压步数够不到 10 秒。
-    # 原则：压叙述，不压事实——结论/行号/原文字符/数字一个都不能少。
-    _SUBAGENT_OUTPUT_DISCIPLINE = (
-        "\n\n【输出纪律·必读】\n"
-        "你这次的延迟大头不在检索，在你自己说了多少话。实测：输出 500 token 以内的"
-        "派单延迟中位 6.7 秒，500-1200 token 那档 18.6 秒——三倍差距全在叙述上。\n"
-        "所以：\n"
-        "① 直接给结论。禁止复述任务（交给你的活你自己知道）、禁止写「我先查了 X、"
-        "发现 Y、于是 Z」这类过程叙述、禁止解释你为什么这么查。\n"
-        "② 格式固定为「结论 + 证据（文件:行 或原文片段）」，每条一到两行，"
-        "能用一行写完的绝不用一段。\n"
-        "③ 禁用过程语：接下来 / 另外 / 综上所述 / 让我 / 我需要 / 首先其次最后。\n"
-        "④ 不确定就用一句话说不确定，不要用三段话描述你的犹豫。\n"
-        "⑤ 证据绝不省：行号、变量名、原文字符、数字必须留全——压的是叙述，不是事实。\n"
-        "⑥ 主代理还需要你的判断时，只加一行「判断：……」，不展开论证。\n"
-    )
-
-    # ── 双段输出（both 模式专用）────────────────────
-    # 场景：route_mode=both 时子代理回复分两路投递——【日常】直发用户，【技术】回传主代理。
-    # 动机：输出纪律要求「结论 + 证据、每条一到两行」是为了压延迟（实测 500 token 6.7s
-    #      vs 500-1200 token 18.6s），可这套格式直发给用户观感很差——会被空行与句末标点
-    #      切成十几条技术短句。所以让她分开写：给用户那段用她自己的口吻。
-    _SUBAGENT_DUAL_OUTPUT = (
-        "\n\n【本次回复分两路投递】\n"
-        "你的这条回复会被拆成两段分别送出去，请按下面格式写：\n"
-        "【日常】\n"
-        "（写给用户看的那段。用你自己的口吻，就像平时聊天——不要出现文件名、行号、"
-        "函数名、token、commit 这类技术词，不要用「结论 + 证据」那套格式，也别分点。"
-        "一到三句，说人话。）\n"
-        "【技术】\n"
-        "（写给主代理看的那段。按原有输出纪律：结论 + 证据（文件:行），每条一到两行，"
-        "压掉叙述。）\n"
-        "两段都要写。用户只看得到【日常】那段，主代理只看得到【技术】那段，"
-        "别把该说的只写在一段里。"
-    )
 
     def _subagent_system_prompt(
         self, handoff, agent_name: str = "", dual_output: bool = False
@@ -1632,68 +1529,13 @@ Args:
         return (
             base
             + _rel_block
-            + self._SUBAGENT_RETRIEVAL_DISCIPLINE
-            + self._SUBAGENT_TASKCARD_GUIDE
-            + self._SUBAGENT_OUTPUT_DISCIPLINE   # 2026-09-15：放最末，最靠近对话，注意力最强
-            + (self._SUBAGENT_DUAL_OUTPUT if dual_output else "")
+            + SUBAGENT_RETRIEVAL_DISCIPLINE
+            + SUBAGENT_TASKCARD_GUIDE
+            + SUBAGENT_OUTPUT_DISCIPLINE   # 2026-09-15：放最末，最靠近对话，注意力最强
+            + (SUBAGENT_DUAL_OUTPUT if dual_output else "")
         )
 
-    # both 双段输出的拆解：直发用户取【日常】，回传主代理取【技术】。
-    # 兜底策略是「宁可重复，不可丢」——没写标记就两路都用全文，
-    # 只写了一段就那一段兜两路。格式没写对不该导致内容消失。
-    # 注意：user 组要连【日常】标记之前的内容一起收——子代理的名字前缀（【助手B】）
-    # 是 _maybe_prefix 加在整段回复最前面的，落在标记之外，只取标记之后会把前缀丢掉，
-    # 用户就不知道是谁在说话。
-    _DUAL_USER_RE = re.compile(r"^(.*?)【日常】\s*(.*?)(?=【技术】|$)", re.S)
-    _DUAL_TECH_RE = re.compile(r"【技术】\s*(.*)$", re.S)
 
-    def _split_dual_output(self, text: str) -> tuple:
-        """把双段输出拆成 (日常段, 技术段)。缺标记时返回 (全文, 全文)。"""
-        _t = (text or "").strip()
-        if not _t:
-            return "", ""
-        _mu = self._DUAL_USER_RE.search(_t)
-        _mt = self._DUAL_TECH_RE.search(_t)
-        if not (_mu or _mt):
-            return _t, _t
-        _user = (_mu.group(1) + _mu.group(2)).strip() if _mu else ""
-        _tech = _mt.group(1).strip() if _mt else ""
-        return (_user or _t), (_tech or _t)
-
-    # ── 任务卡解读（2026-09-11 用户拍板）──────────────────────────
-    # 目的：把「派单格式」变成双方共识——下发侧按块写，接收侧按块读。
-    # 靶点块存在的意义就是省步数：有靶点就直接用，别从全库开始搜。
-    #
-    # 2026-09-12 L2 层扩写：加【判断】【依据】两块 + 判断校验职责。
-    #   实测教训：主代理在任务卡里**明说自己的判断**（"我认为 X 没实现"），
-    #   才能被子代理反驳；只发纯指令（"实现 X"）时她会照做，错的那部分
-    #   直接落进交付物。所以判断块不是礼貌，是校验入口。
-    _SUBAGENT_TASKCARD_GUIDE = (
-        "\n\n【任务卡解读】\n"
-        "下发给你的任务可能按下面几块写，按块来读：\n"
-        "- 【任务】要解决什么\n"
-        "- 【靶点】已经给出的定位线索（文件路径、符号名、关键词、行号范围）"
-        "——**优先从靶点入手，不要从全库开始搜**\n"
-        "- 【判断】主代理当前的判断/假设——**这是待验证命题，不是事实**\n"
-        "- 【依据】上述判断凭什么——线索来源，可能本身就有漏洞\n"
-        "- 【产出】要交什么（结论 / 行号 / 原文 / 修正代码 / 清单）\n"
-        "- 【边界】不许做什么（例如只读不改、不许动某文件）\n"
-        "- 【完成标准】怎么算做完\n"
-        "任务卡没写全的部分，按检索纪律自行补齐；**给了靶点就直接用，"
-        "重复全库搜索是浪费步数**。\n"
-        "\n【判断校验——你的职责包含证伪】\n"
-        "带【判断】块的任务，你的产出**不是顺着它干活，是先验它**：\n"
-        "1. 动手前先花一步确认这个判断成立不成立——去看【依据】指向的位置，"
-        "是不是真如它所说\n"
-        "2. 判断**不成立**：报告**开头第一句**就说「判断不成立」或「半对」+ 证据"
-        "（文件、行号、原文），然后再给正确做法\n"
-        "3. 判断**成立**：也要写一句「已核实，依据属实」——"
-        "让主代理知道这是验过的，不是默认的\n"
-        "4. 判断**部分成立**：分点说清哪部分对、哪部分错，"
-        "**不要为了顺着主代理而含糊掉错的那部分**\n"
-        "主代理的判断经常基于不完整视野（只看主路径、没往下翻 20 行），"
-        "**你退回一个错误的判断，比多干十步活更值钱**。\n"
-    )
 
     def _build_live_status_note(self, session_key: str) -> str:
         """构造「同场实况」注入块：此刻谁在后台干活、跑了多久、谁刚跑完。
