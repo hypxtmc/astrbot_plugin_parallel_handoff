@@ -44,6 +44,25 @@
 - `parallel_handoff` 工具描述压缩派单纪律段，参数说明保留
 - 配置参考补全 14 个漏掉的键，84 项全覆盖
 
+### 移除 · 旁路模块（side_pulse）
+
+2026-09-19 随本次发布一并剔除。
+
+它默认关闭（`enable_side_pulse = false`），实际零 token 消耗——作者最初的判断是不动它。但维护面不小：1,651 行代码、21 个配置键、1,464 行测试，而实际不再使用，于是整块删掉。
+
+净减 **3,445 行**（8 files changed, 398 insertions, 3843 deletions）：
+
+- `side_pulse.py` 整文件
+- `main.py` 里的 `FamilyPulseMixin` 混入、`initialize`/`terminate` 生命周期钩子、`pulse_peek` 事件注册、`_pulse_draft_reply_check` 调用
+- `memory.py` 的旁轨记忆召回（`_merge_pulse_memory_recall`）与日志兜底（`_pulse_log_fallback`），128 行
+- `_conf_schema.json` 的 21 个 `side_pulse_*` 配置键（84 → 63 项）
+- `test_plugin.py` 的 `TestFamilyPulse` 类（1,464 行）与 `_NEEDS_LOCAL_DATA` 里 10 项
+- README 的相关描述（能力对比表、展示段、实验性列表、功能详解、命令表、配置段、文件树、FAQ）
+
+连带效应：`data/side_pulse/` 运行时数据不再生成；`/看看状态`、`/看状态`、`/今日动态` 等命令下线。
+
+删的是混入类（`DispatchMixin`），**热重载不生效，需重启**——与上面那条限制同一个原因。
+
 ### 已知限制
 
 - `both` 的处理封在 `enable_segmented_forward` 里面。关掉分段转发时，both 会**静默退化成 relay**——结果全回主代理、一条不直发，而注入指令仍宣称「既直发也回传」
