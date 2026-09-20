@@ -227,6 +227,12 @@
     "default": "",
     "hint": "优先读 subagent_tools；本键仅在 subagent_tools 为空时生效，留空回落内置默认（读写档）。"
   },
+  "subagent_tools_by_agent": {
+    "description": "按代理特批的工具名单（JSON 对象，例：{\"agent_b\": \"ALL\"}）",
+    "type": "string",
+    "default": "",
+    "hint": "键为代理英文 id，值为逗号分隔的工具名列表；特殊值 \"ALL\" = 与主代理同权（全局注册的工具全给，但自动剔掉 transfer_to_*，防子代理互相转派打转）。留空 = 无特批。优先级高于 subagent_tools。JSON 解析失败一律按「无特批」处理，不会因配置写坏就把工具全放出去。"
+  },
   "subagent_context_enabled": {
     "description": "启用跨轮对话上下文",
     "type": "bool",
@@ -358,12 +364,6 @@
     "type": "int",
     "default": 6,
     "hint": "记录每个会话最近 N 条发言，供仲裁判断「刚说到哪、该谁接」。越大越能感知长对话气口，越小越省内存。"
-  },
-  "arbitrate_old_grudge_agent": {
-    "description": "旧怨组子代理（读空气仲裁特例，逗号分隔英文 id）",
-    "type": "string",
-    "default": "",
-    "hint": "可选。填子代理英文 id（逗号分隔，如 agent_a,agent_b）。当主代理与该组在近期对话里密集互抛（各 ≥2 次）时，仲裁倾向主代理兜住收尾。留空 = 该规则关闭（零行为变化）。"
   },
   "enable_chain_memory_persist": {
     "description": "【实验性】多人接龙整场记忆沉淀开关",

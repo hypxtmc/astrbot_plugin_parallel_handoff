@@ -5,6 +5,8 @@
 1009-1026 行区域（记忆存储）。
 排除逻辑收敛为单一 exclude_agents 集合：由配置直接控制（默认空 = 全部子代理可召回）。
 """
+import json
+
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api.platform import MessageType
@@ -351,6 +353,10 @@ class MemoryMixin:
     #   写/执行类（safe_edit/safe_write/multi_edit/file_patch/safe_rollback/
     #   file_remove/file_move/file_zip/file_unzip/symbol_rename/code_index/
     #   test_runner/git_commit）全部移除，子代理回归「只能看、不能动手」。
+    # 2026-09-20 用户拍板 A+B 方案：
+    #   A=全局安全写工具回归（写进配置键 subagent_tools，不动本默认集）；
+    #   B=单代理特批 subagent_tools_by_agent，值 "ALL" = 与主代理同权。
+    # 本默认集保持「只读」不变——它是配置被清空时的兵底，宁可少给不可多给。
     # 配置键优先 subagent_tools，兼容旧键 subagent_readonly_tools；留空回落本默认集。
     # 高风险工具（shell_exec / astrbot_execute_shell / hot_reload_plugin / git_push /
     # gh_*）刻意不进默认集，需用户单独授权后再写进白名单。
@@ -370,16 +376,61 @@ class MemoryMixin:
         "git_changelog",
     )
 
-    def _subagent_tool_names(self):
-        """子代理工具白名单：优先取配置 subagent_tools，兼容旧键 subagent_readonly_tools
-        （逗号分隔字符串或列表），空值回落 _SUBAGENT_TOOL_NAMES_DEFAULT（读写档）。"""
-        raw = self._cfg("subagent_tools", "")
-        if not raw:
-            raw = self._cfg("subagent_readonly_tools", "")
+    @staticmethod
+    def _parse_tool_names(raw):
+        """逗号分隔字符串 / 列表 → 干净的工具名列表。"""
         if isinstance(raw, (list, tuple)):
-            names = [str(x).strip() for x in raw if str(x).strip()]
+            return [str(x).strip() for x in raw if str(x).strip()]
+        return [x.strip() for x in str(raw or "").split(",") if x.strip()]
+
+    def _subagent_tools_by_agent(self):
+        """按代理的特批工具名单。配置值是 JSON 对象：{"agent_b": "ALL"}。
+
+        2026-09-20 顾主拍板 B 方案。解析失败一律回落空 dict（= 没有特批）——
+        **绝不因为配置写坏就把工具全放出去**（fail-closed）。
+        """
+        raw = self._cfg("subagent_tools_by_agent", "")
+        if not raw:
+            return {}
+        if isinstance(raw, dict):
+            data = raw
         else:
-            names = [x.strip() for x in str(raw or "").split(",") if x.strip()]
+            try:
+                data = json.loads(str(raw))
+            except (ValueError, TypeError):
+                logger.warning(
+                    "[parallel_handoff] subagent_tools_by_agent 不是合法 JSON，已忽略"
+                )
+                return {}
+        if not isinstance(data, dict):
+            return {}
+        return {str(k).strip().lower(): v for k, v in data.items()}
+
+    def _subagent_tool_names(self, agent_name=None):
+        """子代理工具白名单。
+
+        优先级（2026-09-20 加第一级，顾主拍板 A+B 方案）：
+          1. subagent_tools_by_agent[agent_name] —— 单个代理的特批名单。
+             值 "ALL" = 「跟主代理同权」，返回 None 让调用方去取全集。
+          2. subagent_tools —— 全局白名单
+          3. 兼容旧键 subagent_readonly_tools
+          4. 空值回落 _SUBAGENT_TOOL_NAMES_DEFAULT（只读档）
+
+        返回：tuple（白名单）或 None（= 全部工具，调用方负责展开）。
+        """
+        if agent_name:
+            per_agent = self._subagent_tools_by_agent().get(
+                str(agent_name).strip().lower()
+            )
+            if per_agent is not None:
+                if str(per_agent).strip().upper() == "ALL":
+                    return None
+                names = self._parse_tool_names(per_agent)
+                if names:
+                    return tuple(names)
+        names = self._parse_tool_names(self._cfg("subagent_tools", ""))
+        if not names:
+            names = self._parse_tool_names(self._cfg("subagent_readonly_tools", ""))
         return tuple(names) if names else self._SUBAGENT_TOOL_NAMES_DEFAULT
 
     def _build_memory_tools(self, agent_name: str):
@@ -404,16 +455,33 @@ class MemoryMixin:
                     self.context.provider_manager, "llm_tools", None
                 )
                 if global_tools and not global_tools.empty():
-                    wanted = {
-                        "recall_long_term_memory",
-                        "memorize_long_term_memory",
-                    } | set(self._subagent_tool_names())
-                    picked = [t for t in global_tools.func_list if t.name in wanted]
+                    wanted_names = self._subagent_tool_names(agent_name)
+                    if wanted_names is None:
+                        # 特批「ALL」= 跟主代理同权。但剔掉 transfer_to_*——
+                        # 子代理再派子代理没有终止条件，会互相打转烧钱。
+                        picked = [
+                            t
+                            for t in global_tools.func_list
+                            if not str(t.name).startswith("transfer_to_")
+                        ]
+                        mode = "全权档"
+                    else:
+                        wanted = {
+                            "recall_long_term_memory",
+                            "memorize_long_term_memory",
+                        } | set(wanted_names)
+                        picked = [t for t in global_tools.func_list if t.name in wanted]
+                        mode = "白名单"
                     if picked:
                         subagent_tools = ToolSet(tools=picked)
                         logger.info(
                             f"[parallel_handoff] 子代理工具集 [{agent_name}]: "
-                            f"{sorted(t.name for t in picked)}（只读档）"
+                            f"{len(picked)} 项（{mode}）"
+                            + (
+                                ""
+                                if wanted_names is None
+                                else f"{sorted(t.name for t in picked)}"
+                            )
                         )
                     else:
                         logger.warning(

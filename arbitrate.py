@@ -7,8 +7,7 @@
 
 设计核心（用户 2026-09-03 定性）：
 ① 随机性是三期任务，一期只做「宁静权」克制、不引入子代理日常随机演化；
-② 旧怨只体现为贫嘴（刀子嘴豆腐心），不针锋相对，绝不作对抗性仲裁判据；
-③ 读空气仲裁 = 在自动路由「该不该派子代理」的犹豫点追加宁静权克制，
+② 读空气仲裁 = 在自动路由「该不该派子代理」的犹豫点追加宁静权克制，
    绝不比 _mode_shortcut_decision 更激进、绝不拦用户明确点名的人。
 """
 
@@ -243,33 +242,10 @@ class ArbitrationMixin:
         R1 主代理刚回过话（last_speaker 是主代理）→ 顺气口让主代理继续，倾向克制
         R2 群聊性接句话（短、无点名、无技术特征）已在承接链中 → 倾向让主代理收
         R3 消息在 subagent 连续承接链深处 → 倾向克制（不插话打断）
-        R4 关系网旧怨子代理 → 特意偏向让主代理兜，避免两旧怨组针锋相对
 
         返回 True=倾向克制落主代理，False=可让子代理接。
         段二仅作日志信号，不实际干预。
         """
-        recent_agents = [r["agent"] for r in presence.recent]
-        # R4 旧怨组密集互抛 → 主代理兜住。
-        # 定性（用户 2026-09-03）：旧怨只体现为贫嘴（刀子嘴豆腐心），绝不作对抗性
-        # 仲裁判据。故本规则只产出「让主代理兜住」这一收敛信号，绝不判定谁不能说话。
-        # [段五 2026-09-10 修复] 旧实现有两处致命伤，导致 R4 从未生效过：
-        #   ① 它嵌在 R2 的 if 块内、且位于 R2 无条件 return True 之前 —— 两条 return
-        #      结果相同，R4 的判定白算，是死代码；
-        #   ② 判据键名与主代理真实记录键 MAIN_SPEAKER("__main__") 不一致（旧版遗留键名），
-        #      c1 恒为 0，条件永不成立。
-        # 修法：提到 R2 之前独立判定 + 键名对齐 MAIN_SPEAKER。
-        c_main = sum(1 for a in recent_agents if a == MAIN_SPEAKER)
-        # 旧怨特例从配置读（arbitrate_old_grudge_agent，逗号分隔 id；默认空 =
-        # 该规则关闭）——部署方自行声明自家角色，代码侧不内置任何名单。
-        _grudge_raw = str(self._cfg("arbitrate_old_grudge_agent", "")).strip()
-        _grudge_ids = {a.strip().lower() for a in _grudge_raw.split(",") if a.strip()}
-        c_grudge = sum(
-            1
-            for a in recent_agents
-            if a in _grudge_ids or self._display_name(a).lower() in _grudge_ids
-        ) if _grudge_ids else 0
-        if c_main >= 2 and c_grudge >= 2:
-            return True
         # R1 主代理刚回过话 → 倾向让主代理继续，别抢
         # [段五 2026-09-10 修复] R1 依赖 last_speaker == MAIN_SPEAKER，而旧代码里
         # _presence_update 全库只在子代理转发时被调用（dispatch 单点），主代理回复从无

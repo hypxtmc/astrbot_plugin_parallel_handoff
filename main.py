@@ -184,16 +184,42 @@ class ParallelHandoffPlugin(
             elapsed = round((rec.finished_at or 0) - rec.created_at, 1)
 
             if status == "done":
-                body = (rec.result or "").strip()
+                body = self._notify_body(rec.result)
                 if len(body) > 300:
-                    body = body[:300] + f"\n…（共 {len(rec.result)} 字，用 task_result 取全文）"
-                text = f"{icon} 【{name}】后台任务完成（{elapsed}s）\n{body}" if body else f"{icon} 【{name}】后台任务完成（{elapsed}s）"
+                    body = body[:300] + f"\n…（共 {len(body)} 字，用 task_result 取全文）"
+                # 成功时只发她的原话——标题行（✓ 【名字】后台任务完成）看着像系统
+                # 日志，不像同事说话，顾主 2026-09-20 要求去掉。
+                # 失败/超时那支仍保留标题：那种时候必须一眼看出是「出事了」。
+                text = body if body else f"{icon} 【{name}】后台任务完成（{elapsed}s）"
             else:
                 text = f"{icon} 【{name}】后台任务未完成（{elapsed}s）：{rec.error or status}"
 
             await self.context.send_message(umo, MessageChain([Plain(text)]))
         except Exception as _e:  # noqa: BLE001
             logger.warning(f"[parallel_handoff] 后台任务完成通知失败（非致命）: {_e}")
+
+    @staticmethod
+    def _notify_body(result) -> str:
+        """后台任务通知的正文：从任务结果里掏出子代理的原话。
+
+        rec.result 存的是整包结果的 JSON 串（{"agent_name":…, "response":…}），
+        原样铺出去就是一堆带转义换行的结构体——2026-09-20 顾主在 QQ 里收到的
+        就是这种「像日志的东西」。优先取 response 字段；解析不出来就退回原文，
+        宁可难看也不丢内容。
+        """
+        raw = (result or "").strip()
+        if not raw.startswith("{"):
+            return raw
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            return raw
+        if isinstance(data, dict):
+            for key in ("response", "text", "result"):
+                val = data.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+        return raw
 
     # ── 事件注册：主代理前缀自动注入（实现见 forward.py ForwardMixin） ──
     @filter.on_decorating_result()

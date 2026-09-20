@@ -1025,14 +1025,13 @@ class ForwardMixin:
             return f"【{display_name}】\n{message}"
         return message
 
-    # ── 读空气·段五：主代理发言入册（复活 R1/R4 两条死规则）─────
+    # ── 读空气·段五：主代理发言入册（复活 R1 死规则）─────
     def _presence_mark_main(self, event: AstrMessageEvent, text: str = "") -> None:
-        """记录「主代理刚说过话」到在场状态（读空气 R1/R4 的唯一数据来源）。
+        """记录「主代理刚说过话」到在场状态（读空气 R1 的唯一数据来源）。
 
         [段五 2026-09-10] 根因：_presence_update 全库只在 dispatch 子代理转发后
         被调用一次，主代理回复从未入册 → MAIN_SPEAKER("__main__") 从未写入 ——
-        R1（last_speaker 是主代理→倾向克制）恒为 False，R4（旧怨组密集互抛）
-        c_main 恒为 0，两条规则写了但从未生效过。
+        R1（last_speaker 是主代理→倾向克制）恒为 False，规则写了但从未生效过。
 
         本方法挂在 on_decorating_result 出口（主代理消息发出前唯一必经点）补齐记录。
         异常一律吞掉：状态记录绝不能影响发送主流程（安全优先）。
