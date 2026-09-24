@@ -14,3 +14,9 @@ MagicMock/
 test_plugin_2026*_t*.py
 test_plugin.py
 test_plugin_*
+conftest.py
+test_lm_bridge.py
+test_session_store.py
+test_task_integration.py
+test_task_runner.py
+test_*.py

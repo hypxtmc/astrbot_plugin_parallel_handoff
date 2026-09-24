@@ -14,7 +14,7 @@
 计量文件；本地长期验收在插件配置里显式打开 metrics_enabled 并把 metrics_path 指到
 data/experiments/subagent_efficiency/metrics.jsonl。
 
-历史：2026-09-12 18:28 commit 43655cc「v2.10 重构成批落地」连带删除了本模块，
+历史：2026-09-12 18:28 commit 43655cc「v2.10 版本重构」连带删除了本模块，
 metrics.jsonl 自 2026-09-12 15:25 起断流两天（主代理侧也无新增，两天的「零新增」不是
 调用量少，是埋点没了）。本次按原口径复活，字段与旧版完全一致，老数据可直接续接。
 """
