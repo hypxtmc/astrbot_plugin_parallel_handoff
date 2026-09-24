@@ -179,7 +179,7 @@ class DispatchMixin:
 
         _edges = rel.get("relationship_edges", {})
         _states = rel.get("relationship_state", {})
-        _roles = rel.get("roles", rel.get("family_roles", {}))
+        _roles = rel.get("roles", {})
 
         # 该 agent 自己的角色定位
         _role_desc = ""
