@@ -243,7 +243,7 @@ class ParallelHandoffPlugin(
         """
         return await super()._route_directive_inject(event, req)
 
-    # ── 事件注册：小模型路由层（T1规则/T2小模型/T3兜底，实现见 router.py RouterMixin） ──
+    # ── 事件注册：规则路由层（T1规则/T0.5粘滞/T3兜底，实现见 router.py RouterMixin） ──
     @filter.on_waiting_llm_request()
     async def _smart_router_check(self, event: AstrMessageEvent):
         """小模型路由层：主代理 LLM 调用前的最早停点。

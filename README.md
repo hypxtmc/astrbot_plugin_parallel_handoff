@@ -6,7 +6,7 @@ AstrBot 多子代理并行调度插件（原名 `parallel_handoff`）
 
 | 信息 | 值 |
 |------|-----|
-| 版本 | 3.0 |
+| 版本 | 3.1 |
 | 更新说明 | [CHANGELOG.md](CHANGELOG.md) |
 | 作者 | hypxtmc |
 | 许可 | MIT |
@@ -165,6 +165,8 @@ WebUI 插件配置里至少设两项：
 
 **命令式点名（T0 强锁）**：消息以 `/`、`／`、`#`、`！`、`!`、`、` 打头直接叫名字，如 `/助手A`、`/助手A+助手B`。锁定后持续生效，之后无需重复点名。主代理忙碌时同样有效。
 
+多人锁的开口顺序不按点名先后固定，每轮随机（锁着谁不变，只是谁先说）。
+
 **消息消歧**：不传 `calls` 时只传 `message`，插件自动路由到最近对话中出场的子代理。
 
 **路由强制指令**：LLM 请求前按配置算好路由路径并注入执行指令，工具全保留、不做软硬拦截。任务分类（plan / exec / chat / weak）随指令注入。
@@ -185,7 +187,7 @@ WebUI 插件配置里至少设两项：
 
 **livingmemory 记忆集成**：调用子代理时自动召回相关记忆片段（`recall_enabled`），并为子代理过滤记忆工具，防止跨人格记忆污染。私有路径访问通过防腐层 `_lm_bridge` 隔离。
 
-**子代理工具循环 + 只读白名单**：子代理可带工具干活（受 `subagent_max_steps` / `subagent_tool_call_timeout` 约束）。默认只读档 26 项，写和执行类工具全留在主代理。
+**子代理工具循环 + 分级白名单**：子代理可带工具干活（受 `subagent_max_steps` / `subagent_tool_call_timeout` 约束）。默认只读档 26 项；需要放手时用 `subagent_tools` 全局加权，或 `subagent_tools_by_agent` 给单个子代理特批（值 `ALL` = 与主代理同权），后者优先级更高。
 
 | 分类 | 工具 |
 |------|------|
@@ -195,9 +197,9 @@ WebUI 插件配置里至少设两项：
 | 只读检查 | `syntax_check` `lint_runner` `config_diff` |
 | 只读 git | `git_status` `git_diff` `git_log` `git_branch` `git_remote` `git_changelog` |
 
-白名单可由 `subagent_tools` 调整（留空回落内置默认，兼容旧键 `subagent_readonly_tools`）。
+白名单可由 `subagent_tools` 调整（留空回落内置默认，兼容旧键 `subagent_readonly_tools`）。高风险工具（`shell_exec` `hot_reload_plugin` `git_push` `gh_*`）不在默认集，需要逐项写进白名单。
 
-**关系档案自动注入**：子代理的 system 提示带上她与家中每个成员的关系档案（亲密度、基调、最近互动，数据源 `relationships.json`）。档案放在 system 固定段，逐字节确定、无时间戳，跨调用命中前缀缓存；按亲密度降序；文件缺失时退化为空段，不阻塞对话。
+**关系档案自动注入**：子代理的 system 提示带上她与其余成员的关系档案（亲密度、基调、最近互动，数据源 `relationships.json`）。档案放在 system 固定段，逐字节确定、无时间戳，跨调用命中前缀缓存；按亲密度降序；文件缺失时退化为空段，不阻塞对话。
 
 **接龙摘要（chain_summary）**：chained 长接龙自动生成摘要传给下一棒，阈值和保留首尾策略可调。
 
@@ -234,7 +236,7 @@ WebUI 插件配置里至少设两项：
 
 ## 配置参考
 
-共 84 项，按功能分组（完整定义见 WebUI 配置面板）。
+共 60 项，按功能分组（完整定义见 WebUI 配置面板）。
 
 **核心调度**：`user_address` · `main_agent_name` · `route_mode` · `call_mode` · `tech_mode_config` / `affection_mode_config` · `handoff_blacklist_agents` · `direct_delivery_agents`
 
@@ -242,7 +244,7 @@ WebUI 插件配置里至少设两项：
 
 **路由与指令**：`enable_route_directive` · `subagent_visibility_inject` · `directive_inject_mode` · `enable_smart_router` · `enable_disambiguation` · `subagent_reply_timeout`
 
-**子代理工具循环**：`subagent_tools` · `subagent_readonly_tools`（旧键）· `subagent_max_steps` · `subagent_tool_call_timeout` · `subagent_response_preview_chars` · `subagent_prefetch_enabled`
+**子代理工具循环**：`subagent_tools` · `subagent_readonly_tools`（旧键）· `subagent_tools_by_agent` · `subagent_max_steps` · `subagent_tool_call_timeout` · `subagent_response_preview_chars` · `subagent_prefetch_enabled`
 
 **跨轮上下文**：`subagent_context_enabled` · `subagent_context_max_turns`
 
@@ -286,7 +288,7 @@ astrbot_plugin_parallel_handoff/
 运行时数据（自动创建）：
 
 - `data/plugin_data/astrbot_plugin_parallel_handoff/subagent_sessions/` — 会话落盘
-- `data/relationships/relationships.json` — 家庭关系网（关系档案数据源）
+- `data/relationships/relationships.json` — 成员关系网（关系档案数据源）
 
 ---
 
@@ -313,7 +315,7 @@ astrbot_plugin_parallel_handoff/
 | `main_token` / `main_token_set` | 主代理专属入口词 | 仅通用词 `/主代理`、`/主agent` 生效 |
 | `aliases` | 子代理爱称映射 | 爱称不触发，全名与命令正常 |
 | `keywords` | 领域关键词 → 子代理 | 领域词不触发 |
-| `t2_brief` | 子代理职责简介（判向参考） | 自动发现兜底（用子代理公开描述） |
+| `t2_brief` | 子代理职责简介（消歧与路由池参考） | 自动发现兜底（用子代理公开描述） |
 
 ```json
 {
@@ -345,14 +347,14 @@ astrbot_plugin_parallel_handoff/
 
 | 模块 | 规模 | 职责 |
 |------|------|------|
-| `main.py` | 366 行 | 插件入口、事件注册 |
-| `dispatch.py` | 1849 行 | 核心调度主流程、去重守卫、工具循环、关系档案注入 |
-| `router.py` | 1779 行 | 四层判向、消歧、场景判定 |
-| `forward.py` | 1155 行 | 分段转发、主代理前缀、markdown 降级、旁听窗记录 |
-| `memory.py` | 667 行 | livingmemory 集成、工具白名单、时间感知 |
+| `main.py` | 392 行 | 插件入口、事件注册 |
+| `dispatch.py` | 1855 行 | 核心调度主流程、去重守卫、工具循环、关系档案注入 |
+| `router.py` | 1699 行 | 三层判向、消歧、场景判定 |
+| `forward.py` | 1189 行 | 分段转发、主代理前缀、markdown 降级、旁听窗记录 |
+| `memory.py` | 735 行 | livingmemory 集成、工具白名单、时间感知 |
 | `random_state.py` | 428 行 | 个体状态随机演化 |
 | `directive.py` | 373 行 | 路由强制指令构建与注入 |
-| `arbitrate.py` | 328 行 | 读空气仲裁 |
+| `arbitrate.py` | 304 行 | 读空气仲裁 |
 | `task_runner.py` | 295 行 | 后台任务执行 |
 | `session_store.py` | 224 行 | 会话落盘 |
 | `_lm_bridge.py` | 225 行 | livingmemory 防腐隔离 |
@@ -368,7 +370,7 @@ astrbot_plugin_parallel_handoff/
   → dispatch：构建 calls、并发派发
       → 每声部：system（人格 + 关系档案 + 纪律 + 任务卡）
                 + 上下文（ctx_engine / session_store）
-                + 工具循环（只读白名单）
+                + 工具循环（分级白名单）
   → forward：前缀注入 → 分段转发 → 旁听窗记录
   → 用户看到多声部发言
 ```
@@ -377,14 +379,10 @@ astrbot_plugin_parallel_handoff/
 
 ## 开发与测试
 
-```bash
-python3 test_plugin.py                      # 全量测试（需要 AstrBot 的 venv 环境）
-<astrbot>/venv/bin/python3 test_plugin.py   # 或指定解释器
-```
-
-- 测试文件：`test_plugin.py`（主套件）、`test_lm_bridge.py`、`test_task_runner.py`、`test_session_store.py`、`test_task_integration.py`
-- 改完代码：先 `python3 -m py_compile` 自查，再热重载插件，用 `plugin_list` + 日志验证
+- 改完代码：先 `python3 -m py_compile` 自查，再决定生效方式
 - 插件级热重载：命令 `/热重载并行插件`，或控制台插件管理
+- **涉及 Mixin 模块（`dispatch.py` / `router.py` / `memory.py` 等）或新增配置键的改动，热重载不换血，需重启 AstrBot**
+- 全局配置变更：重启 AstrBot
 - 提交前跑全量测试确认零回归
 
 ---
@@ -401,13 +399,13 @@ python3 test_plugin.py                      # 全量测试（需要 AstrBot 的 
 日常陪伴场景下子代理直接对用户说话更自然。技术干活时调用传 `mode: "tech"` 切到 relay。
 
 **改了代码怎么生效？**
-插件级热重载即可（`/热重载并行插件`）。全局配置变更需重启 AstrBot。
+普通改动热重载即可（`/热重载并行插件`）。动了 Mixin 模块（`dispatch.py` / `router.py` / `memory.py` 等）或新增了配置键，热重载回执写着成功也不等于换血，要重启 AstrBot。全局配置变更同样需重启。
 
 **会消耗很多 token 吗？**
 调度本身开销很小，主要消耗在各子代理的对话与工具循环。关系档案放在 system 稳定层、逐字节确定，跨调用命中前缀缓存，不逐轮重复计费。
 
 **子代理能互相聊天吗？**
-能。主代理用 chained 接龙就能让子代理接力对话。
+能。主代理用 chained 接龙就能让子代理接力对话。多人锁下每次开口的先后是随机的，不固定点名顺序。
 
 **怎么做多人群聊氛围？**
 `direct` 路由 + `parallel` 调用，多个子代理同时直发，各有前缀不串音。配合 `affection` 模式更好。
