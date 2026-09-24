@@ -80,7 +80,7 @@
 ### 文档
 
 - README 670 → 466 行。删掉与「功能详解」重复的「特性总览」、22 条目录、版本演进纪要
-- 8 个钩子 docstring 去掉日期戳（`[Busy Bypass 2026-08-31]` 这类）与「通过 X 钩子拦截 Y」——装饰器上已经写着，再说一遍是废话
+- 8 个钩子 docstring 去掉日期戳（`[Busy Bypass 2026-08-31]` 这类）与「通过 X 钩子拦截 Y」——与装饰器上的信息重复
 - `parallel_handoff` 工具描述压缩派单纪律段，参数说明保留
 - 配置参考补全 14 个漏掉的键，84 项全覆盖
 
@@ -93,10 +93,10 @@
 净减 **3,445 行**（8 files changed, 398 insertions, 3843 deletions）：
 
 - `side_pulse.py` 整文件
-- `main.py` 里的 `FamilyPulseMixin` 混入、`initialize`/`terminate` 生命周期钩子、`pulse_peek` 事件注册、`_pulse_draft_reply_check` 调用
+- `main.py` 里的旁软混入类、`initialize`/`terminate` 生命周期钩子、`pulse_peek` 事件注册、`_pulse_draft_reply_check` 调用
 - `memory.py` 的旁轨记忆召回（`_merge_pulse_memory_recall`）与日志兜底（`_pulse_log_fallback`），128 行
 - `_conf_schema.json` 的 21 个 `side_pulse_*` 配置键（84 → 63 项）
-- `test_plugin.py` 的 `TestFamilyPulse` 类（1,464 行）与 `_NEEDS_LOCAL_DATA` 里 10 项
+- `test_plugin.py` 的旁软测试类（1,464 行）与 `_NEEDS_LOCAL_DATA` 里 10 项
 - README 的相关描述（能力对比表、展示段、实验性列表、功能详解、命令表、配置段、文件树、FAQ）
 
 连带效应：`data/side_pulse/` 运行时数据不再生成；`/看看状态`、`/看状态`、`/今日动态` 等命令下线。
@@ -112,7 +112,7 @@
 
 ### 升级注意
 
-- 本次改的是混入类（`DispatchMixin`），**热重载结构上不生效**，需要重启 AstrBot。回执写「完全生效」、日志干净、测试全绿都不算数——判据只有运行时行为变没变
+- 本次改的是混入类（`DispatchMixin`），**热重载结构上不生效**，需要重启 AstrBot。回执、日志和测试结果都不反映运行时行为，需重启后实测确认。
 - `route_mode` 新增枚举值，旧配置（`relay` / `direct`）行为不变
 - 测试：394 passed / 1 skipped
 

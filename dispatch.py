@@ -179,9 +179,9 @@ class DispatchMixin:
 
         _edges = rel.get("relationship_edges", {})
         _states = rel.get("relationship_state", {})
-        _roles = rel.get("family_roles", {})
+        _roles = rel.get("roles", rel.get("family_roles", {}))
 
-        # 该 agent 自己的家庭角色定位
+        # 该 agent 自己的角色定位
         _role_desc = ""
         _role = _roles.get(agent_name)
         if isinstance(_role, dict):
