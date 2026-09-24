@@ -182,7 +182,7 @@ class ArbitrationMixin:
         """自动路由路径的宁静权仲裁。
 
         入参：
-            route           T1/T2 已判出的候选 agent_name（None=未命中，兜底主代理）
+            route           T1 已判出的候选 agent_name（None=未命中，兜底主代理）
             mode_decision   _mode_shortcut_decision 的结果（是否放行主代理的裁决）
 
         返回：

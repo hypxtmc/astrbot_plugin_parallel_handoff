@@ -1,24 +1,23 @@
-"""router.py — 小模型路由层（三层降级：T1 规则 / T2 小模型 / T3 兜底主代理）
+"""router.py — 规则路由层（降级：T1 规则 / T0.5 粘滞 / T3 兜底主代理）
 
 策略：在 OnWaitingLLMRequestEvent（internal.py:217，主代理 LLM 调用前最早停点）里
 判断本条消息该找谁。命中直接子代理直发 + event.stop_event()，整个主代理流程
 （记忆召回/req 构建/LLM 调用）短路跳过；未命中一律落回原主代理路径，行为零变化。
 
 层级设计：
-- T1 规则层：点名（中文名/英文 id + 边界）或强领域词命中，0 LLM 成本，毫秒级
-- T2 小模型路由：glm-4-flash（默认 dmxapi/glm-4-flash），单条消息判向，
-  JSON 输出 {route, confidence}；confidence >= 阈值(默认0.8)才直连，其余落 main
-- T3 兜底层：任何异常/超时/低置信 -> 不拦截，主代理原路径全量接管
+- T1 规则层：点名（中文名/英文 id + 边界）或强领域词命中，0 成本，毫秒级
+- T0.5 粘滞层：上文刚直发过的对象/多人组，短时间窗内承接句直接续上
+- T3 兜底层：任何歧义/多点名/叙述性提及 -> 不拦截，主代理原路径全量接管
 
 安全边界：
 - enable_smart_router 默认关闭，显式开启才生效（防止误伤现网行为）
 - 子代理直发复用 dispatch._call_one -> call_subagent -> direct 转发链路，
   与手动调 call_subagent 完全同构，无新发送通道
-- T2 只读本消息，不注入历史不召回记忆，超时 5s 直接放行主代理
 """
 import asyncio
 import json
 import os
+import random
 import re
 import time
 from collections import deque
@@ -132,7 +131,7 @@ class RouterMixin:
     # ── 会话延续判词（T1.5 层，2026-08-21 新增） ──
     # 纯承接句检测：剥离这些承接词 + 标点空白后应无残留。
     # 用于"好舒服，继续""再来""嗯"等上一条已路由给子代理的短承接消息，
-    # 时间窗内无新点名时直接续接上次路由对象，避免 T2 因单消息无上下文误放行主代理
+    # 时间窗内无新点名时直接续接上次路由对象，避免单条消息无上下文时漏判
     T1_CONTINUE_WORDS = tuple(_ROUTER_TABLES.get("continue_words", []))
     _T1_CONTINUE_WORD_RE = re.compile("|".join(T1_CONTINUE_WORDS)) if T1_CONTINUE_WORDS else None
 
@@ -140,7 +139,7 @@ class RouterMixin:
     # 爱称别名（2026-08-30 用户指定）：直呼爱称 → 对应子代理 T1 命中
     T1_ALIASES = _ROUTER_TABLES.get("aliases", {})
     # 最高优先级令牌（2026-09-03 用户指定）：只要消息含主代理的专属令牌词，
-    # 无论 T1 点名 / T1.5 续接 / T2 小模型判定结果如何，一律放行主代理。
+    # 无论 T1 点名 / T1.5 续接判定结果如何，一律放行主代理。
     # 放在路由链最前，任何子代理都不允许接管主代理。
     # [2026-09-12] 正则 = 部署者主代理名 + 通用入口词（"主代理"），
     # 任何部署环境都能用通用词强锁主代理；未配置 main_token 时仅通用词生效。
@@ -156,27 +155,12 @@ class RouterMixin:
         if _ROUTER_TABLES.get("main_token")
         else re.compile(r"^\s*(?:主代理|主agent)")
     )
-    # T2 判向时给模型看的子代理职责简介（简写，不涉及人格机密）
-    T2_AGENT_BRIEF = _ROUTER_TABLES.get("t2_brief", {})
+    # 判向时给模型看的子代理职责简介（简写，不涉及人格机密）
+    AGENT_BRIEF = _ROUTER_TABLES.get("t2_brief", {})
 
     # ── 配置读取（全走 _cfg 兜底，未配置项全部返回安全默认） ──
     def _router_enabled(self) -> bool:
         return bool(self._cfg("enable_smart_router", False))
-
-    def _router_threshold(self) -> float:
-        try:
-            return float(self._cfg("router_confidence_threshold", 0.8))
-        except (TypeError, ValueError):
-            return 0.8
-
-    def _router_provider(self) -> str:
-        return str(self._cfg("router_provider_id", "dmxapi/glm-4-flash")).strip()
-
-    def _router_timeout(self) -> float:
-        try:
-            return float(self._cfg("router_timeout", 5))
-        except (TypeError, ValueError):
-            return 5.0
 
     def _router_agent_pool(self) -> dict:
         """路由目标池：直发名单 ∩ 有负责人格的子代理（默认 9 人）
@@ -185,7 +169,7 @@ class RouterMixin:
         自动从 subagent_orchestrator 发现子代理生成兜底池，保证新部署用户开箱可用；
         用户自配词表后以自配为准，本部署行为不变。
         """
-        pool = dict(self.T2_AGENT_BRIEF)
+        pool = dict(self.AGENT_BRIEF)
         if not pool:
             pool = self._discover_agent_pool()
         raw = str(self._cfg("direct_delivery_agents", "")).strip()
@@ -198,7 +182,7 @@ class RouterMixin:
         """[2026-09-13] 词表缺失时从编排器发现子代理，生成兜底路由池。
 
         新部署用户未配置 router_tables.json 时，以 AstrBot subagent_orchestrator 里
-        实际注册的子代理为准生成 {英文id: 公开描述} 池——让 T0/T1/T2 与路由指令开箱可用。
+        实际注册的子代理为准生成 {英文id: 公开描述} 池——让 T0/T1 与路由指令开箱可用。
         描述取自 handoff.description（官方给主 LLM 看的公开描述），不读 agent.instructions
         （人格机密）；失败静默返回 {}（路由退回保守行为：全部放行主代理）。
         """
@@ -220,7 +204,7 @@ class RouterMixin:
     # ── T0 命令式触发层（2026-09-08 用户指定）────────────
     # 以 / 开头 + 名字（可 + 连接多名字）的显式命令，直接指定目标子代理/主代理，
     # 取代「从自然语言关键词猜测路由目标」的旧机制。命令命中 → 最高优先级短路，
-    # 跳过 T1/T0.5/T2 全部猜测层，零正则歧义、零误触发。
+    # 跳过 T1/T0.5 全部猜测层，零正则歧义、零误触发。
     # 格式：/助手A · /助手A+助手C · /助手C+助手D+助手G · /主代理+助手A+助手C
     # 不设上限，点名几个就锁定几个；命令持续生效（写入粘滞锁，之后无需再发命令）。
     # Python 同款命令见系统提示「以 / 开头指定」，与下方实现保持一致。
@@ -600,7 +584,7 @@ class RouterMixin:
 
     # ── T1 规则层 ────────────────────────────────────────
     # 报错/日志/代码强特征：命中且整条无呼叫词（找/叫/让/喊…）→ 判定为技术文本，
-    # 子代理名此时多为报错主体/路径/引用，不构成点名，直接放行 main/T2；
+    # 子代理名此时多为报错主体/路径/引用，不构成点名，直接放行 main；
     # 防止 "module 'xxx' not found" 这类把日志里的名字当呼叫乱路由
     _T1_ERR_RE = re.compile(
         r"(?:traceback|exception|error|failed|failure|report|warning|panic|crash|"
@@ -645,8 +629,8 @@ class RouterMixin:
         改进点（2026-08-21）：
         1. 技术文本整体拦截：报错/日志/代码块里出现子代理名不视为点名
         2. 语境区分：呼叫（找/叫/喊/称呼+祈使/单独称谓）才路由；
-           叙述性提及（"某人说过""昨天和某人聊了"）放行 main/T2
-        3. 多点名歧义：一次消息中出现多个子代理名 → 交 T2/main 仲裁，不盲选
+           叙述性提及（"某人说过""昨天和某人聊了"）放行 main
+        3. 多点名歧义：一次消息中出现多个子代理名 → 交主代理仲裁，不盲选
         4. 单字名（单字名）强制词边界，杜绝"今年/除夕/命令"误伤
         """
         if not message:
@@ -723,7 +707,7 @@ class RouterMixin:
                 # 3) 弱点名：名字为消息头，或整条消息极短（"助手A"、"助手B"）→ 认
                 if not pre.strip() or (not post.strip() and len(stripped) <= 12):
                     weak_hits.add(aid)
-        # ── 多点名歧义 → 不盲选，交 T2/main ──
+        # ── 多点名歧义 → 不盲选，交 主代理 ──
         if len(appeared) >= 2:
             return None
         # ── 技术文本拦截（报错/日志）→ 有强呼叫才放行，否则让 main 处理 ──
@@ -731,7 +715,7 @@ class RouterMixin:
             return None
         # ── 单点名路由（2026-08-30 放宽：名字出现即路由，位置无关）──
         # 原来要求名字在句首/有呼叫动词才命中，导致"帮我看一下助手D""最近怎么样"
-        # 这类名字在句中/句尾的消息落 T2。现放宽为：单点名 + 非叙述语境 → 直接路由。
+        # 这类名字在句中/句尾的消息落主代理。现放宽为：单点名 + 非叙述语境 → 直接路由。
         if len(appeared) == 1 and not narr_context:
             return next(iter(appeared))
         # ── 领域词降级：存在叙述语境不收，报错文本不收 ──
@@ -746,7 +730,7 @@ class RouterMixin:
         """[多点名强呼叫 2026-09-07 方案A] 返回强呼叫子代理列表（按原文出现顺序，有序）。
 
         当消息里**明确强呼叫 ≥2 个子代理**（如「助手A，助手D，我们一起来玩」）
-        时返回保序 aid 列表；否则返回 None（交给单点名/T2/main）。
+        时返回保序 aid 列表；否则返回 None（交给单点名/主代理）。
 
         背景：原 `_t1_route` 遇到多点名直接 `return None`（router.py:300-301），
         把「明确多点名呼叫」跟「叙述性提到多个名字」一刀切全挡回主代理，
@@ -810,7 +794,7 @@ class RouterMixin:
         # 按原文出现位置排序，返回保序 aid 列表
         return [aid for aid, _ in sorted(hits.items(), key=lambda kv: kv[1])]
 
-    # ── 会话记忆（供 T1.5 续接 / T2 上下文注入）──────────────
+    # ── 会话记忆（供 T1.5 续接）──────────────────────────
     def _route_mem(self):
         """惰性初始化会话级路由记忆（main.py __init__ 不感知 mixin 私有状态）。
 
@@ -840,7 +824,7 @@ class RouterMixin:
         命令锁定是独立于粘滞锁 _route_last 的最高权重强制锁：/<名A>+<名B> 一经建立，
         该会话直到被新命令或「主代理」文本解除前，永远只跟锁定组对话。
         与 _route_last 的区别：锁定组内出现任何其他子代理名都不会触发路由切换
-        （点名只是对话内容，不是目标），T1/T0.5/T2 全部失效。
+        （点名只是对话内容，不是目标），T1/T0.5 全部失效。
         """
         if not hasattr(self, "_cmd_lock"):
             self._cmd_lock = {}        # session -> {aid: ts}（命令强制在场者组）
@@ -858,7 +842,7 @@ class RouterMixin:
         """[T0 命令式 2026-09-08] 取命令锁定在场者组；无命令锁返回 None。
 
         命令锁 = 最高权重强制锁，命中时 _smart_router_check 主流程直接短路，
-        跳过 T1/T0.5/T2 全部判向，彻底杜绝「对话里点其他子代理名」触发切换。
+        跳过 T1/T0.5 全部判向，彻底杜绝「对话里点其他子代理名」触发切换。
         """
         if not hasattr(self, "_cmd_lock"):
             return None
@@ -898,7 +882,7 @@ class RouterMixin:
 
     # ── 主代理锁（2026-09-12 用户指定）─────────────────
     def _record_main_lock(self, event):
-        """建立会话级主代理锁：后续消息直通主代理，T1/T0.5/T2 全部让位。
+        """建立会话级主代理锁：后续消息直通主代理，T1/T0.5 全部让位。
 
         动机（2026-09-12 用户反馈）：消息里提到子代理名（如「叫个子代理一起
         陪你看 bug」）会被 T1 抢走路由——用户明明是在对主代理说话。
@@ -951,7 +935,7 @@ class RouterMixin:
             _save_main_lock_file(lock)
 
     def _record_direct_reply(self, session_id: str, agent_name: str, reply_text: str):
-        """记录该 session 最近一次子代理直发回复尾部（供 T2 剧情参照，避免承接句判失）。"""
+        """记录该 session 最近一次子代理直发回复尾部（供承接参照，避免承接句判失）。"""
         if not session_id or not agent_name or not reply_text:
             return
         self._route_mem()  # 兜底初始化惰性记忆
@@ -963,7 +947,7 @@ class RouterMixin:
         """返回 (agent_name, reply_tail|None)；无记录或超时返回 (None, None)。
 
         max_age：参照有效期（秒），默认 600s。超时后不注入 prompt，
-        避免数小时前的旧剧情误导 T2 判定（宽松于 T1.5 的 300s 续接窗）。
+        避免数小时前的旧剧情误导承接判定（宽松于 T1.5 的 300s 续接窗）。
         """
         hit = self._route_reply.get(session_id)
         if not hit:
@@ -974,7 +958,7 @@ class RouterMixin:
         return agent, tail
 
     def _record_user_msg(self, event: AstrMessageEvent, message: str):
-        """把用户消息追加进会话最近消息环形缓冲（供 T2 上下文注入）。"""
+        """把用户消息追加进会话最近消息环形缓冲。"""
         _, msgs = self._route_mem()
         sid = event.unified_msg_origin
         buf = msgs.get(sid)
@@ -1163,79 +1147,14 @@ class RouterMixin:
                         out.add(aid)
         return out
 
-    # ── T2 小模型层 ──────────────────────────────────────
-    async def _t2_route(self, event: AstrMessageEvent, message: str):
-        """glm-4-flash 判向。返回 (agent_name|None, confidence)。异常一律 (None, 0)。
-
-        [上下文注入 2026-08-21] T2 不再只看单条消息：把最近会话用户消息序列
-        （_route_msgs 环形缓冲，最近 4 条）注入 prompt，模型可据此判断
-        "继续/再来" 是对上文的承接，避免零上下文必判 main 的缺陷。
-        """
-        pool = self._router_agent_pool()
-        if not pool:
-            return None, 0.0
-        brief_lines = "\n".join(pool.values())
-        _, msgs = self._route_mem()
-        buf = msgs.get(event.unified_msg_origin)
-        recent_lines = "\n".join(f"- {m[:120]}" for m in (list(buf)[-4:] if buf else []))
-        reply_agent, reply_tail = self._last_direct_reply(event.unified_msg_origin)
-        sys_prompt = (
-            "你是消息路由判定器。根据用户最新一条消息判断该交给哪位角色回复。\n"
-            "可选角色：\n"
-            f"{brief_lines}\n"
-            "- main：普通日常对话、跨角色问询、无法确定对象、技术任务（默认）\n"
-            "最近对话（时间正序，仅用户消息）：\n"
-            f"{recent_lines or '（无）'}\n"
-            f"最近一次子代理直发回复尾部（剧情参照，可能正是用户承接的对象）：\n"
-            f"{('（'+reply_agent+'）'+reply_tail) if reply_agent else '（无）'}\n"
-            "只输出一行 JSON（禁止多余文字）：{\"route\": \"角色id或main\", \"confidence\": 0到1的小数}\n"
-            "判定准则：用户明确点名或消息内容强相关才给高分；日常随意闲聊一律 main，confidence 给 0.1-0.3。\n"
-            "若当前消息明显是对上文某位角色的承接（如继续/再来/嗯/然后呢/让我舒服/用力/爱你），"
-            "route 应延续上文最后提到的角色；若最近一次子代理直发回复尾部语境强相关，也优先延续其子代理。"
-        )
-        provider = self._router_provider()
-        try:
-            llm_resp = await asyncio.wait_for(
-                self.context.llm_generate(
-                    chat_provider_id=provider,
-                    prompt=message,
-                    system_prompt=sys_prompt,
-                ),
-                timeout=self._router_timeout(),
-            )
-        except asyncio.TimeoutError:
-            logger.info(f"[parallel_handoff] T2 router timeout after {self._router_timeout()}s -> main")
-            return None, 0.0
-        except Exception as e:
-            logger.warning(f"[parallel_handoff] T2 router error: {e} -> main")
-            return None, 0.0
-
-        raw = (getattr(llm_resp, "completion_text", "") or "").strip()
-        m = re.search(r"\{.*\}", raw, re.S)
-        if not m:
-            logger.warning(f"[parallel_handoff] T2 router non-JSON resp: {raw[:80]!r} -> main")
-            return None, 0.0
-        try:
-            data = json.loads(m.group(0))
-        except json.JSONDecodeError:
-            return None, 0.0
-        route = str(data.get("route") or "").strip().lower()
-        try:
-            conf = float(data.get("confidence", 0))
-        except (TypeError, ValueError):
-            conf = 0.0
-        if route not in pool:
-            route = None
-        return route, conf
-
     # ── 主入口（main.py 壳方法 super() 转发到此处） ────────
     def _mode_shortcut_decision(self, event, message: str, route: str) -> bool:
-        """[模式兼容 2026-08-31] T1/T2 命中后的模式裁决：是否允许短路直发。
+        """[模式兼容 2026-08-31] T1 命中后的模式裁决：是否允许短路直发。
 
         返回 True = 保持短路直发（原行为，call_subagent + stop_event）
         返回 False = 放行主代理（不 stop，让 directive 注入 + parallel_handoff 模式调度）
 
-        冲突背景：T1/T2 命中直接 call_subagent 直发，绕过 tech_mode_config /
+        冲突背景：T1 命中直接 call_subagent 直发，绕过 tech_mode_config /
         affection_mode_config 模式调度——技术干活任务被单发直连，用户配置形同虚设；
         短路后主代理 LLM 不调用，directive 强制路由指令根本没机会注入。
 
@@ -1253,7 +1172,7 @@ class RouterMixin:
             return True
         if task_kind == "tech":
             # [2026-09-07 方案A粘滞锁定] 技术请求短路直发给被点名/粘滞的子代理处理，
-            # 不再放行主代理统帅收卷。route 参数即 T1/T2/粘滞判定的目标代理。
+            # 不再放行主代理统帅收卷。route 参数即 T1/粘滞判定的目标代理。
             return True
         if task_kind == "affection":
             mcfg = self._get_mode_config("affection")
@@ -1262,11 +1181,11 @@ class RouterMixin:
         return True
 
     # ── 判向目标传递（2026-08-31）────────────────────────
-    # T1/T2 命中但模式裁决放行主代理时（tech 统帅收卷 / affection-relay），
-    # 把 T1/T2 判定的路由目标暂存，directive 注入时附加给主代理，
+    # T1 命中但模式裁决放行主代理时（tech 统帅收卷 / affection-relay），
+    # 把 T1 判定的路由目标暂存，directive 注入时附加给主代理，
     # 避免"裁决放行 → 判向目标丢失 → 主代理调错人/不调子代理"的断链。
     def _record_route_suggestion(self, agent: str):
-        """记录 T1/T2 判向目标（供 directive 注入附加），30s 有效期。"""
+        """记录 T1 判向目标（供 directive 注入附加），30s 有效期。"""
         self._route_suggestion = ([agent], time.time())
 
     def _record_route_suggestions(self, agents):
@@ -1302,7 +1221,7 @@ class RouterMixin:
 
         背景：主代理工具链执行中（agent run 活跃）时，用户发来的新消息会被
         internal.py:194 的 try_capture_follow_up 吞进当前 run 的 follow-up ticket，
-        OnWaitingLLMRequestEvent（T1/T2 路由唯一入口）根本不触发，消息混入主代理
+        OnWaitingLLMRequestEvent（T1 路由唯一入口）根本不触发，消息混入主代理
         上下文，主代理只能边干活边手动调子代理。
 
         本方法挂在 @filter.custom_filter(BusyRunnerFilter) 的 AdapterMessageEvent
@@ -1519,8 +1438,15 @@ class RouterMixin:
         原先 3 处内联写法同构（T0 命令锁在场组 / 多点名强呼叫 / T0.5 粘滞多人组），
         差异只有：agent 列表、日志文案、是否写粘滞记忆。call_mode 原先一处随人数
         切换、两处写死 chained，统一成按人数裁决（那两处已保证 len>=2，等价）。
+
+        [2026-09-25] 发言顺序随机化：原按 agents 传入顺序（即命令中名字的前后）
+        固定接龙，`/A+B` 永远 A 先开口。现在每轮独立打乱说话次序；锁组本身不
+        （`_cmd_lock` 的键集）不变，只是开口顺序不固定。
         """
-        calls = [{"agent_name": a, "input": message} for a in agents]
+        order = list(agents)
+        if len(order) > 1:
+            random.shuffle(order)
+        calls = [{"agent_name": a, "input": message} for a in order]
         try:
             await self.parallel_handoff(
                 event,
@@ -1543,7 +1469,7 @@ class RouterMixin:
     async def _smart_router_check(self, event: AstrMessageEvent) -> bool:
         """on_waiting_llm_request 钩子实现。命中返回 True 并已 stop_event。
 
-        路由链（2026-08-21 起）：T1 点名/领域词 → T1.5 会话续接 → T2 小模型（带上下文）→ T3 落主代理。
+        路由链（2026-08-21 起）：T1 点名/领域词 → T1.5 会话续接 → T3 落主代理。
         """
         # [源头封堵 2026-08-21] 子代理直发后、主代理继续生成工具结果续写时，waiting 钩子
         # 会再次被触发（带 _suppress_mainagent_prefix 标记）。此时直接 stop_event 消费标记，
@@ -1563,7 +1489,7 @@ class RouterMixin:
                 self._suppress_mainagent_prefix = False
                 event.stop_event()
                 return True
-            # 非续写触发（新用户消息/过期）：消费标记后走完整路由链 T1→T1.5→T2→主代理
+            # 非续写触发（新用户消息/过期）：消费标记后走完整路由链 T1→T1.5→主代理
             self._suppress_mainagent_prefix = False
         if not self._router_enabled():
             return False
@@ -1585,7 +1511,7 @@ class RouterMixin:
         if self._dedup_shortcircuit(event, message, raw_message):
             return True
         # [软入口·A 方案 2026-09-12] 柜台命令 /谁在 /复位 /列表：回执并短路，
-        # 不进 T0 点名 / T1 / T0.5 / T2 任何一层。
+        # 不进 T0 点名 / T1 / T0.5 任何一层。
         admin_cmd = self._parse_admin_command(raw_message)
         if admin_cmd:
             logger.info(f"[parallel_handoff] SmartRouter: 管理命令 {admin_cmd} → 回执并短路")
@@ -1593,7 +1519,7 @@ class RouterMixin:
             event.stop_event()
             return True
         # [主代理锁 2026-09-12 用户指定] 会话被主代理锁锁定 → 非命令消息直通主代理，
-        # 不跑 T0 点名/T1/T1.5/T0.5/T2；命令字（/ 开头）放行给下方 T0 处理
+        # 不跑 T0 点名/T1/T1.5/T0.5；命令字（/ 开头）放行给下方 T0 处理
         # （/子代理名 换锁、/复位 解绑仍可执行）。
         if self._main_locked(event) and not self._is_real_command(raw_message):
             logger.info(
@@ -1602,7 +1528,7 @@ class RouterMixin:
             return False
         # [T0 命令式触发 2026-09-08 用户指定] 以 / 开头的显式命令（如 /<名A>、/<名A>+<名B>、
         # /助手C+助手A+助手D、/主代理+助手A）→ 直接锁定目标，最高优先级短路，
-        # 彻底跳过 T1 关键词猜测 / T0.5 粘滞 / T2 小模型。命令持续生效（写粘滞锁）。
+        # 彻底跳过 T1 关键词猜测 / T0.5 粘滞。命令持续生效（写粘滞锁）。
         cmd_agents, cmd_main = self._parse_agent_command(raw_message)
         if cmd_agents or cmd_main:
             if cmd_agents and not cmd_main:
@@ -1651,7 +1577,7 @@ class RouterMixin:
                 event.stop_event()
                 return True
         # [最高优先级 2026-09-03 用户指定] 含连续「主代理」四字 → 无条件放行主代理（=主代理）。
-        # 跳过 T1/T1.5/T2 全部判向，任何子代理都不得接管。返回 False 表示不短路、不 stop_event，
+        # 跳过 T1/T1.5 全部判向，任何子代理都不得接管。返回 False 表示不短路、不 stop_event，
         # 消息自然落回主代理路径。登记路由历史防止 T1.5 后续承接接到子代理。
         if self._main_token_hits(event, message):
             logger.info(
@@ -1668,7 +1594,7 @@ class RouterMixin:
             return False
         t0 = time.perf_counter()
         # [T0 命令式强制锁定 2026-09-08 用户指定] 命令锁在场者组存在 → 该会话所有后续
-        # 消息直接按锁组路由（多人 chained / 单人 direct），T1 名字判定/T0.5 粘滞/T2
+        # 消息直接按锁组路由（多人 chained / 单人 direct），T1 名字判定/T0.5 粘滞
         # 全部跳过——即使对话里点了其他子代理名（如「你对某人的看法」），也只是
         # 对话内容，绝不切换到该子代理。只有新命令或「主代理」文本能解除（上层已判）。
         cmd_locked = self._cmd_locked_group(event)
@@ -1723,24 +1649,19 @@ class RouterMixin:
                     event, sticky, message, label="粘滞多人接龙"
                 )
             route = sticky if isinstance(sticky, str) else None
-            conf = 1.0 if route else 0.0
             source = "T0.5"
-        # T2 小模型（带最近会话上下文）
         if not route:
-            route, conf = await self._t2_route(event, message)
-            source = "T2"
-        if not route or conf < self._router_threshold():
             return False
-        # [模式兼容 2026-08-31] T1/T2 命中后按用户模式配置裁决：
+        # [模式兼容 2026-08-31] T1 命中后按用户模式配置裁决：
         # 技术干活任务（tech 特征）→ 放行主代理走 tech 模式统帅收卷（relay+parallel），
-        # 避免 T1/T2 短路把任务变成 direct 单发、绕过用户模式配置；
+        # 避免 T1 短路把任务变成 direct 单发、绕过用户模式配置；
         # 贴贴任务 → 按 affection_mode_config.route_mode：direct 短路直发，relay 放行主代理。
         if not self._mode_shortcut_decision(event, message, route):
             logger.info(
                 f"[parallel_handoff] SmartRouter: {source} route -> {route} "
                 f"但模式配置要求放行主代理（统帅收卷/relay），不短路"
             )
-            # [判向传递 2026-08-31] 放行时把 T1/T2 判向目标暂存，供 directive 注入附加
+            # [判向传递 2026-08-31] 放行时把 T1 判向目标暂存，供 directive 注入附加
             self._record_route_suggestion(route)
             return False
         self._record_route_hit(event, route)
@@ -1767,8 +1688,7 @@ class RouterMixin:
             logger.warning(f"[read_air] arbitrate skipped (non-fatal): {_arb_e}")
         logger.info(
             f"[parallel_handoff] SmartRouter: {source} route -> {route} "
-            f"(conf={conf:.2f}, thr={self._router_threshold()}, "
-            f"cost={int((time.perf_counter() - t0) * 1000)}ms)"
+            f"(cost={int((time.perf_counter() - t0) * 1000)}ms)"
         )
         try:
             await self.call_subagent(event, agent_name=route, input=message, speaker="顾主")

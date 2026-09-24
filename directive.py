@@ -152,7 +152,7 @@ class DirectiveMixin:
         )
 
     # ── 任务分类（T1 规则层停用后的智能预判替代，2026-08-31） ──
-    # 用户指定：T1/T2 小模型路由层与动态模式冲突，已关闭 enable_smart_router。
+    # 用户指定：T1 规则路由层与动态模式冲突，已关闭 enable_smart_router。
     # 但 smart 注入仍需要"这条消息要不要注入、注入哪套指令"的判断，
     # 这里用轻量关键词分类替代：技术特征 → tech 模式；点名/领域词 → affection 模式。
     _TASK_TECH_RE = re.compile(

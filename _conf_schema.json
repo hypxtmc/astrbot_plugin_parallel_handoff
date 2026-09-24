@@ -147,31 +147,13 @@
     "description": "小模型路由层总开关",
     "type": "bool",
     "default": false,
-    "hint": "开启后消息进入主代理 LLM 前先用 T1规则/T2小模型判向，命中子代理直发并短路主代理。默认关，开启后观察路由命中与误伤。"
+    "hint": "开启后消息进入主代理 LLM 前先用 T1 规则判向，命中子代理直发并短路主代理。默认关，开启后观察路由命中与误伤。"
   },
   "enable_disambiguation": {
     "description": "启用消息消歧（无指名自动路由）",
     "type": "bool",
     "default": true,
     "hint": "开启后：没有指名子代理的消息，自动路由给上一次回复过你的那位子代理（会话级连续对话）。默认开。"
-  },
-  "router_provider_id": {
-    "description": "T2路由小模型 Provider ID",
-    "type": "string",
-    "default": "dmxapi/glm-4-flash",
-    "hint": "用于判向的小模型，必须是 AstrBot 中已配置的 provider id。免费 glm-4-flash 即可，勿用主模型。"
-  },
-  "router_confidence_threshold": {
-    "description": "T2小模型路由置信度阈值",
-    "type": "float",
-    "default": 0.8,
-    "hint": ">= 该值才直连子代理，低于则落回主代理。阈值越高越保守（宁可多过主代理），推荐 0.8。"
-  },
-  "router_timeout": {
-    "description": "T2路由判向超时（秒）",
-    "type": "float",
-    "default": 5,
-    "hint": "小模型判向超时直接放行主代理，不影响体验。"
   },
   "subagent_reply_timeout": {
     "description": "子代理回复最大等待超时（秒）",

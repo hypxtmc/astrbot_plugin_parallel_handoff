@@ -625,7 +625,7 @@ class DispatchMixin:
                 if r.get("success") and r.get("agent_name"):
                     self._last_agent[session_id] = r["agent_name"]
                     if self._is_direct_delivery(r.get("agent_name", ""), direct_agents, route_mode):
-                        # 直发成功的回复尾部记入路由记忆（T2 剧情参照用）
+                        # 直发成功的回复尾部记入路由记忆（承接参照用）
                         self._record_direct_reply(
                             session_id,
                             r["agent_name"],

@@ -1,6 +1,6 @@
 # 更新说明
 
-## v3.1.0 — 2026-09-20
+## v3.1.0 — 2026-09-25
 
 子代理的工具权限从「一张全局表」变成「全局 + 单代理特批」。
 
@@ -28,6 +28,27 @@
 
 `子代理工具集 [agent]: N 项（全权档 / 白名单）`。此前只打工具名列表、档位写死「只读档」，
 无法从日志判断某个代理到底拿了什么。热重载假成功时，日志里这行是唯一判据。
+
+### 变更 · 多人接龙发言顺序随机
+
+命令强锁多人（`/A+B`）与多点名强呼叫都走 `_shortcircuit_chain`，原先按传入顺序固定
+接龙，`/A+B` 永远 A 先开口。现改为每轮独立打乱说话次序；锁组本身（`_cmd_lock`
+的键集）不变，`_cmd_locked_group` 的集合语义不受影响。
+
+### 移除 · T2 小模型判向层
+
+路由降级链由「T1 规则 / T2 小模型 / T3 兜底」改为「T1 规则 / T0.5 粘滞 / T3 兜底」。
+
+T2 只读单条消息，要过 `router_confidence_threshold`（默认 0.8）才直连，低于阈值或
+超时一律落主代理；实际能命中的场景与 T1 点名高度重叠，一次额外的模型调用换不到
+对应的路由收益。移除范围：
+
+- `_t2_route` 方法及其在 `_smart_router_check` 中的调用点
+- 配置项 `router_provider_id` / `router_timeout` / `router_confidence_threshold`
+- 辅助方法 `_router_provider` / `_router_timeout` / `_router_threshold`
+- `T2_AGENT_BRIEF` 更名 `AGENT_BRIEF`（`_router_agent_pool` 仍在使用）
+
+`enable_smart_router` 语义不变：开启后命中即短路主代理，未命中无条件放行主代理。
 
 ### 注意 · 改这两处必须重启，热重载无效
 

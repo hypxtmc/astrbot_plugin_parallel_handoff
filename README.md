@@ -181,7 +181,7 @@ WebUI 插件配置里至少设两项：
 
 **读空气仲裁（arbitrate）**：在场状态机判断哪些子代理在场、该谁接话。二级闸门 `read_air_enforce` 默认关闭（observe-only）；开启后执行「宁静权」真实拦截。
 
-**智能路由（router，默认关）**：`enable_smart_router` 开启后由独立小模型预判该不该转子代理，置信度阈值和超时可调。
+**智能路由（router，默认关）**：`enable_smart_router` 开启后按 T1 点名/领域词规则预判该不该转子代理，命中即短路主代理，未命中无条件放行。
 
 **livingmemory 记忆集成**：调用子代理时自动召回相关记忆片段（`recall_enabled`），并为子代理过滤记忆工具，防止跨人格记忆污染。私有路径访问通过防腐层 `_lm_bridge` 隔离。
 
@@ -240,7 +240,7 @@ WebUI 插件配置里至少设两项：
 
 **前缀与转发**：`enable_subagent_name_prefix` · `enable_mainagent_name_prefix` · `enable_mainagent_segmented` · `enable_segmented_forward` · `min_fragment_length` · `fragment_interval` · `allow_mainagent_after_direct` · `forbid_pre_tool_mainagent_talk` · `mainagent_disable_md_split` · `mainagent_md_split_max_chars` · `mainagent_md_split_progress` · `name_display_map` · `name_prefix_overrides` · `qq_md_plainify`
 
-**路由与指令**：`enable_route_directive` · `subagent_visibility_inject` · `directive_inject_mode` · `enable_smart_router` · `enable_disambiguation` · `router_provider_id` · `router_confidence_threshold` · `router_timeout` · `subagent_reply_timeout`
+**路由与指令**：`enable_route_directive` · `subagent_visibility_inject` · `directive_inject_mode` · `enable_smart_router` · `enable_disambiguation` · `subagent_reply_timeout`
 
 **子代理工具循环**：`subagent_tools` · `subagent_readonly_tools`（旧键）· `subagent_max_steps` · `subagent_tool_call_timeout` · `subagent_response_preview_chars` · `subagent_prefetch_enabled`
 
@@ -264,7 +264,7 @@ WebUI 插件配置里至少设两项：
 astrbot_plugin_parallel_handoff/
 ├── main.py            # 入口 + 事件注册
 ├── dispatch.py        # 核心调度：主流程、工具循环、关系档案
-├── router.py          # 路由层：T0 强锁 / T1 规则 / T2 小模型 / T3 兜底、消歧
+├── router.py          # 路由层：T0 强锁 / T1 规则 / T3 兜底、消歧
 ├── forward.py         # 分段转发、前缀注入、markdown 降级、旁听窗
 ├── memory.py          # livingmemory 集成、工具白名单、时间感知
 ├── random_state.py    # 个体状态随机演化
@@ -364,7 +364,7 @@ astrbot_plugin_parallel_handoff/
 
 ```
 用户消息
-  → router：T0 强锁？T1 规则命中？T2 小模型？T3 兜底主代理
+  → router：T0 强锁？T1 规则命中？T3 兜底主代理
   → dispatch：构建 calls、并发派发
       → 每声部：system（人格 + 关系档案 + 纪律 + 任务卡）
                 + 上下文（ctx_engine / session_store）
