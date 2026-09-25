@@ -19,6 +19,26 @@ except ImportError:  # 单测环境：无 package，走绝对导入
     from _lm_bridge import LivingMemoryBridge
 
 
+# ── 未了结事项过滤（2026-09-25）──────────────────────────────
+# 背景：子代理对话里挂着「还没还的针线盒」「等腌完的萝卜」这类悬而未决的事，
+# 每次提到都被提炼成新原子，旧的又没过期，同一件事在库里堆五六个版本。
+# 召回一次捞到一次，提了再写一条，形成自我复制的闭环——实测「针线盒」
+# 一件在 9-05~9-25 之间累计 11 条原子、跨 6 个人格，13 天里反复被念。
+# 处理：把「悬而未决」的表述挡在长期记忆外。这类事该由对话自己了结，
+# 不该沉淀成永久档案。只拦明确句式，宁可漏，不误杀正常事实。
+_UNFINISHED_MARKERS: tuple = (
+    "没有还", "没还", "未还", "欠着", "没交货",
+    "没做完", "没弄完", "没腌完", "没缝完", "没干完", "没写完",
+    "回头再", "下次再", "哪天再", "等有空", "等以后",
+    "搁着", "晾着", "压着石头", "挂着没",
+)
+
+
+def _is_unfinished(text: str) -> bool:
+    """一条事实是否属于「悬而未决」——这类不进长期记忆。"""
+    return any(m in text for m in _UNFINISHED_MARKERS)
+
+
 def _strip_chain_injection(text: str) -> str:
     """剥离接龙注入的前文块（临时上下文），避免污染子代理长期记忆。
 
@@ -632,6 +652,19 @@ class MemoryMixin:
                 session_id=memory_scope,
                 persona_id=persona_id,
             )
+            # 2026-09-25：挡掉悬而未决的事，防同类原子反复堆积（见 _UNFINISHED_MARKERS）
+            _before = len(atoms)
+            atoms = [
+                a
+                for a in atoms
+                if not _is_unfinished(getattr(a, "content", "") or "")
+            ]
+            _dropped = _before - len(atoms)
+            if _dropped:
+                logger.info(
+                    f"[parallel_handoff] 未了结事项过滤 [{agent_name}]："
+                    f"剔除 {_dropped}/{_before} 条，不写入长期记忆"
+                )
             metadata["source_window"] = {
                 "session_id": session_id,
                 "start_index": last,

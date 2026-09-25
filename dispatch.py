@@ -334,15 +334,33 @@ class DispatchMixin:
                 )
             # 该场景的 agent 名单（今日至少要把出过场的都覆盖到）
             agents = self._rng.agents(scene) or list(handoff_map.keys())
-            # 近期日志：取跨轮对话历史（若有）
+            # 近期日志：按 agent 各自取自己的最近历史，带归属与身份标注。
+            #
+            # 严禁退回「取 handoff_map 里任意一位的历史当全员日志」的写法：
+            # 那样 logs 里只有 role>content、看不出是谁说的，GLM 就会把 A 的专业活
+            # 安到 B 头上——2026-09-25 阿米娅连念十二天「跟报错较劲」，源头正是
+            # 可露希尔的工程对话被当成了全场日志，再经接龙脉络回灌固化。
             logs = ""
             try:
-                hist = (self._ctx_engine.histories or {}).get(
-                    f"{next(iter(handoff_map))}:{scene}", []
-                )
-                logs = "\n".join(
-                    f"{m.get('role')}>{m.get('content','')}" for m in hist[-8:]
-                ) or ""
+                _hist_all = self._ctx_engine.histories or {}
+                _parts = []
+                for _a in agents:
+                    _h = _hist_all.get(f"{_a}:{scene}", [])
+                    if not _h:
+                        continue
+                    _tail = "\n".join(
+                        (m.get("content") or "")[:300] for m in _h[-3:]
+                    ).strip()
+                    if not _tail:
+                        continue
+                    # 身份线索：优先 public_description，回落人格开头一段，都取不到就不带
+                    _ag = getattr(handoff_map.get(_a), "agent", None)
+                    _who = (getattr(_ag, "public_description", "") or "").strip()
+                    if not _who:
+                        _who = (getattr(_ag, "instructions", "") or "").strip()[:180]
+                    _head = f"（{_who}）" if _who else ""
+                    _parts.append(f"【{_a}】{_head}\n{_tail}")
+                logs = "\n\n".join(_parts)
             except Exception:
                 logs = ""
             await self._daily_life_injector.inject(scene, agents, logs, umo=scene)
