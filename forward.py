@@ -499,6 +499,31 @@ class ForwardMixin:
         except Exception:
             return False
 
+    def _has_advanced_md(self, text: str) -> bool:
+        """[2026-09-25 定稿] 只认「必须整条才能渲染」的高级 markdown：表格／代码块／公式。
+
+        粗体、列表、标题、行内代码这类简单语法，拆成几条后各自仍能渲染，
+        不该占用整条路径——否则主代理每条长回复都被揉成一坨大消息，用户看着累。
+        表格和代码块恰恰相反：按段落切开就废了（表头与分隔行分离、围栏被截断），
+        公式环境同理（$...$ 拆开就不成立）。
+        """
+        if not text:
+            return False
+        if "```" in text:
+            return True
+        _run = 0
+        for _line in text.splitlines():
+            _s = _line.strip()
+            if _s.startswith("|") and _s.count("|") >= 2:
+                _run += 1
+                if _run >= 2:
+                    return True
+            else:
+                _run = 0
+        if self._looks_like_latex(text):
+            return True
+        return False
+
     async def _send_split_by_type(self, result, event, full_text) -> bool:
         """[2026-08-27 类型拆条] 叙述/代码/公式各发各的，别揉成一条大 md 消息。
 
@@ -834,7 +859,12 @@ class ForwardMixin:
         #   1) 先试"按块类型拆条"(叙述/代码/公式各发一条,像人发消息);
         #   2) 不适合时回退结构边界分段直发(_send_md_split_sections,拆出>=2条才走);
         #   3) 再不行回退 _inject_section_dividers 整条渲染,保持旧行为。
-        if self._looks_like_markdown(full_text) or self._looks_like_latex(full_text):
+        # [2026-09-25 定稿] 闸门收窄：只有表格／代码块／公式这类「拆开就废」的
+        # 高级 markdown 才走整条路径（下面三条）。粗体、列表、标题、行内代码这类
+        # 简单语法拆成几条后各自仍能渲染，一律放行到下面的正常分段——
+        # 否则主代理每条长回复都被揉成一坨大消息，用户看着累。
+        # （旧判据 _looks_like_markdown 命中列表/标题/行内代码即 True，太宽。）
+        if self._has_advanced_md(full_text):
             # [2026-08-28 主代理] 文档型消息（多级标题/标题+表格+代码块）——
             # 完整排版整体，不参与任何拆条，直接整条渲染（类型拆条/900字分段都不碰）
             if self._is_document_style(full_text):
@@ -902,6 +932,24 @@ class ForwardMixin:
             segments = [s for s in segments if s.strip()]
         else:
             segments = [s.strip() for s in full_text.split("\n\n") if s.strip()]
+            # [2026-09-25 亲修] 空行折叠兜底：主代理惯用「一句一行」，
+            # 段间空行常被上游折叠成单换行，split("\n\n") 只拿到整块一条、分段哑火。
+            # 此时按单换行重新分组，攒够 _PM_MIN_CHARS 才落一条，避免每句都成独立消息。
+            if len(segments) <= 1 and full_text.count("\n") >= 2 and len(full_text) > 120:
+                _PM_MIN_CHARS = 90
+                _buf, _packed = [], []
+                for _ln in full_text.split("\n"):
+                    _ln = _ln.strip()
+                    if not _ln:
+                        continue
+                    _buf.append(_ln)
+                    if sum(len(x) for x in _buf) >= _PM_MIN_CHARS:
+                        _packed.append("\n".join(_buf))
+                        _buf = []
+                if _buf:
+                    _packed.append("\n".join(_buf))
+                if len(_packed) > 1:
+                    segments = _packed
         # [2026-08-27 03:08 优化①③] 句子级拆分包：超长无横线段按句标点二次拆，
         # 单块超 900 字硬切——拆到最后真正的"段"再判数量
         segments = [p for seg in segments for p in self._split_long_segment(seg)]
