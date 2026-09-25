@@ -59,6 +59,20 @@ class ContextEngine:
         self.histories[ctx_key] = hist
         return hist
 
+    # ── 只读窥看：取历史但绝不落空，供注入器等旁路消费者用 ──
+    def peek(self, agent_name, session_id):
+        """拿某会话历史；**会触发惰性加载**，键不存在≠没历史。
+
+        2026-09-25 教训：daily_life 注入器曾裸读 `.histories.get(key, [])`，
+        而 histories 是惰性加载的——没被访问过的会话根本不在字典里。
+        于是「没加载」被当成了「没数据」，logs 恒为空，GLM 无话可读恒返 []，
+        inject 长期 applied=0/total=0，状态注入静默空转。旁路消费者一律走本方法。
+        """
+        try:
+            return self._ensure(agent_name, session_id)
+        except Exception:  # noqa: BLE001  窥看失败不该拖垮调用方
+            return []
+
     # ── 注入：历史转结构化 messages 返回（超窗口自动截断） ──
     async def inject(self, agent_name, session_id, final_input):
         """返回 (prompt, contexts)。

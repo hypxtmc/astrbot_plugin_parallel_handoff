@@ -342,10 +342,12 @@ class DispatchMixin:
             # 可露希尔的工程对话被当成了全场日志，再经接龙脉络回灌固化。
             logs = ""
             try:
-                _hist_all = self._ctx_engine.histories or {}
                 _parts = []
                 for _a in agents:
-                    _h = _hist_all.get(f"{_a}:{scene}", [])
+                    # 必须走 peek（内部 _ensure）：histories 是惰性加载的，
+                    # 裸读 .histories.get() 会把「没加载」误判成「没数据」，
+                    # 那正是 inject 长期 applied=0/total=0 的真根因。
+                    _h = self._ctx_engine.peek(_a, scene)
                     if not _h:
                         continue
                     _tail = "\n".join(
@@ -363,6 +365,12 @@ class DispatchMixin:
                 logs = "\n\n".join(_parts)
             except Exception:
                 logs = ""
+            if not logs:
+                logger.warning(
+                    f"[parallel_handoff] 今日状态注入：logs 为空 "
+                    f"（agents={len(agents)} 有历史的={sum(1 for _a in agents if self._ctx_engine.peek(_a, scene))}）"
+                    f"，GLM 将无话可读——检查 ctx_engine 惰性加载与 session_store"
+                )
             await self._daily_life_injector.inject(scene, agents, logs, umo=scene)
             self._daily_llm_injected_scenes.add(_key)
             logger.info(f"[parallel_handoff] 今日状态 LLM 注入完成 scene={scene} agents={len(agents)}")

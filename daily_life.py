@@ -142,8 +142,8 @@ class DailyLifeInjector:
                 self._rng.set_llm(scene, agent, _mood, _domain, _hand)
                 applied += 1
             _logger.info(
-                "[daily_life] inject scene=%s applied=%d skipped_blank=%d total=%d",
-                scene, applied, skipped, len(entries),
+                "[daily_life] inject scene=%s applied=%d skipped_blank=%d total=%d logs_chars=%d",
+                scene, applied, skipped, len(entries), len(logs or ""),
             )
         except Exception as e:  # noqa: BLE001
             _logger.warning("[daily_life] inject failed, degrade to random: %s", e)
