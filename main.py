@@ -82,7 +82,7 @@ def _load_display_names() -> dict:
     "astrbot_plugin_parallel_handoff",
     "hypxtmc",
     "并行子代理调用 — parallel_handoff tool,支持同时调用多个子代理",
-    "2.0.0",
+    "3.1.0",
 )
 class ParallelHandoffPlugin(
     _forward_mod.ForwardMixin,

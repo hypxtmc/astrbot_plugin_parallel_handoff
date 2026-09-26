@@ -6,7 +6,7 @@ AstrBot 多子代理并行调度插件（原名 `parallel_handoff`）
 
 | 信息 | 值 |
 |------|-----|
-| 版本 | 3.1 |
+| 版本 | 3.1.0 |
 | 更新说明 | [CHANGELOG.md](CHANGELOG.md) |
 | 作者 | hypxtmc |
 | 许可 | MIT |
