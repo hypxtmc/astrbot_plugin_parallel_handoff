@@ -1320,7 +1320,7 @@ class RouterMixin:
                     call_mode="chained" if len(calls) > 1 else "direct",
                     route_mode="direct",
                     mode="affection",
-                    speaker="顾主",
+                    speaker=self._get_user_address(),
                 )
             except Exception as e:
                 logger.error(
@@ -1344,7 +1344,7 @@ class RouterMixin:
                     call_mode="chained",
                     route_mode="direct",
                     mode="affection",
-                    speaker="顾主",
+                    speaker=self._get_user_address(),
                 )
             except Exception as e:
                 logger.error(
@@ -1370,7 +1370,7 @@ class RouterMixin:
                     call_mode="chained",
                     route_mode="direct",
                     mode="affection",
-                    speaker="顾主",
+                    speaker=self._get_user_address(),
                 )
             except Exception as e:
                 logger.error(
@@ -1395,7 +1395,7 @@ class RouterMixin:
                 f"(runner active, skip follow-up capture)"
             )
             try:
-                await self.call_subagent(event, agent_name=route, input=message, speaker="顾主")
+                await self.call_subagent(event, agent_name=route, input=message, speaker=self._get_user_address())
             except Exception as e:
                 logger.error(
                     f"[parallel_handoff] BusyBypass T0.5 direct call failed: {e}; release to main"
@@ -1421,7 +1421,7 @@ class RouterMixin:
             f"(runner active, skip follow-up capture)"
         )
         try:
-            await self.call_subagent(event, agent_name=route, input=message, speaker="顾主")
+            await self.call_subagent(event, agent_name=route, input=message, speaker=self._get_user_address())
         except Exception as e:
             logger.error(
                 f"[parallel_handoff] BusyBypass direct call failed: {e}; release to main"
@@ -1454,7 +1454,7 @@ class RouterMixin:
                 call_mode="chained" if len(calls) > 1 else "direct",
                 route_mode="direct",
                 mode="affection",
-                speaker="顾主",
+                speaker=self._get_user_address(),
             )
         except Exception as e:
             logger.error(
@@ -1691,7 +1691,7 @@ class RouterMixin:
             f"(cost={int((time.perf_counter() - t0) * 1000)}ms)"
         )
         try:
-            await self.call_subagent(event, agent_name=route, input=message, speaker="顾主")
+            await self.call_subagent(event, agent_name=route, input=message, speaker=self._get_user_address())
         except Exception as e:
             logger.error(f"[parallel_handoff] SmartRouter direct call failed: {e}; release to main")
             return False

@@ -149,8 +149,12 @@ class MemoryMixin:
         self._lm_bridge_cache = bridge
         return bridge
 
-    # ── 预取线索（2026-09-15 用户驱动）：派单时替子代理把「任务里已点名的实体」
-    #    先本地 ripgrep 一遍，把 文件:行 锚点塞进 extra，让她开局直接精读、跳过盲搜。
+    # ── 预取线索（2026-09-15 上线，2026-09-26 重做抽取闸门与质量门）：派单时替子代理把
+    #    「任务里已点名的实体」先本地 ripgrep 一遍，锚点拼进派单 prompt 尾部送进去
+    #    （这里是派单任务书本身，属任务内容、该进历史，故仍拼进 prompt；
+    #     旁轨记忆／时间感知那类临时上下文自 2026-09-26 起已改走
+    #     extra_user_content_parts，不再并进 prompt），
+    #    让她开局直接精读、跳过盲搜。
     #    依据：实测子代理单次派单每步约 7.4 秒，≥3 步的派单里 93% 是
     #    「搜一次→看一眼→再搜一次」的串行搜索。预取成本：纯本地 rg，实测
     #    6 个候选 232ms、线索块约 300 字符，不调 LLM、不砍任何注入内容。
@@ -159,20 +163,46 @@ class MemoryMixin:
         "AstrBot", "astrbot", "python", "plugin", "plugins", "test", "tests",
         "data", "file", "files", "config", "main", "api", "json", "yaml",
         "README", "src", "lib", "docs", "web", "http", "https", "log", "logs",
+        # [2026-09-26] 高频代码通用词：抽取闸门放宽后它们会挤掉真候选（实测 prompt/
+        # emit/dispatch 一进场，块从 240 字符涨到 994 字符且几乎无定位价值）。
+        "prompt", "dispatch", "emit", "logger", "handler", "return", "import",
+        "class", "def", "state", "scene", "agent", "agents", "core", "func",
         "用户", "任务", "文件", "目录", "代码", "函数", "变量", "配置", "插件", "测试",
+    })
+
+    # [2026-09-26] 英语口语停用词：抽取闸门放宽后这类词会占满 5 个候选名额，
+    # 它们满库皆是、定位价值为零。只挡它们，不挡 dmesg/bettbox 这种技术词。
+    _PREFETCH_EN_STOP = frozenset({
+        "the", "this", "that", "with", "from", "what", "when", "where", "which",
+        "check", "look", "find", "help", "need", "want", "also", "just", "only",
+        "make", "take", "give", "keep", "into", "over", "after", "before", "about",
+        "task", "agent", "agents", "error", "errors", "issue", "please", "thanks",
+        "good", "best", "some", "more", "most", "than", "then", "they", "them",
+        "your", "will", "should", "could", "would", "have", "has", "had", "been",
+        "were", "was", "are", "and", "but", "for", "not", "use", "used", "using",
     })
 
     @classmethod
     def _prefetch_candidates(cls, text: str, limit: int = 5) -> list:
         """从任务文本抽可检索实体（零 LLM 成本）。优先级：绝对路径 > 文件名 >
-        代码标识符（带下划线/驼峰）> 引号内片段。通用词走黑名单，避免抽到
-        「AstrBot」这种满库都是的词污染线索。"""
+        代码标识符 > 引号内片段。通用词走黑名单，避免抽到「AstrBot」这种满库都是
+        的词污染线索；口语停用词走 _PREFETCH_EN_STOP。"""
         import re
 
         paths = re.findall(r"/[\w\-./]{6,}", text)
         files = re.findall(r"\b[\w\-]+\.(?:py|json|yaml|yml|toml|sh|log|md)\b", text)
         ids = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]{2,})\b", text)
-        ids = [x for x in ids if "_" in x or re.search(r"[a-z][A-Z]", x)]
+        # [2026-09-26 修] 旧闸门只放过带下划线或驼峰的词，`bettbox`/`dmesg`/`OOM`
+        # 这类全小写技术词一个都进不来——实测五条真实口径的派单里三条抽零候选、
+        # 预取整块白开。放宽为：带下划线 / 驼峰 / 全大写缩写(≥3) / 长度≥4 全小写
+        # 实词（再用口语停用词挡掉 the/check/please 这类）。
+        ids = [
+            x for x in ids
+            if "_" in x or re.search(r"[a-z][A-Z]", x)
+            or (len(x) >= 3 and x.isupper())
+            or (len(x) >= 4 and x.isalpha() and x.islower()
+                and x.lower() not in cls._PREFETCH_EN_STOP)
+        ]
         quoted = re.findall(r"[`\"'「【]([^`\"'\n【】]{3,60})[`\"'」】]", text)
         out, seen = [], set()
         for bucket in (paths, files, ids, quoted):
@@ -220,7 +250,18 @@ class MemoryMixin:
             d = f"/root/AstrBot/data/plugins/{name}"
             if os.path.isdir(d):
                 roots.append(d)
-        roots = [r for r in dict.fromkeys(roots) if r and os.path.isdir(r)]
+        # [2026-09-26] 候选本身可能就是插件名（parallel_handoff / bettbox / daily_life）：
+        # 命中插件目录名就把根收窄到它——rg 从全树 ~1s 降到单目录 ~30ms，也只有这样
+        # 才够预算跑完「定义点 + 出现点」两趟（实测收窄前出现点那趟必撞超时）。
+        _pj = "/root/AstrBot/data/plugins"
+        if os.path.isdir(_pj):
+            _dirs = [n for n in os.listdir(_pj) if os.path.isdir(os.path.join(_pj, n))]
+            for _c in cands:
+                for _n in _dirs:
+                    if _c.lower() in _n.lower():
+                        roots.insert(0, os.path.join(_pj, _n))
+                        break
+        roots = list(dict.fromkeys(r for r in roots if r and os.path.isdir(r)))
         if not roots:
             # [2026-09-15 实测] 兜底不能给 AstrBot 全库：它下面压着 .venv / plugin_data 等
             # 十几万文件，四个候选全部撞 5s 超时（总 20.4 秒、零命中）。实测 data/plugins
@@ -232,35 +273,46 @@ class MemoryMixin:
         skip_ext = ("README", "CHANGELOG", "LICENSE")
         doc_mark = ("├", "│", "└", "──")
 
-        def _sync() -> str:
+        def _rg(pattern: str, root: str, fixed: bool, timeout: float, word: bool = False):
             # [2026-09-15 修] 必须带 --no-ignore：AstrBot 根 .gitignore 第 23 行有 `data`，
             # rg 默认遵守它 → 从 AstrBot 根搜时把 data/plugins 整个跳过，永远零命中。
-            # 实测直搜插件目录能命中目标文件，全库搜零命中，就是被忽略规则吃掉的。
-            import time
+            cmd = ["rg", "-n", "--no-ignore", "--no-heading", "--max-count", "3"]
+            cmd += ["-F", pattern] if fixed else ["-e", pattern]
+            if word:
+                # [2026-09-26] 短词必须带词边界：`-F OOM` 会命中 CHATROOM_HEADER
+                # （子串命中），这条噪音实测能占掉整个候选的名额。
+                cmd.append("-w")
+            cmd += [root,
+                    "-g", "!*.pyc", "-g", "!__pycache__", "-g", "!.git", "-g", "!*.log",
+                    "-g", "!.venv*", "-g", "!node_modules", "-g", "!*.jsonl",
+                    "-g", "!plugin_data", "-g", "!*.bak*", "-g", "!*ytimeout*"]
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
-            lines = []
-            slow, bad = [], []
-            deadline = time.monotonic() + 4.0   # 总预算：预取快不过 4 秒，否则不如不预取
-            for root in roots[:2]:
-                for c in cands:
-                    if len(lines) >= 8 or time.monotonic() > deadline:
-                        break
-                    try:
-                        r = subprocess.run(
-                            ["rg", "-n", "--no-ignore", "--no-heading", "--max-count", "3",
-                             "-F", c, root,
-                             "-g", "!*.pyc", "-g", "!__pycache__", "-g", "!.git", "-g", "!*.log",
-                             "-g", "!.venv*", "-g", "!node_modules", "-g", "!*.jsonl",
-                             "-g", "!plugin_data", "-g", "!*.bak*", "-g", "!*ytimeout*"],
-                            capture_output=True, text=True, timeout=2,
-                        )
-                    except subprocess.TimeoutExpired:
-                        slow.append(c)
-                        continue
-                    except Exception as _e:
-                        bad.append(f"{c}:{type(_e).__name__}")
-                        continue
-                    picked = []
+        def _pick(c: str, root: str) -> list:
+            """一个候选在一个根下的定位，最多 2 条，按值钱程度排。
+
+            ① 定义点优先：直接找 `def/class 名字` 声明行——这是她要读的那一行的
+               准确位置，比任何出现点值钱；
+            ② 出现点兜底：全字面匹配，但砍掉 import 行 / 注释 / 目录树 / 空 docstring
+               这些占位命中（实测它们能吃掉一半配额，random_state.py:1 之类照读等于白读）；
+            ③ test 文件降到末位——不是不要，是别占首位。
+            """
+            picked = []
+            try:
+                r = _rg(r"^[ \t]*(?:def|class)[ \t]+" + re.escape(c) + r"\b", root, False, 0.6)
+                for raw in r.stdout.strip().splitlines():
+                    parts = raw.split(":", 2)
+                    if len(parts) == 3:
+                        fpath, lno, body = parts
+                        picked.append((fpath.replace(root.rstrip("/") + "/", ""), lno, body.strip()))
+            except Exception:
+                pass
+            if len(picked) < 2:
+                try:
+                    # [2026-09-26] 词边界只给全大写缩写：`-F OOM` 会撞 CHATROOM_HEADER，
+                    # 但小写词加词边界反而漏掉 `_use_bettbox_proxy` 这种下划线写法
+                    # （实测 bettbox 因此整条候选零命中）。
+                    r = _rg(c, root, True, 0.6, word=(c.isupper() and "/" not in c))
                     for raw in r.stdout.strip().splitlines():
                         parts = raw.split(":", 2)
                         if len(parts) != 3:
@@ -268,22 +320,83 @@ class MemoryMixin:
                         fpath, lno, body = parts
                         rel = fpath.replace(root.rstrip("/") + "/", "")
                         sbody = body.strip()
-                        # 过滤文档噪音：README/说明文档、注释行、目录树图
                         if any(x in rel for x in skip_ext) and not rel.endswith(".py"):
                             continue
                         if sbody.startswith("#") or any(m in sbody for m in doc_mark):
                             continue
-                        picked.append(f"{rel}:{lno}")
-                        if len(picked) >= 2:
+                        if re.match(r"(?:import|from)[ \t]", sbody) or sbody in ('"""', "'''", ""):
+                            continue
+                        # [2026-09-26] 文件头 docstring 行同样是占位命中
+                        # （random_state.py:1 的 `"""三期 · 个体状态种子…`），读了等于白读。
+                        if sbody.startswith('"""') or sbody.startswith("'''"):
+                            continue
+                        if (rel, lno, sbody) in picked:
+                            continue
+                        picked.append((rel, lno, sbody))
+                except Exception:
+                    pass
+            # [2026-09-26] 排序：同名文件命中优先（候选 random_state → random_state.py 的
+            # 命中排前面，别处注释里提到这个名字的行降位），test 文件降到末位。
+            picked.sort(key=lambda x: (
+                os.path.basename(x[0]).rsplit(".", 1)[0] != c and os.path.basename(x[0]) != c,
+                "test_" in x[0] or x[0].startswith("test"),
+            ))
+            # [2026-09-26] 候选是文件名（random_state.py）就只认同名文件：否则它会命中
+            # 别处提到这个名字的地方（实测命中我自己写在注释里的引用，纯噪音）。
+            if "." in c and "/" not in c:
+                picked = [p for p in picked if os.path.basename(p[0]) == c]
+            return picked[:2]
+
+        def _sync() -> str:
+            from concurrent.futures import ThreadPoolExecutor, wait
+
+            # [2026-09-26 提速] 原串行 for root × for cand 实测最慢 3.0s（4s 预算内贴着顶），
+            # 而慢的那条本来也没人会读。改并发 + 单候选 1.0s + 总预算 1.5s。
+            deadline = 1.5
+            combos = [(_r, _c) for _r in roots[:2] for _c in cands]
+            picked_map, miss = {}, 0
+            pool = ThreadPoolExecutor(max_workers=min(len(combos), 12))
+            try:
+                futs = {pool.submit(_pick, _c, _r): _c for _r, _c in combos}
+                done, pending = wait(futs, timeout=deadline)
+                for fut in done:
+                    _c = futs[fut]
+                    try:
+                        got = fut.result()
+                    except Exception:
+                        got = []
+                    if got:
+                        picked_map.setdefault(_c, []).append(got)
+                    else:
+                        miss += 1
+                miss += len(pending)
+                for fut in pending:
+                    fut.cancel()          # 没跑完的不等，subprocess 自带 1.0s 上限
+            finally:
+                pool.shutdown(wait=False)
+            lines = []
+            for c in cands:
+                seen, flat = set(), []
+                for got in picked_map.get(c, []):
+                    for rel, lno, body in got:
+                        key = f"{rel}:{lno}"
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        flat.append((rel, lno, body))
+                        if len(flat) >= 2:
                             break
-                    if picked:
-                        lines.append(f"- `{c}` → " + "、".join(picked))
-                if len(lines) >= 8:
-                    break
-            if slow:
-                logger.info(f"[parallel_handoff] 预取：{len(slow)} 个候选检索超时 {slow[:3]}")
-            if bad:
-                logger.warning(f"[parallel_handoff] 预取：{len(bad)} 个候选检索异常 {bad[:3]}")
+                    if len(flat) >= 2:
+                        break
+                if flat:
+                    lines.append(
+                        f"- `{c}` → " + "、".join(
+                            f"{rel}:{lno}" + (f" │ {body[:72]}" if body else "")
+                            for rel, lno, body in flat
+                        )
+                    )
+            if miss:
+                logger.info(f"[parallel_handoff] 预取：{miss} 个候选无命中或未跑完")
             return "\n".join(lines)
 
         try:

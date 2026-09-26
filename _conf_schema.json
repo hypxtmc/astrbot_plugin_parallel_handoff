@@ -95,12 +95,6 @@
     "default": 900,
     "hint": "主代理 Markdown 智能分段的单段字符预算，超过才拆。默认 900。"
   },
-  "mainagent_md_split_progress": {
-    "description": "主代理分段带进度标识",
-    "type": "bool",
-    "default": false,
-    "hint": "开启后分段消息带（1/3）之类的进度标识（旧行为）。默认关。"
-  },
   "name_display_map": {
     "description": "子代理显示名映射",
     "type": "string",

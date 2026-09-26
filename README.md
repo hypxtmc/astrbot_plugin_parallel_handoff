@@ -240,7 +240,7 @@ WebUI 插件配置里至少设两项：
 
 **核心调度**：`user_address` · `main_agent_name` · `route_mode` · `call_mode` · `tech_mode_config` / `affection_mode_config` · `handoff_blacklist_agents` · `direct_delivery_agents`
 
-**前缀与转发**：`enable_subagent_name_prefix` · `enable_mainagent_name_prefix` · `enable_mainagent_segmented` · `enable_segmented_forward` · `min_fragment_length` · `fragment_interval` · `allow_mainagent_after_direct` · `forbid_pre_tool_mainagent_talk` · `mainagent_disable_md_split` · `mainagent_md_split_max_chars` · `mainagent_md_split_progress` · `name_display_map` · `name_prefix_overrides` · `qq_md_plainify`
+**前缀与转发**：`enable_subagent_name_prefix` · `enable_mainagent_name_prefix` · `enable_mainagent_segmented` · `enable_segmented_forward` · `min_fragment_length` · `fragment_interval` · `allow_mainagent_after_direct` · `forbid_pre_tool_mainagent_talk` · `mainagent_disable_md_split` · `mainagent_md_split_max_chars` · `name_display_map` · `name_prefix_overrides` · `qq_md_plainify`
 
 **路由与指令**：`enable_route_directive` · `subagent_visibility_inject` · `directive_inject_mode` · `enable_smart_router` · `enable_disambiguation` · `subagent_reply_timeout`
 

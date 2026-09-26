@@ -470,11 +470,19 @@ class ForwardMixin:
             pos = m.end()
         if pos < len(full_text):
             blocks.append(("text", full_text[pos:].strip()))
+        # [2026-09-26 主代理 01:0x] 不再合并相邻叙述。
+        # 旧行为把代码块前后的所有散文并成一个 text 块，_send_split_by_type 只能
+        # 发出「短引子 + 代码块 + 一大坨」，用户看到半屏长文（2026-09-26 实测）。
+        # 现在叙述按空行切段，各段独立成条——代码块仍整体一条，其余是一条条小消息。
         merged = []
         for k, v in blocks:
-            if v and k == "text" and merged and merged[-1][0] == "text":
-                merged[-1] = ("text", merged[-1][1] + "\n\n" + v)
-            elif v:
+            if not v:
+                continue
+            if k == "text":
+                for _para in re.split(r"\n\s*\n", v):
+                    if _para.strip():
+                        merged.append(("text", _para.strip()))
+            else:
                 merged.append((k, v))
         return merged
 
@@ -783,7 +791,7 @@ class ForwardMixin:
         依赖配置：mainagent_md_split_max_chars（默认 900）、
         mainagent_disable_md_split（默认 False,True 则永远走 prefK 整条渲染）。
         发送：全部走被动 markdown 路径（event.send + use_markdown_），
-        与 prefK 验证过的渲染通道一致；第 2 条起加 ▍续 N/M 进度前缀。
+        与 prefK 验证过的渲染通道一致。
         返回 True=已拆分发送并清链；False=不宜拆分（未开启/太短/未用 markdown），
         由调用方回退到 _inject_section_dividers 整条渲染。
         """
@@ -798,12 +806,6 @@ class ForwardMixin:
             messages = self._md_split_segments(full_text, budget)
             if not messages:
                 return False
-            total = len(messages)
-            # 进度前缀（2026-08-27 起默认关）：用户嫌 ▍续 N/M 打头傻。
-            # 配置 mainagent_md_split_progress=True 可恢复旧行为。
-            if self.config.get("mainagent_md_split_progress", False):
-                for i in range(1, total):
-                    messages[i] = f"\n▍续 {i + 1}/{total}\n\n" + messages[i]
             sent_any = False
             fixed_iv = self.config.get("fragment_interval", None)
             for idx, msg in enumerate(messages):

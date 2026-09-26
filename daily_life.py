@@ -36,10 +36,13 @@ _INJECT_USER_TEMPLATE = (
     "角色清单：{agents}\n"
     "今日可选话题倾向：{domains}\n"
     "各自的对话记录（【名字】（身份）＋该角色的发言）：\n{logs}\n\n"
-    "三条铁律，违反即整条作废：\n"
+    "{avoid_block}"
+    "四条铁律，违反即整条作废：\n"
     "1. 手头事只能取自该角色自己那段里明说的内容，别人段里的事一个字都不许安到他头上；\n"
     "2. 手头事必须落在该角色的身份与本职之内，跨进别人专业领域的一律不要；\n"
-    "3. 没把握就不输出这个角色，绝不编造。\n\n"
+    "3. 没把握就不输出这个角色，绝不编造；\n"
+    "4. 若上面给了「已用过」清单，手头事不得与清单里任何一条重复——不许换近义词，"
+    "不许只改后缀，必须是同一个人今天真会碰上的另一件具体事。\n\n"
     "请输出 JSON 数组，每个元素格式：\n"
     '{{"agent": "角色名", "mood": "心情", "hand": "手头事", "domain": "话题倾向"}}\n'
     "只输出有把握的角色，从对话里读不出信息的角色直接不要出现在数组里，不要编造。"
@@ -50,15 +53,26 @@ def build_inject_prompt(
     agents: List[str],
     logs: str,
     domains: Optional[List[str]] = None,
+    avoid_map: Optional[Dict[str, List[str]]] = None,
 ) -> Dict[str, str]:
-    """组装注入请求的系统/用户 prompt（供调用与测试复用）。"""
+    """组装注入请求的系统/用户 prompt（供调用与测试复用）。
+
+    avoid_map: {agent: [该角色近期已用过的手头事]}——2026-09-26 加。
+    光写「别重复」模型不会听，把具体条目摊在它面前才会收敛（与注入侧禁复清单同口径）。
+    """
     d = domains or LIFE_DOMAINS
+    avoid_block = ""
+    if avoid_map:
+        _lines = [f"【{a}】已用过：{'、'.join(v)}" for a, v in avoid_map.items() if v]
+        if _lines:
+            avoid_block = "已用过清单（违反铁律 4）：\n" + "\n".join(_lines) + "\n\n"
     return {
         "system": _INJECT_SYSTEM_PROMPT,
         "user": _INJECT_USER_TEMPLATE.format(
             agents="、".join(agents),
             domains="、".join(d),
             logs=logs or "（暂无）",
+            avoid_block=avoid_block,
         ),
     }
 
@@ -97,6 +111,7 @@ class DailyLifeInjector:
         agents: List[str],
         logs: str,
         umo: str = "",
+        avoid_map: Optional[Dict[str, List[str]]] = None,
     ) -> Dict[str, str]:
         """离线为 scene 注入今日状态。
 
@@ -117,7 +132,7 @@ class DailyLifeInjector:
                 )
                 return self._fallback(scene, agents)
 
-            prompts = build_inject_prompt(agents, logs)
+            prompts = build_inject_prompt(agents, logs, avoid_map=avoid_map)
             resp = await self._llm_generate(
                 chat_provider_id=prov_id,
                 prompt=prompts["user"],

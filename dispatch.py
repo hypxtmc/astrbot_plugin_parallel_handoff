@@ -56,6 +56,65 @@ logger.info("[parallel_handoff] dispatch.py 已加载 · banner 2026-09-15T01:00
 # 两边真跑不到一起时，这里也不会在加载阶段就报错。
 _TERMINAL_STATES = {"done", "failed", "stopped", "interrupted"}
 
+# ── 在飞 dispatch 计数（2026-09-26）────────────────────────────────
+# 存在的理由：auto_reload 重载本插件前会读它，非零则拒绝重载。
+# 2026-09-26 事故实证：20:33:25 一次 chained dispatch 起飞，20:33:45 热重载
+# 触发 `Terminating plugin`，在飞协程被掐，子代理回复永久丢失——无报错、
+# 无超时文案、用户侧一片空白。根因不是模型，是重载与在飞任务之间没有互斥。
+# 覆盖：同步路径（chained / parallel）全程；background 提交后本计数即归零，
+# 后台任务仍在飞的那段窗口由 task_runner 的 tasks 状态另行兜底。
+IN_FLIGHT_DISPATCHES = 0
+
+
+def _in_flight_add(n: int = 1) -> None:
+    global IN_FLIGHT_DISPATCHES
+    IN_FLIGHT_DISPATCHES += n
+
+
+def _in_flight_sub(n: int = 1) -> None:
+    global IN_FLIGHT_DISPATCHES
+    IN_FLIGHT_DISPATCHES = max(0, IN_FLIGHT_DISPATCHES - n)
+
+
+# 最近一次登记的 TaskRunner（后台路径的在飞证据，2026-09-26）。
+# 用「最近一个」而非列表：同一插件的后台任务都归同一个 TaskRunner，旧实例被
+# 重载淘汰后新实例立即覆盖——不会攒下读不到的僵尸。
+_IN_FLIGHT_TASK_RUNNER = None
+
+
+def _register_in_flight_runner(runner) -> None:
+    """登记 TaskRunner，让 in_flight_count() 能把它算进去。"""
+    global _IN_FLIGHT_TASK_RUNNER
+    _IN_FLIGHT_TASK_RUNNER = runner
+
+
+def in_flight_count() -> int:
+    """此刻在飞的子代理任务数（重载守卫读它，2026-09-26）。
+
+    两段相加：
+      · IN_FLIGHT_DISPATCHES —— 同步路径（chained / parallel）的整段 dispatch，
+        在外层 try/finally 里 ±1；
+      · TaskRunner.tasks 里非终态的记录 —— 后台路径。`_run_background` 一返回
+        同步计数就归零了，任务却还在飞——非终态记录才是它真实的在飞证据。
+
+    后台那段不另设计数器，直接从 TaskRunner 的状态表实时算：少一套要同步的账，
+    就少一个能算错的地方。
+    """
+    n = IN_FLIGHT_DISPATCHES
+    tr = _IN_FLIGHT_TASK_RUNNER
+    if tr is not None:
+        try:
+            for rec in list(getattr(tr, "tasks", {}).values()):
+                if getattr(rec, "status", None) not in _TERMINAL_STATES:
+                    n += 1
+        except Exception:
+            pass
+    return n
+
+
+# 约定名：auto_reload 的重载守卫按这个名字找（见 _scan_in_flight）。
+IN_FLIGHT_COUNT = in_flight_count
+
 
 class DispatchMixin:
     """去重守卫 / 单子代理调用 / 并行调度 / 跨轮上下文 / 统一单代理路由"""
@@ -85,12 +144,14 @@ class DispatchMixin:
                 if a or i:
                     parts.append(f"{a}::{i}")
             if parts:
-                sig = hashlib.md5(",".join(sorted(parts)).encode("utf-8")).hexdigest()[:16]
+                sig = hashlib.md5(
+                    ",".join(sorted(parts)).encode("utf-8"), usedforsecurity=False
+                ).hexdigest()[:16]
                 return f"{base}|sig:{sig}"
         elif message:
             m = str(message).strip()
             if m:
-                sig = hashlib.md5(m.encode("utf-8")).hexdigest()[:16]
+                sig = hashlib.md5(m.encode("utf-8"), usedforsecurity=False).hexdigest()[:16]
                 return f"{base}|msg:{sig}"
         elif agents:
             sig = ",".join(sorted({str(a).strip() for a in agents if str(a).strip()}))
@@ -294,7 +355,29 @@ class DispatchMixin:
             import random_state as _rs  # type: ignore
             import daily_life as _dl  # type: ignore
 
-        self._rng = getattr(self, "_rng", None) or _rs.RandomStateManager()
+        # seen_path 必须给：不给等于去重池只在内存里活一口气（重启即空），
+        # 2026-09-26 实证——盘上一份 random_state_seen.json 都没有，跨天去重从未生效。
+        # 测试进程（pytest）不许写生产去重池：测试里没有真角色，落进去的假卡会污染
+        # 真数据（2026-09-26 实证：跑一次 pytest，data/random_state_seen.json 就多一条
+        # nova 记录）。生产可用 random_state_seen_path 覆盖（留空用插件默认路径）。
+        import sys as _sys
+
+        _seen_default = getattr(_rs, "_DEFAULT_SEEN_FILE", None)
+        _seen_cfg = ""
+        try:
+            _seen_cfg = (self.config.get("random_state_seen_path") or "").strip()
+        except Exception:
+            _seen_cfg = ""
+        if "pytest" in _sys.modules:
+            _seen_default = None
+        _seen_default = _seen_cfg or _seen_default
+        self._rng = getattr(self, "_rng", None) or _rs.RandomStateManager(seen_path=_seen_default)
+        # 旧实例可能建于 seen_path=None / 旧口径（插件目录）的版本，而热重载不重建
+        # 实例对象——就地同步，否则「跨天去重池」要等下次重启才落盘，热重载等于没改。
+        try:
+            _rs.sync_seen_path(self._rng, _seen_default)
+        except Exception:
+            pass
         self._daily_life_engine_ready = True
         self._rs_mod = _rs
         self._dl_mod = _dl
@@ -371,28 +454,69 @@ class DispatchMixin:
                     f"（agents={len(agents)} 有历史的={sum(1 for _a in agents if self._ctx_engine.peek(_a, scene))}）"
                     f"，GLM 将无话可读——检查 ctx_engine 惰性加载与 session_store"
                 )
-            await self._daily_life_injector.inject(scene, agents, logs, umo=scene)
+            # 禁复清单（近 N 天落盘池 + 近几段内存窗口）交给写卡模型：
+            # 不摊具体条目，它就每天重编同一件事（2026-09-26 用户实证）。
+            _avoid_map: dict = {}
+            try:
+                for _a in agents:
+                    _seen = list(self._rng.avoid_hands_for(_a)) + list(self._rng.recent_hands(_a))
+                    if _seen:
+                        _avoid_map[_a] = _seen[:12]
+            except Exception:
+                _avoid_map = {}
+            if _avoid_map:
+                logger.info(
+                    f"[parallel_handoff] 今日状态禁复清单 scene={scene} 覆盖={len(_avoid_map)}"
+                    f"/{len(agents)} 人"
+                )
+            await self._daily_life_injector.inject(
+                scene, agents, logs, umo=scene, avoid_map=_avoid_map
+            )
             self._daily_llm_injected_scenes.add(_key)
             logger.info(f"[parallel_handoff] 今日状态 LLM 注入完成 scene={scene} agents={len(agents)}")
         except Exception as _e:  # noqa: BLE001
             logger.warning(f"[parallel_handoff] 今日状态注入器懒初始化失败(降级规则随机): {_e}")
 
     def _daily_state_text(self, agent_name, st) -> str:
-        """把某 agent 的今日 DailyState 拼成口吻自然的注入叙述（非紧凑 summary）。"""
+        """把某 agent 的本段 DailyState 拼成口吻自然的注入叙述（非紧凑 summary）。
+
+        2026-09-26 用户拍板改（治"套路固化、复用旧事"）：
+          · 承接：把 st.prev（上一段的手头事）写进去，让角色能顺着时间往下接，
+            而不是每段从零开始说一件跟前文无关的事。
+          · 禁复清单：把近 N 段已用过的手头事摊开列出来，硬性要求不得再当新事说。
+            只写"别重复"是空话，把具体条目摆出来模型才会收敛。
+        取不到清单/prev 时自动降级为原叙述，绝不报错。
+        """
         if st is None:
             return ""
         try:
             _mood = getattr(st, "mood", "") or "平静"
             _hand = getattr(st, "hand", "") or ""
             _domain = getattr(st, "domain", "") or "生活"
-            _text = f"【今日日常】你今天心情{_mood}。"
+            _prev = getattr(st, "prev", "") or ""
+            _text = f"【今日日常】你现在心情{_mood}。"
             if _hand:
-                _text += f"正{_hand}。"
-            # 附一句话题倾向，让角色自然往今日领域靠
-            return (
-                f"{_text}你今日的心思偏向『{_domain}』这一块的事，"
+                _text += f"手头正{_hand}。"
+            # 承接：让上一段成为这一段的起点，而不是平行列举
+            if _prev:
+                _text += f"（上一段你还{_prev}，按先后顺序往下接，别把已经过去的当现在。）"
+            _text += (
+                f"你此刻的心思偏向『{_domain}』这一块的事，"
                 "自然地带着这份状态聊天，不必刻意表露。"
             )
+            # 禁复清单：近几段用过的手头事，硬性不得再当新事说
+            try:
+                _recent = self._rng.recent_hands(agent_name)[:-1]  # 末项就是本段，不算"说过"
+            except Exception:
+                _recent = []
+            if _recent:
+                _text += (
+                    "这几样你前几段提过了："
+                    + "、".join(_recent)
+                    + "。它们已经不算新事了，别再拿出来说，也别换个说法重说；"
+                    "这一段必须有自己的实处——具体到手上正在弄的、刚碰上的。"
+                )
+            return _text
         except Exception:
             return ""
 
@@ -724,8 +848,9 @@ class DispatchMixin:
             logger.warning(f"[parallel_handoff] 用户身份注入失败: {e}")
 
         # ── 说话者身份注入（2026-09-18 双向身份识别） ──
-        # 区分「顾主亲口点名」（router 短路，speaker="顾主"）与「主代理调度/转述」
-        # （main.py 工具壳默认兕底 "主代理"）。None 不注入——旧路径零影响。
+        # 区分「主对话者亲口点名」（router 短路，speaker 取配置 user_address）
+        # 与「主代理调度/转述」（main.py 工具壳默认兜底 "主代理"）。None 不注入——旧路径零影响。
+        # 称呼统一取 user_address，不在此处硬编码——单一来源，改配置即改。
         if speaker:
             final_input = f"[说话者] 本条消息来自：{speaker}\n{final_input}"
 
@@ -876,15 +1001,18 @@ class DispatchMixin:
             # [工具循环 2026-09-11 用户定] 子代理改走 tool_loop_agent：
             # llm_generate 是一次性调用、不执行 tool_call（官方 docstring 明示），
             # 子代理伸手抓工具永远抓空 → 空回复 → 降级无工具重试，工具形同虚设。
-            # tool_loop_agent 不设 ProviderRequest.extra_user_content_parts，
-            # 故把旁轨记忆/状态注入文本直接并进 prompt。
-            _extra_text = "\n".join(
-                (getattr(p, "text", "") or "").strip()
-                for p in (memory_extra_parts or [])
-            ).strip()
-            prompt_with_extra = (
-                f"{final_input}\n\n{_extra_text}" if _extra_text else final_input
-            )
+            # [2026-09-26 核心开洞] tool_loop_agent 现在透传
+            # ProviderRequest.extra_user_content_parts（本地核心已打
+            # /root/.irmia/patches/astrbot-10230-extra-user-content-parts.patch），
+            # 旁轨记忆 / 时间感知 / 预取线索改走该字段——临时内容不再并进
+            # prompt，也就不落持久历史、不脏前缀缓存。这些 ContentPart 本来
+            # 就都带 mark_as_temp()，语义一直是这个槽。
+            if memory_extra_parts:
+                logger.info(
+                    f"[parallel_handoff] 子代理 extra 注入 [{agent_name}]: "
+                    f"{len(memory_extra_parts)} 条 / "
+                    f"{sum(len(getattr(p, 'text', '') or '') for p in memory_extra_parts)} 字符"
+                )
             # 子代理系统提示（打点块删除后此处是唯一构造点，2026-09-19）
             _sys_p = self._subagent_system_prompt(
                 handoff, agent_name, dual_output=dual_output
@@ -894,7 +1022,8 @@ class DispatchMixin:
                 self.context.tool_loop_agent(
                     event=event,
                     chat_provider_id=prov_id,
-                    prompt=prompt_with_extra,
+                    prompt=final_input,
+                    extra_user_content_parts=memory_extra_parts or None,
                     contexts=_ctx_contexts or None,
                     system_prompt=_sys_p,
                     tools=subagent_tools,
@@ -1354,6 +1483,9 @@ class DispatchMixin:
         # 开启后每个子代理各自一个后台任务，本方法立即返回 task_id，
         # 主代理可以继续跟用户说话，结果用 task_result 取。
         session_key = getattr(event, "unified_msg_origin", "") or "default"
+        # 登记后台运行器：in_flight_count() 从这里读在飞的 bg 任务（2026-09-26）。
+        # 后台路径的同步计数一返回就归零，只有 TaskRunner 的状态表知道它还在飞。
+        _register_in_flight_runner(self._task_runner)
         submitted = []
         for _c in calls:
             _agent = _c.get("agent_name") or ""
@@ -1498,7 +1630,8 @@ Args:
     route_mode(string): 路由模式覆盖，'direct'或'relay'；不传用模式/配置默认。技术干活任务传"relay"使子代理回复返回主代理汇总；日常贴贴不传走默认直发。
     call_mode(string): 调用模式覆盖，'parallel'或'chained'；不传用模式/配置默认。技术干活传"parallel"并行调度；流水线任务传"chained"接龙。
     background(boolean): 是否后台执行（二期，默认 false）。true 时立即返回 task_id 不阻塞——主代理可以继续和用户对话，子代理做完再来取结果（用 task_result），适合耗时长或需要并行的任务。false 时等子代理全部做完再返回，与原行为完全一致。
-    speaker(string): 内部参数。说话者身份，注入为 [说话者] 行；None 不注入。router 短路传"顾主"，工具壳默认"主代理"。
+    speaker(string): 内部参数。说话者身份，注入为 [说话者] 行；None 不注入。router 短路传配置里的
+        user_address，工具壳默认"主代理"。
 """
         # ── LLM 同回合重复调用防重：同一消息对同一批子代理的重复路由短路 ──
         # 防重 key 含本次路由目标子代理名单，串行调不同子代理可各自放行
@@ -1618,17 +1751,24 @@ Args:
             direct_agents=direct_agents, route_mode=route_mode,
             enable_segmented_forward=enable_segmented_forward,
         )
-        if call_mode == "chained":
-            results = await self._run_chained(calls, _call_ctx, message)
-        elif background and getattr(self, "_task_runner", None) is not None:
-            return await self._run_background(calls, _call_ctx)
-        else:
-            results = await self._run_parallel(calls, _call_ctx)
-        return await self._finalize_dispatch(
-            results, event, t_total, enable_disambiguation,
-            enable_segmented_forward, direct_agents, route_mode,
-            also_return, return_agent_results,
-        )
+        # ── 在飞计数（2026-09-26）：重载守卫读它，非零时拒绝热重载本插件。
+        # 包住整段 dispatch（起跑 → 结果收齐）。此前这里没有任何互斥保护，
+        # 热重载的 Terminating 会在半空中掐断协程，回复直接丢失。
+        _in_flight_add(len(calls))
+        try:
+            if call_mode == "chained":
+                results = await self._run_chained(calls, _call_ctx, message)
+            elif background and getattr(self, "_task_runner", None) is not None:
+                return await self._run_background(calls, _call_ctx)
+            else:
+                results = await self._run_parallel(calls, _call_ctx)
+            return await self._finalize_dispatch(
+                results, event, t_total, enable_disambiguation,
+                enable_segmented_forward, direct_agents, route_mode,
+                also_return, return_agent_results,
+            )
+        finally:
+            _in_flight_sub(len(calls))
 
     # ── 跨轮上下文已迁至 ctx_engine.ContextEngine ──
 
